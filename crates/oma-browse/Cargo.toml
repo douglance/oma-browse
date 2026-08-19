@@ -1,0 +1,43 @@
+[package]
+name = "oma-browse"
+description = "An Omarchy-themed, agent-drivable browser."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oma-theme = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+axum = "0.8"
+tower = "0.5"
+topcoat = { version = "0.6", features = ["tower", "datastar"] }
+incurs = { version = "0.5", features = ["cli", "http", "mcp"] }
+schemars = "1"
+url = "2"
+
+# Tauri's `unstable` feature is what turns on `Window::add_child`; without it
+# every webview becomes the window's sole content.
+tauri = { version = "2", features = ["unstable"] }
+
+# These two must match Tauri's own pins exactly. `with_webview` hands back a
+# `webkit2gtk::WebView`, and a version skew would give us two incompatible
+# copies of the same types.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+webkit2gtk = { version = "=2.0", features = ["v2_40"] }
+# Only for `png`: gtk pulls cairo in without it, so `ImageSurface::write_to_png`
+# is missing and a snapshot has nowhere to go. Naming it here turns the feature
+# on for gtk's copy too, rather than adding a second one.
+cairo-rs = { version = "0.18", features = ["png"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

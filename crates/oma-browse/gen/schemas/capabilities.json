@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"oma-browse creates and drives its webviews from Rust; page content gets no API access.","local":true,"windows":["main"],"webviews":["chrome"],"permissions":[]}}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "oma-browse",
+  "version": "0.1.0",
+  "identifier": "dev.douglance.oma-browse",
+  "build": {
+    "frontendDist": "dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "deb",
+    "icon": ["icons/icon.png"]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "oma-browse creates and drives its webviews from Rust; page content gets no API access.",
+  "windows": ["main"],
+  "webviews": ["chrome"],
+  "permissions": []
+}

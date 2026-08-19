@@ -1,0 +1,19 @@
+[package]
+name = "oma-theme"
+description = "Resolve the live Omarchy theme into CSS custom properties, and watch for changes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+notify = "8"
+
+[dev-dependencies]
+serde_json = { workspace = true }
