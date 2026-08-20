@@ -295,6 +295,34 @@ Logs go to stderr and are filtered with `RUST_LOG`, e.g.
 - `crates/oma-theme` — reads an Omarchy theme and renders it as CSS: the token
   block for our own chrome, and the runtime injected into loaded pages.
 
+## Development
+
+Hooks live in `.githooks/` and are opt-in per clone, because git will not let a
+repository point itself at its own hooks — that would be a remote handing you
+code to run on checkout. One line, once:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+**pre-commit** checks that `assets/mark.png` and `assets/icon.png` are still
+tracked — `server.rs` embeds them with `include_bytes!`, and they were lost to
+`.gitignore` once already — then runs `cargo fmt --all --check`. It skips
+rustfmt entirely when nothing Rust-shaped is staged, so a README commit costs
+nothing. Measured at 0.2s.
+
+**pre-push** runs the slow half of CI: `cargo clippy --workspace --all-targets
+-- -D warnings`, the test suite, and `node --check` on the two JavaScript
+runtimes the binary injects. Those are `include_str!` strings to Rust, so a
+syntax error in one compiles, ships, and silently never runs — the only symptom
+is a page that stays unthemed, or `f` that stops drawing link hints. Measured at
+17s warm.
+
+The split is measured rather than aesthetic: clippy over the workspace takes
+minutes from cold, and a commit-time hook that costs minutes is a hook people
+learn to `--no-verify` past. Both hooks honour `--no-verify`, and
+`OMA_SKIP_HOOKS=1` does the same for a script that cannot pass the flag.
+
 ## Status
 
 Early, and moving. It is the browser I use, which is a different bar from *it is

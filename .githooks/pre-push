@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# The slow half of CI, run once per push rather than once per commit: the test
+# suite, and a syntax check of the two JavaScript runtimes the binary injects.
+#
+# Those scripts are `include_str!` strings as far as Rust is concerned, so a
+# syntax error in either one compiles, ships, and silently never runs -- the
+# only symptom is a page that stays unthemed, or `f` that stops drawing link
+# hints. Rust cannot see it; node can. Skipped when node is not installed,
+# because CI checks it too and a missing node should not block a push.
+#
+# Escape hatches:
+#   git push --no-verify
+#   OMA_SKIP_HOOKS=1 git push
+
+set -euo pipefail
+
+if [[ -n "${OMA_SKIP_HOOKS:-}" ]]; then
+    echo "pre-push: skipped (OMA_SKIP_HOOKS)"
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+fail() {
+    echo
+    echo "pre-push: $1"
+    echo "          fix it, or push with --no-verify if you know better."
+    exit 1
+}
+
+# The invocation the project asks people to run by hand, character for
+# character: cargo fingerprints a clippy run by its flags, so a hook that
+# spelled it differently would rebuild the world every time you alternated
+# between the two.
+echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets --locked -- -D warnings || fail "clippy is unhappy"
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace --locked --quiet || fail "tests are failing"
+
+if command -v node >/dev/null 2>&1; then
+    echo "pre-push: node --check on the injected runtimes"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    OMA_DUMP_SCRIPT="$tmp/page.js" cargo test -p oma-theme --test dump_script --locked --quiet >/dev/null
+    OMA_DUMP_HINTS="$tmp/hints.js" cargo test -p oma-browse hints::tests::dump --locked --quiet >/dev/null
+    node --check "$tmp/page.js" || fail "page.js does not parse"
+    node --check "$tmp/hints.js" || fail "hints.js does not parse"
+else
+    echo "pre-push: node not installed; leaving the script check to CI"
+fi
+
+echo "pre-push: ok"

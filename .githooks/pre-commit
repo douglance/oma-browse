@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# Formatting only. Clippy and the tests are in `pre-push`, and the split is
+# measured rather than aesthetic: this hook runs on every commit, `cargo fmt
+# --all --check` answers in about a second, and a full-workspace clippy took
+# over two minutes cold on this tree. A commit-time hook that costs minutes is a
+# hook people learn to pass `--no-verify` to, which is worse than not having
+# one.
+#
+# It checks the *working tree*, not the index. The purist version stashes
+# unstaged changes so it sees exactly what is being committed, and that is the
+# wrong trade here: this repository is routinely edited by more than one process
+# at a time, and a stash that goes wrong takes someone else's uncommitted work
+# with it. The cost is that a commit can be blocked by a mess elsewhere in the
+# tree, which `--no-verify` exists for.
+#
+# Escape hatches, in order of preference:
+#   git commit --no-verify        skip every hook, once
+#   OMA_SKIP_HOOKS=1 git commit   the same, spelled so a script can set it
+
+set -euo pipefail
+
+if [[ -n "${OMA_SKIP_HOOKS:-}" ]]; then
+    echo "pre-commit: skipped (OMA_SKIP_HOOKS)"
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+fail() {
+    echo
+    echo "pre-commit: $1"
+    echo "            fix it, or commit with --no-verify if you know better."
+    exit 1
+}
+
+# `include_bytes!` in `server.rs` embeds these, so a commit that loses them
+# breaks the build for everyone who clones -- and it happened once already, when
+# `assets/` was still in `.gitignore`. Instant to check, so it runs always.
+for asset in assets/mark.png assets/icon.png; do
+    git cat-file -e ":$asset" 2>/dev/null || fail "$asset is not tracked; server.rs embeds it with include_bytes!"
+done
+
+# Nothing Rust-shaped staged means nothing for rustfmt or clippy to say. A
+# README or an asset commit should not pay for a clippy run.
+if ! git diff --cached --name-only --diff-filter=ACMR |
+    grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rustfmt\.toml$|(^|/)deny\.toml$'; then
+    echo "pre-commit: no Rust changes staged; skipping rustfmt"
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check || fail "formatting differs from rustfmt.toml -- run: cargo fmt --all"
+
+echo "pre-commit: ok"
