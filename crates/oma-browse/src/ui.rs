@@ -168,6 +168,7 @@ async fn act_run(cx: &Cx, spec: String, query: String) -> Result<String> {
         "tab" => Ok(finish(&state, &reg.catalog, "tab_select", arg("id", payload)).await),
         "close" => Ok(finish(&state, &reg.catalog, "tab_close", arg("id", payload)).await),
         "hist" => Ok(finish(&state, &reg.catalog, "nav_go", arg("url", payload)).await),
+        "down" => Ok(finish(&state, &reg.catalog, "download_open", arg("index", payload)).await),
         "cmd" => Ok(run_command(&state, reg, payload, None).await),
         _ => Ok(String::new()),
     }
@@ -220,6 +221,7 @@ async fn act_pick(cx: &Cx, prompt: String, query: String, index: f64) -> Result<
         "tab" => Ok(finish(&state, &reg.catalog, "tab_select", arg("id", payload)).await),
         "close" => Ok(finish(&state, &reg.catalog, "tab_close", arg("id", payload)).await),
         "hist" => Ok(finish(&state, &reg.catalog, "nav_go", arg("url", payload)).await),
+        "down" => Ok(finish(&state, &reg.catalog, "download_open", arg("index", payload)).await),
         "cmd" => Ok(run_command(&state, reg, payload, None).await),
         _ => Ok(String::new()),
     }
@@ -270,9 +272,10 @@ async fn run_command(
         args.insert(name, crate::dispatch::coerce(line, &ty));
     }
 
+    let keep = stays_open(tool, &args);
     match crate::dispatch::run(&reg.catalog, tool, args).await {
         None => {
-            if !stays_open(tool) {
+            if !keep {
                 dismiss(state);
             }
             state.notify_tabs();
@@ -293,9 +296,10 @@ async fn finish(
     tool: &str,
     args: BTreeMap<String, Value>,
 ) -> String {
+    let keep = stays_open(tool, &args);
     match crate::dispatch::run(catalog, tool, args).await {
         None => {
-            if !stays_open(tool) {
+            if !keep {
                 dismiss(state);
             }
             state.notify_tabs();
@@ -319,8 +323,16 @@ fn wants_argument(message: &str) -> bool {
 
 /// The few commands that change what the palette is showing, so closing it would
 /// hide the result. The single place UI policy diverges from the registry.
-fn stays_open(tool: &str) -> bool {
-    matches!(tool, "tab_close" | "tab_list" | "theme_recolor" | "theme_show" | "theme_css")
+///
+/// `tab_open` is the one row whose answer depends on its arguments: opening a
+/// URL is done with the palette, while opening a blank tab re-summons it (see
+/// `commands.rs`), and dismissing here would close what the command just opened.
+fn stays_open(tool: &str, args: &BTreeMap<String, Value>) -> bool {
+    match tool {
+        "tab_close" | "tab_list" | "theme_recolor" | "theme_show" | "theme_css" => true,
+        "tab_open" => !args.contains_key("url"),
+        _ => false,
+    }
 }
 
 fn dismiss(state: &Arc<AppState>) {
@@ -341,6 +353,8 @@ async fn palette(cx: &Cx) -> Result {
     let staged = state(cx).take_stage().unwrap_or_default();
     let theme = state(cx).theme.read().await;
     let vars = Unescaped::new_unchecked(theme.css.chrome.clone());
+    let mine =
+        Unescaped::new_unchecked(crate::strip::chrome_vars(&state(cx).config, theme.css.opacity));
     let sheet = Unescaped::new_unchecked(PALETTE_CSS);
 
     view! {
@@ -350,6 +364,7 @@ async fn palette(cx: &Cx) -> Result {
                 <meta charset="utf-8">
                 <title>"Palette"</title>
                 <style>(vars)</style>
+                <style>(mine)</style>
                 <style>(sheet)</style>
             </head>
             <body>
@@ -435,6 +450,8 @@ async fn palette(cx: &Cx) -> Result {
 async fn start(cx: &Cx) -> Result {
     let theme = state(cx).theme.read().await;
     let vars = Unescaped::new_unchecked(theme.css.chrome.clone());
+    let mine =
+        Unescaped::new_unchecked(crate::strip::chrome_vars(&state(cx).config, theme.css.opacity));
     let sheet = Unescaped::new_unchecked(START_CSS);
     let theme_name = theme.name.clone();
 
@@ -445,10 +462,12 @@ async fn start(cx: &Cx) -> Result {
                 <meta charset="utf-8">
                 <title>"New tab"</title>
                 <style>(vars)</style>
+                <style>(mine)</style>
                 <style>(sheet)</style>
             </head>
             <body>
                 <main>
+                    <div class="mark">(MARK)</div>
                     <h1>"oma-browse"</h1>
                     <p class="sub">"Wearing " <strong>(theme_name)</strong></p>
                     <ul class="swatches">
@@ -466,12 +485,26 @@ async fn start(cx: &Cx) -> Result {
     }
 }
 
+/// The browser's mark: `nf-md-web_box`.
+///
+/// A Nerd Font glyph rather than an SVG or a bundled image, for the same reason
+/// the tab strip uses one -- it inherits the theme's accent colour by being
+/// text, so it re-dresses with everything else and costs no asset.
+const MARK: &str = "\u{f0f94}";
+
 const START_CSS: &str = r#"
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--oma-fg);
   font-family: system-ui, sans-serif; }
 main { height: 100%; display: flex; flex-direction: column; align-items: center;
   justify-content: center; gap: var(--oma-space-2); }
+.mark {
+  /* Nerd Font by name, not through `--oma-font-mono`: that token is whatever
+     fontconfig calls `monospace`, which is not guaranteed to be patched -- and
+     an unpatched font renders the mark as tofu. Same chain as the tab strip. */
+  font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", var(--oma-font-mono), monospace;
+  font-size: 4.5rem; line-height: 1; color: var(--oma-accent);
+}
 h1 { margin: 0; font-size: 2.5rem; font-weight: 600; color: var(--oma-accent); letter-spacing: -0.02em; }
 .sub { margin: 0; color: var(--oma-fg); }
 .sub strong { color: var(--oma-accent); font-weight: 600; }
@@ -621,6 +654,30 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
         }
         drop(marks);
 
+        // Saved files, ranked like anything else you might be looking for.
+        // Capped low: this is "open the thing I just downloaded", and a
+        // downloads *manager* is `download list`.
+        if let Ok(downloads) = state.downloads.lock() {
+            for (at, file) in downloads.entries().iter().enumerate().take(50) {
+                let hay = format!("{} {}", file.name(), file.url).to_lowercase();
+                let Some(points) = crate::fuzzy::score(&hay, &needle) else { continue };
+                scored.push((
+                    points + 20,
+                    Row {
+                        index: 0.0,
+                        // 1-based, because `download open` counts from the
+                        // newest as 1 and the two must agree.
+                        id: format!("do-down:{}", at + 1),
+                        close_id: String::new(),
+                        icon: "⤓".to_string(),
+                        title: file.name(),
+                        sub: file.path.display().to_string(),
+                        section: "Downloads".to_string(),
+                    },
+                ));
+            }
+        }
+
         let history = state.history.read().await;
         for visit in history.entries() {
             let hay = format!("{} {}", visit.title, visit.url).to_lowercase();
@@ -657,7 +714,7 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
         // duplicate rather than showing the same URL twice.
         let mut seen = std::collections::HashSet::new();
         scored.retain(|(_, row)| seen.insert(row.id.clone()));
-        out.extend(scored.into_iter().take(24).map(|(_, mut row)| {
+        out.extend(scored.into_iter().take(state.config.chrome.palette.rows).map(|(_, mut row)| {
             row.section = String::new();
             row
         }));
@@ -683,8 +740,15 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
         menu.extend(
             scored
                 .iter()
+                .filter(|(_, r)| r.section == "Downloads")
+                .take(state.config.chrome.palette.download_rows)
+                .map(|(_, r)| r.clone()),
+        );
+        menu.extend(
+            scored
+                .iter()
                 .filter(|(_, r)| r.section == "Recently visited")
-                .take(8)
+                .take(state.config.chrome.palette.history_rows)
                 .map(|(_, r)| r.clone()),
         );
         // Print a heading only where the section actually changes.
@@ -781,8 +845,9 @@ const PALETTE_CSS: &str = r##"
 * { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%; background: transparent;
-  /* The aesthetic contract is mono-first: dense, precise, terminal-grade. */
-  font-family: var(--oma-font-mono); font-size: var(--oma-font-body);
+  /* The aesthetic contract is mono-first: dense, precise, terminal-grade.
+     `chrome.font` in the config file is what this resolves to. */
+  font-family: var(--oma-chrome-font); font-size: var(--oma-font-body);
   color: var(--oma-fg);
 }
 .card {
@@ -791,7 +856,10 @@ html, body {
      floating over content, and at the page's translucency a full list of
      commands is unreadable against whatever happens to be behind it. This is
      the same token the Omarchy launcher uses, so it matches by construction. */
-  background: var(--oma-omnibar-bg);
+  /* `chrome.veil`: the card is opaque by default, because it is a card you
+     read dense text off. color-mix rather than an alpha baked into the token,
+     since the token may already carry one of its own. */
+  background: color-mix(in srgb, var(--oma-omnibar-bg) calc(var(--oma-chrome-alpha) * 100%), transparent);
   border: 1px solid var(--oma-border);
   border-radius: var(--oma-radius);
   overflow: hidden;
@@ -854,6 +922,21 @@ kbd {
 
 #[cfg(test)]
 mod tests {
+    /// The mark has to be a glyph a patched font actually carries, or the start
+    /// page opens on a tofu box. `nf-md-web_box` lives in plane 15, where Nerd
+    /// Fonts put the Material Design set -- not the BMP private use area the
+    /// strip's older glyphs come from.
+    #[test]
+    fn the_mark_is_a_private_use_glyph() {
+        let c = super::MARK.chars().next().expect("a glyph");
+        assert_eq!(super::MARK.chars().count(), 1, "one codepoint, not a sequence");
+        assert!(
+            ('\u{e000}'..='\u{f8ff}').contains(&c) || ('\u{f0000}'..='\u{ffffd}').contains(&c),
+            "{:?} is outside the private use areas",
+            super::MARK
+        );
+    }
+
     /// The palette, the CLI and MCP must all see the same commands.
     ///
     /// This is the test that makes the registry worth having: add a command to
@@ -943,6 +1026,29 @@ mod tests {
         assert!(tab_at.is_some(), "the open tab should be offered");
         assert!(hist_at.is_some(), "history should be offered");
         assert!(tab_at < hist_at, "the open tab should rank above history");
+    }
+
+    /// A saved file is findable by name, and Enter on it opens the file rather
+    /// than navigating to where it came from.
+    #[tokio::test]
+    async fn a_download_is_findable_by_its_name() {
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        state.downloads.lock().unwrap().start(
+            "https://a.example/d?id=7",
+            std::path::Path::new("/tmp/quarterly-report.pdf"),
+            1,
+        );
+        let cli = crate::commands::command_graph(state.clone());
+        let reg = super::Registry::new(cli.try_tool_catalog().unwrap());
+
+        let rows = super::rows(&state, &reg, "quarterly").await;
+        let row = rows
+            .iter()
+            .find(|r| r.id.starts_with("do-down:"))
+            .expect("the download should be offered");
+        assert_eq!(row.title, "quarterly-report.pdf");
+        // 1-based, because `download open` counts from the newest as 1.
+        assert_eq!(row.id, "do-down:1");
     }
 
     /// History is searchable but must not flood the idle menu.

@@ -26,11 +26,35 @@ use crate::ui::{registry, state};
 /// The webview label, and the route it points at.
 pub const LABEL: &str = "strip";
 
+/// The font stack our own surfaces ask for.
+///
+/// Nerd Font by name rather than through `--oma-font-mono`: that token is
+/// whatever fontconfig calls `monospace`, which is not guaranteed to be
+/// patched -- and an unpatched font renders the strip's glyphs as tofu.
+pub const DEFAULT_FONT: &str =
+    "\"JetBrainsMono Nerd Font\", \"Symbols Nerd Font\", var(--oma-font-mono), monospace";
+
+/// The `:root` block carrying what our own chrome is configured to look like.
+///
+/// Emitted per page rather than added to the theme's token block: these are
+/// settings of the browser, not properties of the Omarchy theme, and
+/// `oma-theme` has no business knowing about either.
+pub fn chrome_vars(config: &crate::config::Config, page_veil: f64) -> String {
+    format!(
+        ":root {{ --oma-chrome-font: {font}; --oma-chrome-alpha: {alpha}; }}",
+        font = config.chrome.font,
+        // `auto` for chrome means "whatever the page settled on", which is the
+        // only sense in which a palette card can be automatic.
+        alpha = config.chrome.veil.resolve(page_veil),
+    )
+}
+
 #[page("/strip")]
 async fn strip(cx: &Cx) -> Result {
     let state = state(cx);
     let theme = state.theme.read().await;
     let vars = Unescaped::new_unchecked(theme.css.chrome.clone());
+    let mine = Unescaped::new_unchecked(chrome_vars(&state.config, theme.css.opacity));
     let sheet = Unescaped::new_unchecked(STRIP_CSS);
     drop(theme);
 
@@ -47,6 +71,7 @@ async fn strip(cx: &Cx) -> Result {
                 <meta charset="utf-8">
                 <title>"Tabs"</title>
                 <style>(vars)</style>
+                <style>(mine)</style>
                 <style>(sheet)</style>
             </head>
             <body>
@@ -70,7 +95,7 @@ async fn strip(cx: &Cx) -> Result {
                                 title=(tab.title.clone())
                             >
                                 if tab.icon.is_empty() {
-                                    <span class="glyph">(GLOBE)</span>
+                                    <span class="glyph">(Unescaped::new_unchecked(GLOBE))</span>
                                 } else {
                                     <img class="icon" src=(tab.icon.clone()) alt="">
                                 }
@@ -78,7 +103,13 @@ async fn strip(cx: &Cx) -> Result {
                         }
                     </div>
 
-                    <div class="title" title=(title.clone())>(title)</div>
+                    if state.config.chrome.strip.title {
+                        <div class="title" title=(title.clone())>(title)</div>
+                    } else {
+                        // The grid wants its middle track either way, or the
+                        // gear stops being pinned to the right.
+                        <div class="title"></div>
+                    }
 
                     <button class="gear" id="do-settings" title="Settings">(GEAR)</button>
                 </div>
@@ -129,10 +160,17 @@ fn arg(name: &str, value: &str) -> std::collections::BTreeMap<String, serde_json
 
 /// Stand-in for a tab whose favicon has not arrived, or never will.
 ///
-/// `nf-fa-globe`. A blank square reads as a broken tab and a spinner would be a
-/// lie -- plenty of sites simply ship no icon, and this is what they look like
-/// permanently.
-const GLOBE: &str = "\u{f0ac}";
+/// A blank square reads as a broken tab and a spinner would be a lie -- plenty
+/// of sites simply ship no icon, and this is what they look like permanently.
+///
+/// Drawn rather than set in the Nerd Font, which the gear beside it still is.
+/// Every icon in the patched font has ink wider than its cell and hanging off
+/// to the right -- `nf-fa-globe` measures 12.0px of ink in a 7.8px advance at
+/// 13px, so centring the *cell* leaves the drawing 2.1px right of centre. That
+/// is invisible in a terminal, where these glyphs live in a row of other
+/// glyphs, and obvious here, sitting in a row of 16px favicons with a mark
+/// centred underneath. An SVG has the geometry it says it has.
+const GLOBE: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><ellipse cx="12" cy="12" rx="4.6" ry="9"/></svg>"#;
 
 /// The settings gear: `nf-fa-cog`.
 const GEAR: &str = "\u{f013}";
@@ -151,8 +189,7 @@ const GEAR: &str = "\u{f013}";
 /// header, which by definition ignores the document's padding and will sit under
 /// the strip at the top of the page. That is the cost of floating; a strip that
 /// covered nothing would have to be a strip that never moved.
-pub fn inset_script() -> String {
-    let height = crate::layout::STRIP_HEIGHT;
+pub fn inset_script(height: i32) -> String {
     format!(
         r#"(function () {{
   "use strict";
@@ -181,10 +218,8 @@ const STRIP_CSS: &str = r##"
 * { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%; overflow: hidden;
-  /* Nerd Font by name, not through `--oma-font-mono`: that token is whatever
-     fontconfig calls `monospace`, which is not guaranteed to be patched -- and
-     an unpatched font renders the glyphs below as tofu. */
-  font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", var(--oma-font-mono), monospace;
+  /* See `DEFAULT_FONT`; `chrome.font` in the config file replaces it. */
+  font-family: var(--oma-chrome-font);
   font-size: var(--oma-font-small);
   /* No surface of its own. The strip sits in the window's own background, and a
      bar painted here would be a second one drawn on top of it. */
@@ -211,7 +246,11 @@ html, body {
 .tab {
   flex: none;
   position: relative;
-  width: 22px; height: 20px;
+  /* Two px taller than it needs to be for a 16px icon, and the mark lives in
+     that slack. `.tabs` clips (it has to, so a long row of tabs runs off the
+     end rather than shoving the title aside), so a mark hung below the button
+     is simply not drawn. */
+  width: 22px; height: 22px;
   display: grid; place-items: center;
   padding: 0; border: 0; border-radius: var(--oma-radius);
   background: transparent; color: inherit; font: inherit;
@@ -221,20 +260,34 @@ html, body {
   cursor: pointer;
 }
 .tab:hover { opacity: 1; background: var(--oma-menu-selected-bg); }
+/* No fill of its own: a filled square behind the favicon is a second shape
+   competing with the icon, and it reads as the hover highlight stuck on. The
+   mark below carries the whole signal. */
 .tab.on { opacity: 1; }
-/* The active tab is marked underneath rather than filled, so the mark cannot be
-   confused with the hover highlight. */
+/* The mark spans the whole button rather than sitting under the icon: at 22px
+   wide there is no room for a bar to be *nearly* as wide as the thing above it
+   without looking mis-set, and a full-width bar has no free edges to round
+   differently from the icon on a fractionally scaled output. */
 .tab.on::after {
   content: "";
-  position: absolute; left: 50%; bottom: -1px; transform: translateX(-50%);
-  width: 14px; height: 2px; background: var(--oma-accent);
+  /* Inside the button, in the slack under a 16px icon centred in 22px: 3px of
+     clear air between the icon and the mark, and nothing to clip. */
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 2px; background: var(--oma-accent);
 }
 
 /* The icon must never be the click target: the handler reads the id off
-   whatever was hit, and only the button carries one. */
-.icon, .glyph { pointer-events: none; }
+   whatever was hit, and only the button carries one.
+   The margin is what keeps clear air under the icon: the button centres its one
+   child, so lifting the child by 2px puts 2px between it and the mark along the
+   bottom edge. An even number on purpose -- an odd one centres on a half pixel
+   and the icon blurs. */
+.icon, .glyph { pointer-events: none; margin-bottom: 2px; }
 .icon { width: 16px; height: 16px; display: block; }
-.glyph { font-size: 13px; line-height: 1; color: var(--oma-menu-fg); }
+/* The same 16px box as a favicon, so a tab with no icon lines up with the ones
+   that have one -- and with the mark underneath. */
+.glyph { width: 16px; height: 16px; display: block; color: var(--oma-menu-fg); }
+.glyph svg { display: block; }
 
 .title {
   min-width: 0;
@@ -263,7 +316,7 @@ mod tests {
     fn the_glyphs_are_in_the_nerd_font_private_use_area() {
         // A codepoint that fell outside it is one some unpatched font will
         // happily render as something else entirely.
-        for glyph in [GLOBE, GEAR] {
+        for glyph in [GEAR] {
             let c = glyph.chars().next().expect("a glyph");
             assert_eq!(glyph.chars().count(), 1, "one codepoint, not a sequence");
             assert!(
@@ -271,5 +324,15 @@ mod tests {
                 "{glyph:?} is outside the private use area"
             );
         }
+    }
+
+    /// The placeholder is drawn rather than typed, and the two things that make
+    /// it line up are the square viewBox and the 16px box it declares -- the
+    /// same box a favicon gets. `currentColor` is what keeps it themed.
+    #[test]
+    fn the_placeholder_is_a_square_themed_svg() {
+        assert!(GLOBE.contains(r#"viewBox="0 0 24 24""#), "not a square viewBox");
+        assert!(GLOBE.contains(r#"width="16" height="16""#), "not a favicon-sized box");
+        assert!(GLOBE.contains("currentColor"), "a hard-coded colour would not follow the theme");
     }
 }

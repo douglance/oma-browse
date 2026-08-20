@@ -24,39 +24,24 @@
 use anyhow::{Context, Result};
 use tauri::webview::Webview;
 
-/// Share of the window's width the palette card takes, before the bounds below.
-const PALETTE_WIDTH_RATIO: f64 = 0.5;
-/// Narrowest the card gets. Below this the two-line rows start wrapping.
-const PALETTE_MIN_WIDTH: i32 = 420;
-/// Widest it gets. A launcher stretched across an ultrawide is a bar, not a card.
-const PALETTE_MAX_WIDTH: i32 = 900;
-/// Tallest the card gets, and its height on any window with room for it.
-const PALETTE_HEIGHT: i32 = 420;
-/// Shortest it gets before it would rather be clipped than useless.
-const PALETTE_MIN_HEIGHT: i32 = 200;
-/// Gap between the top of the window and the palette.
-const PALETTE_TOP_MARGIN: i32 = 72;
-/// Page left visible either side of the card, and below it.
-const PALETTE_SIDE_MARGIN: i32 = 24;
-const PALETTE_BOTTOM_MARGIN: i32 = 72;
-
 /// The card's size for a window of the given size.
 ///
 /// The ratio is what shapes it; the bounds keep it a card at both extremes, and
 /// the margins win over the minimum, because a card wider than the window is
-/// clipped by the overlay rather than centred in it.
-fn palette_size(window_width: i32, window_height: i32) -> (i32, i32) {
-    let ideal = (f64::from(window_width) * PALETTE_WIDTH_RATIO).round() as i32;
-    let room = (window_width - 2 * PALETTE_SIDE_MARGIN).max(1);
-    let width = ideal.clamp(PALETTE_MIN_WIDTH, PALETTE_MAX_WIDTH).min(room);
+/// clipped by the overlay rather than centred in it. Every number is a
+/// `[chrome.palette]` setting; the defaults live in [`crate::config::Palette`].
+fn palette_size(p: &crate::config::Palette, window_width: i32, window_height: i32) -> (i32, i32) {
+    let ideal = (f64::from(window_width) * p.width_ratio).round() as i32;
+    let room = (window_width - 2 * p.side_margin).max(1);
+    let width = ideal.clamp(p.min_width, p.max_width).min(room);
 
-    let available = window_height - PALETTE_TOP_MARGIN - PALETTE_BOTTOM_MARGIN;
-    let height = available.clamp(PALETTE_MIN_HEIGHT, PALETTE_HEIGHT);
+    let available = window_height - p.top_margin - p.bottom_margin;
+    let height = available.clamp(p.min_height, p.height);
 
     (width, height)
 }
 
-/// Height of the tab strip, in pixels.
+/// Height of the tab strip, in pixels, unless the config file says otherwise.
 ///
 /// Two rows of nothing is what a browser normally spends here; this is one row
 /// of 16px favicons and the padding that keeps them off the page. Anything
@@ -73,14 +58,22 @@ const CONTENT_STACK_NAME: &str = "oma-content-stack";
 
 /// Rebuild the widget tree. Call once, after the palette and first tab exist.
 #[cfg(target_os = "linux")]
-pub fn install<R: tauri::Runtime>(palette: &Webview<R>) -> Result<()> {
+pub fn install<R: tauri::Runtime>(
+    palette: &Webview<R>,
+    config: &crate::config::Chrome,
+) -> Result<()> {
     // Escape hatch for bisecting rendering problems: reparenting a
     // WebKitWebView is the most invasive thing we do to the widget tree, so
     // `OMA_LAYOUT=plain` leaves Tauri's own vertical box alone.
-    if std::env::var("OMA_LAYOUT").as_deref() == Ok("plain") {
-        tracing::warn!("OMA_LAYOUT=plain: skipping the overlay; tabs will tile, not stack");
+    if config.plain_layout || std::env::var("OMA_LAYOUT").as_deref() == Ok("plain") {
+        tracing::warn!("plain layout: skipping the overlay; tabs will tile, not stack");
         return Ok(());
     }
+    // Cloned out of the config before the closure: `with_webview` runs on the
+    // GTK thread whenever it gets there, and the handler it installs outlives
+    // this call entirely.
+    let geometry = config.palette.clone();
+
     palette
         .with_webview(move |platform| {
             use gtk::prelude::*;
@@ -114,10 +107,10 @@ pub fn install<R: tauri::Runtime>(palette: &Webview<R>) -> Result<()> {
             // card, not a bar. The request here is only what the widget asks for
             // before the first layout pass; the handler below is what actually
             // sizes it, on that pass and on every resize after it.
-            palette_widget.set_size_request(PALETTE_MIN_WIDTH, PALETTE_HEIGHT);
+            palette_widget.set_size_request(geometry.min_width, geometry.height);
             palette_widget.set_halign(gtk::Align::Center);
             palette_widget.set_valign(gtk::Align::Start);
-            palette_widget.set_margin_top(PALETTE_TOP_MARGIN);
+            palette_widget.set_margin_top(geometry.top_margin);
 
             // GTK hands the overlay its allocation on every layout pass, which
             // makes it the one place that knows how wide the window currently
@@ -125,7 +118,7 @@ pub fn install<R: tauri::Runtime>(palette: &Webview<R>) -> Result<()> {
             let card = palette_widget.clone();
             let last = std::cell::Cell::new((0, 0));
             overlay.connect_size_allocate(move |_, alloc| {
-                let size = palette_size(alloc.width(), alloc.height());
+                let size = palette_size(&geometry, alloc.width(), alloc.height());
                 // `set_size_request` queues another allocation, so setting it
                 // unconditionally here would spin the layout loop.
                 if last.replace(size) != size {
@@ -177,6 +170,14 @@ pub fn install_keys<R: tauri::Runtime>(
     catalog: incurs::tool::ToolCatalog,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    // Resolved out here, on the async side, where complaining about the config
+    // file is possible: the closure below runs on the GTK thread.
+    let bound = {
+        let complain = |problem: String| state.note_config_problem(problem);
+        bindings(&state.config, &catalog, &complain)
+    };
+    tracing::debug!(count = bound.len(), "key bindings resolved");
+
     anchor
         .with_webview(move |platform| {
             use gtk::prelude::*;
@@ -186,14 +187,6 @@ pub fn install_keys<R: tauri::Runtime>(
                 tracing::error!("no GTK toplevel; keyboard shortcuts are not bound");
                 return;
             };
-
-            // A binding that names a command the graph does not have is a
-            // typo, and a silently dead key is a miserable way to find out.
-            for b in BINDINGS {
-                if catalog.get(b.tool).is_none() {
-                    tracing::error!(tool = b.tool, "key binding names a command that does not exist");
-                }
-            }
 
             top.connect_key_press_event(move |_win, event| {
                 use gtk::gdk::ModifierType;
@@ -209,27 +202,23 @@ pub fn install_keys<R: tauri::Runtime>(
                 // freeze the whole UI.
                 let palette_open = state.palette_visible();
 
-                let hit = BINDINGS.iter().find(|b| {
-                    b.ctrl == ctrl
-                        && b.alt == alt
-                        && b.shift.is_none_or(|want| want == shift)
-                        && b.keys.contains(&name.as_str())
-                        && b.when.applies(palette_open)
-                });
+                let hit = bound
+                    .iter()
+                    .find(|b| b.matches(ctrl, alt, shift, &name) && b.when.applies(palette_open));
 
                 match hit {
                     Some(b) => {
                         let catalog = catalog.clone();
-                        let args = crate::dispatch::args_from_json(b.args);
-                        let (tool, quiet) = (b.tool, b.propagate);
+                        let args = b.args.clone();
+                        let (tool, quiet) = (b.tool.clone(), b.propagate);
                         runtime.spawn(async move {
-                            if let Some(message) = crate::dispatch::run(&catalog, tool, args).await {
+                            if let Some(message) = crate::dispatch::run(&catalog, &tool, args).await {
                                 // A propagating chord fires on presses that were
                                 // meant for the page, so its failures are not
                                 // news: Escape on a window with no tab would
                                 // otherwise raise a notification every time.
                                 if quiet {
-                                    tracing::debug!(tool, %message, "command declined");
+                                    tracing::debug!(%tool, %message, "command declined");
                                 } else {
                                     crate::dispatch::toast(&message);
                                 }
@@ -258,6 +247,131 @@ pub fn install_keys<R: tauri::Runtime>(
     _runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     Ok(())
+}
+
+/// A binding as it is actually installed: the built-in table with the config
+/// file's `[keys]` merged over it.
+///
+/// Owned, where [`Binding`] is `&'static`, because a chord read out of a file
+/// cannot be. Everything else about it is the same.
+#[derive(Debug, Clone)]
+pub struct Bound {
+    ctrl: bool,
+    alt: bool,
+    shift: Option<bool>,
+    keys: Vec<String>,
+    tool: String,
+    args: std::collections::BTreeMap<String, serde_json::Value>,
+    when: When,
+    propagate: bool,
+}
+
+impl Bound {
+    fn matches(&self, ctrl: bool, alt: bool, shift: bool, name: &str) -> bool {
+        self.ctrl == ctrl
+            && self.alt == alt
+            && self.shift.is_none_or(|want| want == shift)
+            && self.keys.iter().any(|k| k == name)
+    }
+
+    /// Whether a chord from the config file addresses this binding.
+    ///
+    /// Key and modifiers, but *not* Shift when the built-in does not care about
+    /// it: `Ctrl-K` is bound with `shift: None`, and someone rebinding it will
+    /// write `"ctrl+k"`, not `"ctrl+shift+k"` as well.
+    fn addressed_by(&self, chord: &crate::keys::Chord) -> bool {
+        self.ctrl == chord.ctrl
+            && self.alt == chord.alt
+            && (self.shift.is_none() || self.shift == chord.shift)
+            && self.keys.iter().any(|k| chord.keys.contains(k))
+    }
+}
+
+/// The bindings to install: the table, plus whatever `[keys]` says.
+///
+/// A config chord that addresses an existing binding replaces its command; one
+/// that does not is added; an empty command unbinds. Everything that goes wrong
+/// -- an unparseable chord, a command the graph does not have, an argument it
+/// will not accept -- is reported through `note_config_problem` and then
+/// *skipped*, because a key that runs nothing is better than one that runs
+/// something unintended, and both are better than refusing to start.
+pub fn bindings(
+    config: &crate::config::Config,
+    catalog: &incurs::tool::ToolCatalog,
+    complain: &impl Fn(String),
+) -> Vec<Bound> {
+    let mut out: Vec<Bound> = BINDINGS
+        .iter()
+        .map(|b| Bound {
+            ctrl: b.ctrl,
+            alt: b.alt,
+            shift: b.shift,
+            keys: b.keys.iter().map(|k| (*k).to_string()).collect(),
+            tool: b.tool.to_string(),
+            args: crate::dispatch::args_from_json(b.args),
+            when: b.when,
+            propagate: b.propagate,
+        })
+        .collect();
+
+    for (spec, command) in &config.keys {
+        let chord = match crate::keys::parse_chord(spec) {
+            Ok(chord) => chord,
+            Err(e) => {
+                complain(format!("keys: {e}"));
+                continue;
+            }
+        };
+
+        // An empty command unbinds, which is the only way to get a key back
+        // from the browser and give it to the page.
+        if command.trim().is_empty() {
+            out.retain(|b| !b.addressed_by(&chord));
+            continue;
+        }
+
+        let tool = command.split_whitespace().next().unwrap_or_default();
+        let Some(def) = catalog.get(tool) else {
+            complain(format!("keys: {spec:?} names {tool:?}, which is not a command"));
+            continue;
+        };
+        let props = def.input_schema.get("properties").and_then(|p| p.as_object());
+        let (tool, args) = match crate::keys::parse_command(command, props) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                complain(format!("keys: {spec:?}: {e}"));
+                continue;
+            }
+        };
+        if let Some(bad) = args.keys().find(|k| !props.is_some_and(|p| p.contains_key(*k))) {
+            complain(format!("keys: {tool} does not take an argument named {bad:?}"));
+            continue;
+        }
+
+        // Replace in place where it addresses something, so a rebound chord
+        // keeps the built-in's `when` and `propagate` -- rebinding Escape
+        // should not quietly stop it reaching the page.
+        let mut replaced = false;
+        for existing in out.iter_mut().filter(|b| b.addressed_by(&chord)) {
+            existing.tool = tool.clone();
+            existing.args = args.clone();
+            replaced = true;
+        }
+        if !replaced {
+            out.push(Bound {
+                ctrl: chord.ctrl,
+                alt: chord.alt,
+                shift: chord.shift,
+                keys: chord.keys.clone(),
+                tool: tool.clone(),
+                args: args.clone(),
+                when: When::Always,
+                propagate: false,
+            });
+        }
+    }
+
+    out
 }
 
 /// One chord, and the command it runs.
@@ -337,6 +451,14 @@ const BINDINGS: &[Binding] = &[
     Binding {
         ctrl: true, alt: false, shift: Some(false),
         keys: &["t", "T"], tool: "tab_open", args: "{}",
+        when: When::Always, propagate: false,
+    },
+    // A window is a second process, not a second window in this one; see
+    // `window::spawn` for why. Shift is excluded so that a future Ctrl-Shift-N
+    // -- incognito, everywhere else -- cannot be swallowed by this row.
+    Binding {
+        ctrl: true, alt: false, shift: Some(false),
+        keys: &["n", "N"], tool: "window_new", args: "{}",
         when: When::Always, propagate: false,
     },
     // Ctrl-Shift-W closes the window; it must come *before* Ctrl-W, which would
@@ -494,6 +616,11 @@ const BINDINGS: &[Binding] = &[
         keys: &["Escape"], tool: "nav_stop", args: "{}",
         when: When::PaletteClosed, propagate: true,
     },
+    // Link hints (`f`, `F`) are deliberately *not* here. A toplevel accelerator
+    // on a bare letter fires wherever the caret is, so it would swallow the `f`
+    // in every search box on the web; only the page knows whether a keystroke
+    // is text. They are bound in `hints.js` as a capturing page handler, and
+    // the Escape row above is what lets the page cancel them.
 ];
 
 #[cfg(target_os = "linux")]
@@ -521,7 +648,7 @@ pub fn focus<R: tauri::Runtime>(_view: &Webview<R>) -> Result<()> {
 /// strip obscures nothing at rest -- the inset is the first thing on the page --
 /// and the content passes beneath it as soon as that inset scrolls away.
 #[cfg(target_os = "linux")]
-pub fn adopt_strip<R: tauri::Runtime>(strip: &Webview<R>) -> Result<()> {
+pub fn adopt_strip<R: tauri::Runtime>(strip: &Webview<R>, height: i32) -> Result<()> {
     strip
         .with_webview(move |platform| {
             use gtk::prelude::*;
@@ -546,7 +673,7 @@ pub fn adopt_strip<R: tauri::Runtime>(strip: &Webview<R>) -> Result<()> {
             // order -- which costs nothing, since the card starts well below.
             widget.set_halign(gtk::Align::Fill);
             widget.set_valign(gtk::Align::Start);
-            widget.set_size_request(-1, STRIP_HEIGHT);
+            widget.set_size_request(-1, height);
 
             // A strip that can take focus is a strip that swallows the next
             // keystroke after a click on it -- and every shortcut is bound on
@@ -595,7 +722,10 @@ pub fn adopt_tab<R: tauri::Runtime>(tab: &Webview<R>) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install<R: tauri::Runtime>(_palette: &Webview<R>) -> Result<()> {
+pub fn install<R: tauri::Runtime>(
+    _palette: &Webview<R>,
+    _config: &crate::config::Chrome,
+) -> Result<()> {
     Ok(())
 }
 
@@ -605,14 +735,14 @@ pub fn adopt_tab<R: tauri::Runtime>(_tab: &Webview<R>) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn adopt_strip<R: tauri::Runtime>(_strip: &Webview<R>) -> Result<()> {
+pub fn adopt_strip<R: tauri::Runtime>(_strip: &Webview<R>, _height: i32) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BINDINGS, PALETTE_HEIGHT, PALETTE_MAX_WIDTH, PALETTE_MIN_WIDTH, PALETTE_SIDE_MARGIN,
+        BINDINGS, When,
         palette_size,
     };
 
@@ -621,22 +751,109 @@ mod tests {
     /// and, on the tab rows, its close button with it.
     #[test]
     fn the_card_tracks_the_window_width() {
-        assert_eq!(palette_size(1400, 900).0, 700);
-        assert_eq!(palette_size(1000, 900).0, 500);
+        let p = crate::config::Palette::default();
+
+        assert_eq!(palette_size(&p, 1400, 900).0, 700);
+        assert_eq!(palette_size(&p, 1000, 900).0, 500);
 
         // Bounded at both ends.
-        assert_eq!(palette_size(3440, 900).0, PALETTE_MAX_WIDTH);
-        assert_eq!(palette_size(700, 900).0, PALETTE_MIN_WIDTH);
+        assert_eq!(palette_size(&p, 3440, 900).0, p.max_width);
+        assert_eq!(palette_size(&p, 700, 900).0, p.min_width);
 
         // And on a window too narrow for even the minimum, the margins win.
-        let narrow = palette_size(360, 900).0;
-        assert!(narrow < PALETTE_MIN_WIDTH, "{narrow} should have been squeezed");
-        assert_eq!(narrow, 360 - 2 * PALETTE_SIDE_MARGIN);
+        let narrow = palette_size(&p, 360, 900).0;
+        assert!(narrow < p.min_width, "{narrow} should have been squeezed");
+        assert_eq!(narrow, 360 - 2 * p.side_margin);
 
         // A short window trims the card rather than overflowing the page.
-        assert_eq!(palette_size(1400, 900).1, PALETTE_HEIGHT);
-        assert!(palette_size(1400, 500).1 < PALETTE_HEIGHT);
-        assert!(palette_size(1400, 100).1 > 0);
+        assert_eq!(palette_size(&p, 1400, 900).1, p.height);
+        assert!(palette_size(&p, 1400, 500).1 < p.height);
+        assert!(palette_size(&p, 1400, 100).1 > 0);
+    }
+
+    /// A card configured wider than it is allowed to be is still a card: the
+    /// bounds are what keep `width_ratio = 1.0` from becoming a bar.
+    #[test]
+    fn the_configured_bounds_are_what_hold() {
+        let wide = crate::config::Palette { width_ratio: 1.0, ..Default::default() };
+        assert_eq!(palette_size(&wide, 1400, 900).0, wide.max_width);
+
+        let roomy = crate::config::Palette { max_width: 1200, ..Default::default() };
+        assert_eq!(palette_size(&roomy, 1400, 900).0, 700, "the ratio still shapes it");
+    }
+
+    /// What the config file may do to the table: replace, add, unbind.
+    #[tokio::test]
+    async fn the_config_file_rebinds_adds_and_unbinds() {
+        use crate::config::Config;
+
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog = crate::commands::command_graph(state)
+            .try_tool_catalog()
+            .expect("the graph has unique tool names");
+        let quiet = |_: String| {};
+
+        let stock = super::bindings(&Config::default(), &catalog, &quiet);
+        let bound_to = |list: &[super::Bound], key: &str, ctrl: bool, shift: bool| {
+            list.iter()
+                .find(|b| b.matches(ctrl, false, shift, key))
+                .map(|b| b.tool.clone())
+        };
+        assert_eq!(bound_to(&stock, "t", true, false).as_deref(), Some("tab_open"));
+
+        let mut config = Config::default();
+        config.keys.insert("ctrl+t".into(), "page_hints".into());
+        config.keys.insert("ctrl+shift+j".into(), "tab_cycle --delta -1".into());
+        config.keys.insert("ctrl+d".into(), String::new());
+        let merged = super::bindings(&config, &catalog, &quiet);
+
+        assert_eq!(
+            bound_to(&merged, "t", true, false).as_deref(),
+            Some("page_hints"),
+            "an addressed chord is replaced, not duplicated"
+        );
+        assert_eq!(
+            merged.iter().filter(|b| b.matches(true, false, false, "t")).count(),
+            1,
+            "and exactly once"
+        );
+        assert_eq!(
+            bound_to(&merged, "j", true, true).as_deref(),
+            Some("tab_cycle"),
+            "a chord nothing holds is added"
+        );
+        assert!(bound_to(&merged, "d", true, false).is_none(), "an empty command unbinds");
+    }
+
+    /// A broken line in the file loses that one binding and nothing else.
+    #[tokio::test]
+    async fn a_bad_binding_is_skipped_and_reported() {
+        use crate::config::Config;
+
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog = crate::commands::command_graph(state)
+            .try_tool_catalog()
+            .expect("the graph has unique tool names");
+
+        let mut config = Config::default();
+        config.keys.insert("ctrl+shift".into(), "tab_open".into()); // no key
+        config.keys.insert("ctrl+y".into(), "no_such_command".into());
+        config.keys.insert("ctrl+u".into(), "tab_open --nonsense 1".into());
+
+        let complaints = std::sync::Mutex::new(Vec::new());
+        let merged = super::bindings(&config, &catalog, &|p| {
+            complaints.lock().unwrap().push(p);
+        });
+
+        assert_eq!(complaints.lock().unwrap().len(), 3, "each bad line says so once");
+        assert!(
+            merged.iter().all(|b| b.tool != "no_such_command"),
+            "a command that does not exist is never installed"
+        );
+        assert!(
+            merged.iter().any(|b| b.matches(true, false, false, "t")),
+            "and the rest of the table survives"
+        );
     }
 
     /// Every chord must name a command that exists, with arguments that command
@@ -663,6 +880,58 @@ mod tests {
                     props.is_some_and(|p| p.contains_key(key)),
                     "{} does not accept an argument named {key:?}",
                     b.tool
+                );
+            }
+        }
+    }
+
+    /// Escape is the one key bound twice, and the split is the whole point: it
+    /// dismisses the palette when there is one, and otherwise stops the load
+    /// *and lets the page have the key*. A page whose modal cannot be closed is
+    /// what the single unconditional binding used to cause.
+    #[test]
+    fn escape_is_bound_once_per_palette_state() {
+        let escape: Vec<_> =
+            BINDINGS.iter().filter(|b| b.keys.contains(&"Escape")).collect();
+        assert_eq!(escape.len(), 2, "Escape needs one binding per palette state");
+
+        let open = escape.iter().find(|b| b.when == When::PaletteOpen).expect("no palette-open Escape");
+        let closed =
+            escape.iter().find(|b| b.when == When::PaletteClosed).expect("no palette-closed Escape");
+
+        assert_eq!(open.tool, "ui_palette");
+        assert!(!open.propagate, "the palette's own Escape is not the page's business");
+        assert_eq!(closed.tool, "nav_stop");
+        assert!(closed.propagate, "the page must still see Escape");
+
+        // Propagation is the exception, not a thing to reach for: anything else
+        // the browser binds, it owns outright.
+        let propagating: Vec<&str> =
+            BINDINGS.iter().filter(|b| b.propagate).map(|b| b.tool).collect();
+        assert_eq!(propagating, vec!["nav_stop"]);
+    }
+
+    /// Two bindings that can both fire on the same keystroke: the second is
+    /// dead, because the handler takes the first match. `when` splits Escape
+    /// legitimately; anything else sharing a chord is a mistake.
+    #[test]
+    fn no_two_bindings_claim_the_same_chord() {
+        for (i, b) in BINDINGS.iter().enumerate() {
+            for other in &BINDINGS[i + 1..] {
+                let same_mods = b.ctrl == other.ctrl && b.alt == other.alt;
+                let same_shift = match (b.shift, other.shift) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => true,
+                };
+                let overlaps = [true, false]
+                    .iter()
+                    .any(|&open| b.when.applies(open) && other.when.applies(open));
+                let shared = b.keys.iter().any(|k| other.keys.contains(k));
+                assert!(
+                    !(same_mods && same_shift && overlaps && shared),
+                    "{} and {} both claim the same chord; the second can never fire",
+                    b.tool,
+                    other.tool
                 );
             }
         }

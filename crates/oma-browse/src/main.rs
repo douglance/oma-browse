@@ -2,12 +2,18 @@
 
 mod bookmarks;
 mod commands;
+mod config;
 mod dispatch;
+mod downloads;
+mod engine;
 mod favicon;
 mod fuzzy;
+mod hints;
 mod history;
+mod keys;
 mod layout;
 mod server;
+mod session;
 mod shot;
 mod state;
 mod strip;
@@ -28,24 +34,29 @@ use crate::state::AppState;
 /// rewrites its own `--private` to `--incognito` for non-Firefox, non-Edge
 /// browsers, so both of those have to land in GUI mode.
 enum Invocation {
-    Gui { url: Option<String>, incognito: bool },
+    Gui { url: Option<String>, incognito: bool, palette: bool },
     Command,
 }
 
 fn classify(args: &[String]) -> Invocation {
     let mut url = None;
     let mut incognito = false;
+    let mut palette = false;
 
     for arg in args {
         match arg.as_str() {
             "--incognito" | "--private" => incognito = true,
+            // Ours, and only ours: `window new` passes it when it has no URL to
+            // send the new window to, so Ctrl-N comes up asking where to go
+            // rather than sitting on the start page. See `window::spawn`.
+            "--palette" => palette = true,
             a if looks_like_url(a) => url = Some(normalize_url(a)),
             // Anything else is a subcommand or a flag for one; hand the whole
             // argv to incurs and let it do the parsing and the error messages.
             _ => return Invocation::Command,
         }
     }
-    Invocation::Gui { url, incognito }
+    Invocation::Gui { url, incognito, palette }
 }
 
 fn looks_like_url(s: &str) -> bool {
@@ -65,7 +76,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let state = Arc::new(AppState::new());
+    // Before anything else: the window's size, the home page and the search
+    // engine all come out of it, and Tauri owns the main thread from `run` on.
+    let state = Arc::new(AppState::new(config::Config::load()));
     let cli = commands::command_graph(state.clone());
 
     // The registry every non-CLI surface dispatches through. `try_` rather than
@@ -83,7 +96,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Invocation::Gui { url, incognito } => {
+        Invocation::Gui { url, incognito, palette } => {
+            // The flag or the config file; either is enough. There is no way to
+            // ask for a *public* window from a config that says otherwise,
+            // which is the right way round for this particular setting.
+            let incognito = incognito || state.config.startup.incognito;
             let server = server::build(&cli, catalog.clone(), state.clone()).await?;
             let addr = server.addr;
             tracing::info!(%addr, ?url, incognito, "oma-browse control plane up");
@@ -98,11 +115,19 @@ async fn main() -> Result<()> {
 
             let base: url::Url = format!("http://{addr}/").parse()?;
             state.set_base_url(base.clone());
-            let start_url = match url {
+            let start_url: url::Url = match url {
                 Some(u) => u.parse()?,
-                None => base.join("start")?,
+                // The configured home, or the browser's own start page when
+                // `home` is empty. Resolved the way the palette resolves it, so
+                // a bare host in the config file works.
+                None => {
+                    let fallback = base.join("start")?.to_string();
+                    state.config.home_url(&fallback).parse()?
+                }
             };
 
+            // `theme.veil` has already been folded into this by
+            // `ThemeState::load`, so there is one number here and not two.
             let (background, opacity) = {
                 let theme = state.theme.read().await;
                 (theme.css.tint, theme.css.opacity)
@@ -126,6 +151,26 @@ async fn main() -> Result<()> {
             // user's to install: it writes into their Omarchy config.
             spawn_theme_watcher(state.clone());
 
+            // Keep `~/.local/state/oma-browse/session` in step with the tab
+            // list, so `tab restore` has something to restore. Read the old
+            // session *before* starting the ticker, which would overwrite it.
+            // Before the ticker, which would otherwise overwrite the very
+            // thing `tab restore` exists to read.
+            session::init();
+            let restore = state.config.startup.restore && !incognito;
+            let previous = if restore { session::saved() } else { Vec::new() };
+            crate::session::spawn(state.clone());
+            if !previous.is_empty() {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    // After the window exists: `tabs::open` needs an app handle,
+                    // and Tauri does not have one until `setup` has run.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let opened = session::restore(&state).await;
+                    tracing::info!(opened, "restored the last session");
+                });
+            }
+
             window::run(window::Launch {
                 state,
                 base,
@@ -136,6 +181,7 @@ async fn main() -> Result<()> {
                 page_script,
                 first_tab,
                 catalog,
+                open_palette: palette,
             })
         }
     }
@@ -200,9 +246,22 @@ mod tests {
     }
 
     #[test]
+    fn palette_flag_is_gui() {
+        // `window new` hands this to the window it opens; incurs' parser must
+        // never see it, or Ctrl-N would spawn a process that prints usage.
+        match classify(&args(&["--palette"])) {
+            Invocation::Gui { url, palette, .. } => {
+                assert!(palette);
+                assert!(url.is_none());
+            }
+            _ => panic!("--palette must open the GUI"),
+        }
+    }
+
+    #[test]
     fn incognito_with_a_url_is_still_gui() {
         match classify(&args(&["--incognito", "https://example.com"])) {
-            Invocation::Gui { url, incognito } => {
+            Invocation::Gui { url, incognito, .. } => {
                 assert!(incognito);
                 assert_eq!(url.as_deref(), Some("https://example.com"));
             }

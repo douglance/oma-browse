@@ -42,6 +42,16 @@
   var sticky = [];
 
   window.__oma = {
+    // The theme, for the injected scripts that are not this one. `link hints`
+    // needs a colour that stands off the page, and the token block below is
+    // published to *our own* chrome rather than to loaded sites, so reading
+    // `--oma-accent` off the document root gets nothing.
+    theme: {
+      accent: CFG.accent,
+      selection: CFG.selection,
+      bg: "rgb(" + CFG.tint.join(",") + ")",
+      fg: "rgb(" + CFG.fgRgb.join(",") + ")"
+    },
     teardown: function () {
       for (var i = 0; i < listeners.length; i++) {
         listeners[i][0].removeEventListener(listeners[i][1], listeners[i][2], listeners[i][3]);
@@ -709,11 +719,23 @@
   //
   // Reading `el.style.*` is a parsed-attribute read rather than a computed one,
   // so none of this forces layout.
+  // Our own chrome, injected into the page: the veil, the backers, the strip's
+  // inset, link-hint labels. It is themed already, and running it through the
+  // site pass would retint it to whatever the site's palette happens to imply.
+  function ours(el) {
+    if (el.classList && el.classList.contains(BACKER_CLASS)) return true;
+    try {
+      return !!(el.closest && el.closest('[id^="__oma_browse_"]'));
+    } catch (e) {
+      return false;
+    }
+  }
+
   function fixElementColours(base) {
     var nodes = document.querySelectorAll('[style*="background"],[style*="color"],[style*="gradient"]');
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
-      if (el.classList.contains(BACKER_CLASS)) continue;
+      if (ours(el)) continue;
       var bg = el.style.backgroundColor;
       if (bg && isNeutral(bg)) {
         // Same rule as the stylesheet pass: the canvas belongs to the veil. X
@@ -805,7 +827,7 @@
     var keep = [];
     for (var k = 0; k < candidates.length; k++) {
       var el = candidates[k];
-      if (el.classList.contains(BACKER_CLASS)) continue;
+      if (ours(el)) continue;
       var cs;
       try {
         cs = getComputedStyle(el);

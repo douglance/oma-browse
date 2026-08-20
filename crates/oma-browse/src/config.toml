@@ -1,0 +1,165 @@
+# oma-browse
+#
+# Every setting is optional; delete a line to get its default back. Sections are
+# named for the surface they affect: [chrome] is the browser's own interface,
+# [theme] is what loaded websites get, [engine] is WebKit itself.
+#
+# `oma-browse config show` prints this file as the browser actually resolved it.
+
+# The page a bare `oma-browse` opens, and where Alt-Home goes.
+# Anything the palette accepts works here: a URL, a bare host, or a search.
+# Empty means the browser's own start page.
+home = ""
+
+# Where anything that is not a URL gets searched. `{query}` is url-encoded; a
+# template without it gets the terms appended.
+search = "https://duckduckgo.com/?q={query}"
+
+# --- the browser's own interface -------------------------------------------
+
+[chrome]
+# How see-through the palette card is. Opaque on purpose: it is a card you read
+# dense text off, and it has no reason to inherit the page's translucency.
+# "auto" follows the page's veil instead.
+veil = 1.0
+# Nerd Font first and by name: the strip and the palette draw glyphs from the
+# patched range, and an unpatched font renders them as tofu.
+font = "\"JetBrainsMono Nerd Font\", \"Symbols Nerd Font\", var(--oma-font-mono), monospace"
+# Skip the GTK overlay surgery -- tabs tile instead of stacking, and there is no
+# floating palette. For bisecting rendering problems.
+plain_layout = false
+
+[chrome.palette]
+# The card is a share of the window's width, bounded either side.
+width_ratio = 0.5
+min_width = 420
+max_width = 900
+height = 420
+min_height = 200
+top_margin = 72
+side_margin = 24
+bottom_margin = 72
+# How many results a search shows, and how much of each kind the idle menu
+# lists below the commands.
+rows = 24
+history_rows = 8
+# How many downloaded files it lists there. Short on purpose: this is "open the
+# thing I just saved"; `oma-browse download list` is the whole list.
+download_rows = 5
+
+[chrome.strip]
+# The floating row of favicons at the top of the window.
+enabled = true
+# Its height, which is also the inset every page gets at the top. Turning the
+# strip off gives that inset back.
+height = 26
+# The active tab's title, in the middle.
+title = true
+# How long to coalesce redraws for. One page load fires a URL change, a title
+# change and a favicon within milliseconds.
+debounce_ms = 80
+
+# --- what loaded websites get ----------------------------------------------
+
+[theme]
+# How see-through a page is. "auto" solves for contrast against the wallpaper
+# and follows Ghostty's background-opacity, so the browser is as translucent as
+# the terminal; a number pins it whatever the wallpaper does.
+veil = "auto"
+# Repaint neutral page surfaces onto the theme's ramp. Only greyscale surfaces
+# are touched, so a site's brand colour survives. Turn it off for a site that
+# does not survive it -- or at runtime, with `oma-browse theme recolor off`.
+recolor = true
+
+# --- the window ------------------------------------------------------------
+
+[window]
+width = 1400
+height = 900
+# A GTK titlebar. Omarchy tiles everything and paints its own border, so this is
+# off: it would be wasted rows.
+decorations = false
+# What a tiling window manager labels the window by.
+title = "oma-browse"
+
+# --- WebKit itself ---------------------------------------------------------
+
+[engine]
+javascript = true
+# Right-click, Inspect Element.
+devtools = false
+# Empty is WebKit's own.
+user_agent = ""
+# Let media start playing without a click.
+autoplay = true
+webrtc = true
+webgl = true
+smooth_scrolling = true
+# The default font size a page gets, in pixels.
+font_size = 16
+# "always", "never", or "no-third-party".
+cookies = "no-third-party"
+
+# --- the control plane -----------------------------------------------------
+
+[control]
+# The port the HTTP control plane listens on. 0 takes whatever is free, which
+# means reading the log to find it; a fixed port is what makes the browser
+# reachable by something that did not watch it start. Loopback either way.
+port = 0
+# Write the live port to $XDG_RUNTIME_DIR/oma-browse/port.
+port_file = true
+
+[startup]
+# Start every window incognito, as though --incognito were always passed.
+incognito = false
+# Reopen the tabs that were open when the browser last closed. Off by default:
+# a browser that opens eleven tabs because you asked for one is a browser you
+# stop launching from a keybind. `oma-browse tab restore` does it on demand.
+restore = false
+
+# --- what the browser remembers --------------------------------------------
+
+[history]
+# Remember where the browser has been. False is what --incognito does to
+# history, permanently, without what it does to everything else.
+enabled = true
+limit = 5000
+
+[downloads]
+# Where files land. Empty follows the desktop's own download directory. `~` is
+# expanded; nothing else is.
+dir = ""
+# Say so, on the desktop, when a download finishes.
+notify = true
+
+[screenshot]
+# Where `page screenshot` writes when told nowhere. Empty is
+# $XDG_RUNTIME_DIR/oma-browse: per-boot, user-private, and cleaned up by the
+# system rather than accumulating in your home directory.
+dir = ""
+# Capture the whole scrollable document rather than just the viewport.
+full = false
+# Keep the page's transparency instead of compositing it onto white.
+transparent = false
+
+[tabs]
+# How many closed tabs Ctrl-Shift-T can walk back through.
+reopen_depth = 32
+# What a new tab starts at, and the ladder Ctrl-+ and Ctrl-- step along.
+zoom = 1.0
+zoom_steps = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
+# The size favicons are stored at. Sites do ship 512px icons, and one of those
+# is 40KB of base64 re-sent on every strip redraw.
+favicon_size = 32
+
+# --- keys ------------------------------------------------------------------
+#
+# Chord to command, overriding the built-in table. The command is a name from
+# `oma-browse --llms` with optional flags; an empty value unbinds the chord.
+# Anything not named here keeps its default binding.
+#
+# [keys]
+# "ctrl+k" = "ui_palette --action toggle"
+# "ctrl+shift+p" = "page_hints"
+# "ctrl+d" = ""

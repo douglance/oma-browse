@@ -17,12 +17,6 @@ use tauri::webview::Webview;
 
 use crate::state::AppState;
 
-/// Icons are painted at 16 CSS pixels in a 26px strip; 32 covers hidpi and
-/// nothing more. Sites do ship 512px PNGs, and one of those is 40KB of base64
-/// re-sent on every strip render -- so oversized icons are scaled on the way in
-/// rather than left for the browser to scale on every paint.
-const ICON_PX: i32 = 32;
-
 /// Hook a content webview so its favicon reaches the tab model.
 ///
 /// Called for every tab, including the first, because the signal is per webview
@@ -98,7 +92,8 @@ fn enable_database(context: &webkit2gtk::WebContext, incognito: bool) {
 /// happens here and only a `data:` URL crosses back to the runtime.
 #[cfg(target_os = "linux")]
 fn publish(state: &Arc<AppState>, label: &str, surface: Option<gtk::cairo::Surface>) {
-    let Some(icon) = surface.and_then(|s| encode(&s)) else { return };
+    let size = state.config.tabs.favicon_size.max(1);
+    let Some(icon) = surface.and_then(|s| encode(&s, size)) else { return };
 
     let state = state.clone();
     let label = label.to_string();
@@ -116,7 +111,7 @@ fn publish(state: &Arc<AppState>, label: &str, surface: Option<gtk::cairo::Surfa
 /// undo that -- and because scaling is then one call rather than a second
 /// surface and a cairo context.
 #[cfg(target_os = "linux")]
-fn encode(surface: &gtk::cairo::Surface) -> Option<String> {
+fn encode(surface: &gtk::cairo::Surface, max_px: i32) -> Option<String> {
     use gtk::gdk_pixbuf::InterpType;
 
     let image = gtk::cairo::ImageSurface::try_from(surface.clone()).ok()?;
@@ -126,8 +121,8 @@ fn encode(surface: &gtk::cairo::Surface) -> Option<String> {
     }
 
     let pixbuf = gtk::gdk::pixbuf_get_from_surface(surface, 0, 0, width, height)?;
-    let pixbuf = if width > ICON_PX || height > ICON_PX {
-        pixbuf.scale_simple(ICON_PX, ICON_PX, InterpType::Bilinear)?
+    let pixbuf = if width > max_px || height > max_px {
+        pixbuf.scale_simple(max_px, max_px, InterpType::Bilinear)?
     } else {
         pixbuf
     };

@@ -21,8 +21,23 @@ pub struct ThemeState {
 }
 
 impl ThemeState {
-    fn load() -> Self {
-        let theme = Theme::load();
+    /// Read the live theme, with the config file's say over how see-through a
+    /// page ends up.
+    ///
+    /// `theme.veil` is applied here rather than inside `oma-theme`, which has no
+    /// business knowing this crate's config exists: `Theme::opacity` is a plain
+    /// field, and everything downstream -- `--oma-veil`, the page's veil
+    /// element, the window's alpha -- is derived from it by `css()`.
+    ///
+    /// `OMA_VEIL` still wins. It is the bisecting hatch, and a hatch that a
+    /// config file could shut is not one.
+    fn load(config: &crate::config::Config) -> Self {
+        let mut theme = Theme::load();
+        if oma_theme::veil_override().is_none()
+            && let Some(pinned) = config.theme.veil.fixed()
+        {
+            theme.opacity = pinned;
+        }
         Self {
             name: theme.name.clone(),
             mode: theme.mode(),
@@ -46,12 +61,21 @@ pub enum UiEvent {
 }
 
 pub struct AppState {
+    /// The dotfile, read once at startup. Everything in it is a setting the
+    /// browser reads rather than a value it changes, so it needs no lock.
+    pub config: crate::config::Config,
     pub theme: RwLock<ThemeState>,
     pub tabs: RwLock<Tabs>,
     /// Where the browser has been. Empty and never written in an incognito
     /// window -- see [`AppState::set_incognito`].
     pub history: RwLock<crate::history::History>,
     pub bookmarks: RwLock<crate::bookmarks::Bookmarks>,
+    /// What has been saved to disk.
+    ///
+    /// A `std::sync::Mutex`, not tokio's, and deliberately: WebKit's download
+    /// callbacks arrive on the GTK main thread with no runtime under them, and
+    /// an async lock cannot be taken there.
+    pub downloads: std::sync::Mutex<crate::downloads::Downloads>,
     /// Set once, after Tauri's `setup` runs. Everything that touches a webview
     /// goes through here, so commands work identically from the GUI, the CLI
     /// and MCP.
@@ -71,6 +95,8 @@ pub struct AppState {
     stage: std::sync::Mutex<Option<String>>,
     /// Whether this window forgets where it has been.
     incognito: std::sync::atomic::AtomicBool,
+    /// Whether WebKit's shared download signal has been hooked yet.
+    download_hook: std::sync::atomic::AtomicBool,
     /// Whether to repaint neutral page surfaces.
     ///
     /// On by default. A browser that themes its own chrome but leaves every page
@@ -78,28 +104,45 @@ pub struct AppState {
     /// only greyscale surfaces are touched, so brand colour survives. Turn it off
     /// with `oma-browse theme recolor off` when a site does not survive it.
     recolor: std::sync::atomic::AtomicBool,
+    /// Set once the cookie policy has been applied to the shared web context.
+    cookie_policy: std::sync::atomic::AtomicBool,
+    /// A complaint about the configuration raised after startup.
+    late_problem: std::sync::Mutex<Option<String>>,
     /// The local control plane's base URL, used by injected scripts.
     base: OnceLock<url::Url>,
     events: broadcast::Sender<UiEvent>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(config: crate::config::Config) -> Self {
         let (events, _) = broadcast::channel(32);
         Self {
-            theme: RwLock::new(ThemeState::load()),
-            tabs: RwLock::new(Tabs::default()),
-            history: RwLock::new(crate::history::History::load()),
+            theme: RwLock::new(ThemeState::load(&config)),
+            tabs: RwLock::new(Tabs::with_reopen_depth(config.tabs.reopen_depth)),
+            history: RwLock::new(crate::history::History::load_with(config.history.limit)),
             bookmarks: RwLock::new(crate::bookmarks::Bookmarks::load()),
+            downloads: std::sync::Mutex::new(crate::downloads::Downloads::load()),
             incognito: std::sync::atomic::AtomicBool::new(false),
+            download_hook: std::sync::atomic::AtomicBool::new(false),
             stage: std::sync::Mutex::new(None),
             app: OnceLock::new(),
             rt: tokio::runtime::Handle::current(),
             palette: std::sync::atomic::AtomicBool::new(false),
-            recolor: std::sync::atomic::AtomicBool::new(true),
+            recolor: std::sync::atomic::AtomicBool::new(config.theme.recolor),
             base: OnceLock::new(),
+            cookie_policy: std::sync::atomic::AtomicBool::new(false),
+            late_problem: std::sync::Mutex::new(None),
             events,
+            config,
         }
+    }
+
+    /// Whether a visit should be written down.
+    ///
+    /// Two ways to answer no, and they are different questions: this window is
+    /// incognito, or this browser never keeps history at all.
+    pub fn keeps_history(&self) -> bool {
+        !self.incognito() && self.config.history.enabled
     }
 
     /// An app state whose history and bookmarks are detached from disk.
@@ -110,9 +153,10 @@ impl AppState {
     /// fail them.
     #[cfg(test)]
     pub fn detached() -> Self {
-        let mut state = Self::new();
+        let mut state = Self::new(crate::config::Config::default());
         *state.history.get_mut() = crate::history::History::default();
         *state.bookmarks.get_mut() = crate::bookmarks::Bookmarks::default();
+        *state.downloads.get_mut().unwrap() = crate::downloads::Downloads::default();
         state
     }
 
@@ -125,18 +169,81 @@ impl AppState {
         self.app.get().cloned()
     }
 
-    /// What a content webview needs injected: the theme's page styling.
+    /// What a content webview needs injected: the theme's page styling, the tab
+    /// strip's inset, and link hints.
     ///
-    /// Shortcuts are deliberately *not* here. They started as an injected key
-    /// handler, but a page-level handler only fires when that webview holds
-    /// focus — and it would never work on a page that blocks scripts. They are
-    /// bound on the GTK toplevel instead; see [`crate::layout::install_keys`].
+    /// Shortcuts are otherwise deliberately *not* here. They started as an
+    /// injected key handler, but a page-level handler only fires when that
+    /// webview holds focus — and it would never work on a page that blocks
+    /// scripts. They are bound on the GTK toplevel instead; see
+    /// [`crate::layout::install_keys`].
+    ///
+    /// Link hints are the one exception, and for a reason that only applies to
+    /// them: their key is a bare `f`, which is a letter, and a toplevel
+    /// accelerator would eat it in every search box on the web. Only the page
+    /// knows where the caret is. See [`crate::hints`].
     pub async fn page_script(&self) -> String {
         let theme = self.theme.read().await.css.page_script(self.recolor());
-        // The strip's inset rides along with the theme's injection rather than
-        // being a second `initialization_script`: both have to be re-applied on
-        // every navigation, and there is only one hook for that.
-        format!("{theme}\n{}", crate::strip::inset_script())
+        // These ride along with the theme's injection rather than being further
+        // `initialization_script`s: all of them have to be re-applied on every
+        // navigation, and there is only one hook for that.
+        format!("{theme}\n{}\n{}", self.inset_script(), crate::hints::script())
+    }
+
+    /// Take the right to set the cookie policy, once. Same reason as the
+    /// download hook below: the policy is the shared `WebContext`'s, not a
+    /// tab's.
+    pub fn claim_cookie_policy(&self) -> bool {
+        !self.cookie_policy.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Something the browser noticed about its own configuration after the file
+    /// was read -- a value that parsed but does not mean anything.
+    ///
+    /// Separate from `Config::problem` because the config itself is immutable
+    /// once loaded; `config show` reports whichever of the two happened.
+    pub fn note_config_problem(&self, problem: String) {
+        tracing::warn!(%problem, "config");
+        if let Ok(mut slot) = self.late_problem.lock()
+            && slot.is_none()
+        {
+            *slot = Some(problem);
+        }
+    }
+
+    /// What is wrong with the configuration, if anything: the parse failure
+    /// first, since a file that did not load explains everything after it.
+    pub fn config_problem(&self) -> Option<String> {
+        self.config
+            .problem
+            .clone()
+            .or_else(|| self.late_problem.lock().ok().and_then(|slot| slot.clone()))
+    }
+
+    /// Take the right to hook WebKit's downloads, once.
+    ///
+    /// The signal lives on the `WebContext`, which every tab shares, so hooking
+    /// it per tab would report each download once per open tab.
+    pub fn claim_download_hook(&self) -> bool {
+        !self.download_hook.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Where a download should land, and under what name.
+    ///
+    /// Resolved per download rather than once at startup: the directory can be
+    /// created, removed or filled between two saves, and `unique` has to see the
+    /// disk as it is at the moment the file is written.
+    pub fn download_path(&self, suggested: &str) -> std::path::PathBuf {
+        let configured = self.config.downloads.dir.trim();
+        let dir = if configured.is_empty() {
+            crate::downloads::download_dir()
+        } else {
+            std::path::PathBuf::from(shellexpand(configured))
+        };
+        // A download that cannot be placed is a download that is lost, so make
+        // the directory rather than letting WebKit fail on it.
+        let _ = std::fs::create_dir_all(&dir);
+        crate::downloads::unique(&dir, suggested)
     }
 
     /// Ask the palette to open staged into a command.
@@ -159,6 +266,16 @@ impl AppState {
     /// history, so an incognito window leaves no trace on disk.
     pub fn set_incognito(&self, on: bool) {
         self.incognito.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The strip's top inset, or nothing at all when the strip is off -- the
+    /// room is only worth taking for something that is going to be there.
+    pub fn inset_script(&self) -> String {
+        if self.config.chrome.strip.enabled {
+            crate::strip::inset_script(self.config.chrome.strip.height)
+        } else {
+            String::new()
+        }
     }
 
     pub fn recolor(&self) -> bool {
@@ -228,7 +345,9 @@ impl AppState {
     /// The fingerprint check matters: the hook and the inotify fallback both fire
     /// for a single `omarchy theme set`, and repainting twice is visible.
     pub async fn reload_theme(&self) -> bool {
-        let next = ThemeState::load();
+        // The config's veil survives a theme change: it is a statement about
+        // this browser, not about the theme that happens to be on.
+        let next = ThemeState::load(&self.config);
         let mut current = self.theme.write().await;
         if current.css.fingerprint == next.css.fingerprint {
             tracing::debug!(theme = %next.name, "theme reload was a no-op");
@@ -246,8 +365,23 @@ impl AppState {
     }
 }
 
+/// `~` at the start of a configured path, and nothing else.
+///
+/// A config file is written by a human, and a human writes `~/Downloads`. Full
+/// shell expansion in a path a browser writes files to would be a liability
+/// rather than a feature.
+fn shellexpand(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/{rest}")
+        }
+        None => path.to_string(),
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::config::Config::default())
     }
 }

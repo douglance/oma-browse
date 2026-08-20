@@ -18,13 +18,6 @@ use crate::state::AppState;
 /// The palette webview's label. Reserved: it is never a tab.
 pub const PALETTE_LABEL: &str = "palette";
 
-/// How long to wait before redrawing the strip after something changes.
-///
-/// One page load fires a URL change, a title change and a favicon, in that
-/// order and milliseconds apart. Redrawing on each is three reloads of the same
-/// row, and the middle one shows a title with no icon.
-const STRIP_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(80);
-
 pub struct Launch {
     pub state: Arc<AppState>,
     pub base: url::Url,
@@ -43,6 +36,11 @@ pub struct Launch {
     /// The command registry, so keyboard shortcuts dispatch through the same
     /// graph the CLI and MCP do rather than reimplementing it.
     pub catalog: incurs::tool::ToolCatalog,
+    /// Come up with the palette already asking where to go. Set by `window new`
+    /// when it has no URL to hand the window it is opening; never by a bare
+    /// launch, which is someone starting the browser rather than asking it a
+    /// question.
+    pub open_palette: bool,
 }
 
 pub fn run(launch: Launch) -> Result<()> {
@@ -56,6 +54,7 @@ pub fn run(launch: Launch) -> Result<()> {
         page_script,
         first_tab,
         catalog,
+        open_palette,
     } = launch;
 
     // The veil is painted once, in CSS. Every native surface underneath it is
@@ -63,7 +62,11 @@ pub fn run(launch: Launch) -> Result<()> {
     // `AppState::background_color`.
     state.set_incognito(incognito);
 
-    let translucent = opacity.clamp(0.0, 1.0) < 1.0;
+    // Either surface wanting translucency is enough to need it from the window:
+    // the page's veil is an element, but chrome's alpha has nothing behind it
+    // except whatever the compositor shows through an RGBA window.
+    let chrome_veil = state.config.chrome.veil.resolve(opacity);
+    let translucent = opacity.clamp(0.0, 1.0) < 1.0 || chrome_veil < 1.0;
     let alpha = if translucent { 0 } else { 255 };
     let bg = tauri::window::Color(background.r, background.g, background.b, alpha);
     // The strip is transparent whatever the theme is doing: it floats over the
@@ -77,12 +80,12 @@ pub fn run(launch: Launch) -> Result<()> {
             state.set_app_handle(app.handle().clone());
 
             let window = WindowBuilder::new(app, "main")
-                .title("oma-browse")
-                .inner_size(1400.0, 900.0)
+                .title(&state.config.window.title)
+                .inner_size(state.config.window.width, state.config.window.height)
                 // Omarchy tiles everything and paints its own themed border, so a
                 // GTK titlebar is wasted rows. `SUPER + W` closes the window, as
                 // with every other Omarchy app.
-                .decorations(false)
+                .decorations(state.config.window.decorations)
                 // Ghostty-style translucency: the window carries the alpha and
                 // the compositor shows the wallpaper through it. Only ask for a
                 // transparent window when the theme actually wants one — an
@@ -117,34 +120,50 @@ pub fn run(launch: Launch) -> Result<()> {
                         state.clone(),
                     ),
                     LogicalPosition::new(0.0, 0.0),
-                    LogicalSize::new(1400.0, 900.0),
+                    LogicalSize::new(state.config.window.width, state.config.window.height),
                 )
                 .context("could not create the first tab")?;
 
             // Favicons are per webview, and this is the first one.
+            // The download signal is on the shared web context, so this registers
+            // once however many tabs ask; see `downloads::watch`.
+            if let Err(e) = crate::downloads::watch(&content, state.clone()) {
+                tracing::warn!(error = %e, "not watching downloads");
+            }
             if let Err(e) = crate::favicon::watch(&content, state.clone()) {
                 tracing::warn!(error = %e, "not watching the first tab's favicon");
             }
+            // `[engine]`, which is per webview like the two above -- and this is
+            // the one webview `tabs::open` never sees.
+            if let Err(e) = crate::engine::configure(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab kept WebKit's own settings");
+            }
 
-            crate::layout::install(&palette)?;
-            crate::layout::install_keys(&palette, catalog.clone(), state.runtime())?;
+            crate::layout::install(&palette, &state.config.chrome)?;
+            crate::layout::install_keys(&palette, state.clone(), catalog.clone(), state.runtime())?;
 
             // After the surgery, not before: `install` sweeps everything in the
             // window box except the palette into the content stack, and a strip
             // created earlier would be swept in with it and become a tab-shaped
             // hole in the page. It also needs the overlay to exist, since that
             // is what it floats in.
-            let strip = window
-                .add_child(
-                    WebviewBuilder::new(crate::strip::LABEL, WebviewUrl::External(strip_url.clone()))
+            if state.config.chrome.strip.enabled {
+                let height = state.config.chrome.strip.height;
+                let strip = window
+                    .add_child(
+                        WebviewBuilder::new(
+                            crate::strip::LABEL,
+                            WebviewUrl::External(strip_url.clone()),
+                        )
                         .transparent(true)
                         .background_color(strip_bg),
-                    LogicalPosition::new(0.0, 0.0),
-                    LogicalSize::new(1400.0, f64::from(crate::layout::STRIP_HEIGHT)),
-                )
-                .context("could not create the tab strip webview")?;
-            crate::layout::adopt_strip(&strip)?;
-            spawn_strip_refresh(state.clone());
+                        LogicalPosition::new(0.0, 0.0),
+                        LogicalSize::new(state.config.window.width, f64::from(height)),
+                    )
+                    .context("could not create the tab strip webview")?;
+                crate::layout::adopt_strip(&strip, height)?;
+                spawn_strip_refresh(state.clone());
+            }
 
             // Nothing holds keyboard focus after the surgery, so page-level key
             // handlers — which is where every shortcut lives — would never fire.
@@ -153,6 +172,18 @@ pub fn run(launch: Launch) -> Result<()> {
             }
 
             tracing::info!(palette = %palette_url, content = %start_url, "window up");
+
+            // Last, once there is a palette to show and a page behind it: a
+            // window opened with nowhere to go asks where, exactly as a tab
+            // opened with nowhere to go does. See `crate::window::spawn`.
+            if open_palette {
+                match set_palette_visible(&state, true) {
+                    Ok(()) => state.set_palette_visible(true),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not summon the palette at startup");
+                    }
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -168,16 +199,20 @@ pub fn instrument(
     state: Arc<AppState>,
 ) -> WebviewBuilder<tauri::Wry> {
     let title_state = state.clone();
+    let nav_state = state.clone();
     let load_state = state;
 
     builder
+        // Inert for every real navigation; see `crate::hints::intercept`, which
+        // is the only way a page can ask the browser to open a tab.
+        .on_navigation(move |url| crate::hints::intercept(&nav_state, url))
         .on_document_title_changed(move |webview, title| {
             let state = title_state.clone();
             let label = webview.label().to_string();
             state.runtime().spawn(async move {
                 let url = state.tabs.read().await.url_for(&label);
                 state.tabs.write().await.update_title(&label, title.clone());
-                if !state.incognito()
+                if state.keeps_history()
                     && let Some(url) = url
                 {
                     let mut history = state.history.write().await;
@@ -193,7 +228,7 @@ pub fn instrument(
             let url = payload.url().to_string();
             state.runtime().spawn(async move {
                 state.tabs.write().await.update_url(&label, url.clone());
-                if !state.incognito() {
+                if state.keeps_history() {
                     let mut history = state.history.write().await;
                     history.record(&url, crate::history::now());
                     history.flush();
@@ -227,7 +262,7 @@ pub async fn restyle(state: &Arc<AppState>) -> Result<()> {
             // The strip's inset goes back in with it: this is the same
             // injection `AppState::page_script` composes for a fresh tab, and a
             // restyled page has to end up in the same state as a new one.
-            format!("{}\n{}", theme.css.page_script(state.recolor()), crate::strip::inset_script()),
+            format!("{}\n{}", theme.css.page_script(state.recolor()), state.inset_script()),
             theme.mode.is_dark(),
             tauri::window::Color(bg.r, bg.g, bg.b, alpha),
             tauri::window::Color(bg.r, bg.g, bg.b, 0),
@@ -292,7 +327,13 @@ fn spawn_strip_refresh(state: Arc<AppState>) {
                 Err(RecvError::Closed) => break,
             }
 
-            tokio::time::sleep(STRIP_DEBOUNCE).await;
+            // One page load fires a URL change, a title change and a favicon,
+            // in that order and milliseconds apart. Redrawing on each is three
+            // reloads of the same row, and the middle one has no icon yet.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                state.config.chrome.strip.debounce_ms,
+            ))
+            .await;
             while events.try_recv().is_ok() {}
 
             if let Some(strip) =
@@ -325,6 +366,52 @@ pub fn close(state: &Arc<AppState>) -> Result<()> {
     let app = state.app_handle().context("the window is not up yet")?;
     let window = app.get_window("main").context("the main window has gone away")?;
     window.close().context("could not close the window")
+}
+
+/// Open another browser window.
+///
+/// A window here is a *process*. Everything a window owns -- the tab model, the
+/// palette, the strip, the theme watcher -- hangs off one `AppState` reached
+/// through one app handle, and the two chrome webviews are found by the fixed
+/// labels `palette` and `strip`. A second window inside this process would mean
+/// giving every one of those a window dimension; launching the binary again
+/// gets the same window for the price of an `exec`, and it is already how
+/// `omarchy-launch-browser` opens us from the outside.
+///
+/// The child is told to open its palette when it is being sent nowhere in
+/// particular, so Ctrl-N lands in the same "where to?" state Ctrl-T does.
+pub fn spawn(state: &Arc<AppState>, url: Option<String>) -> Result<u32> {
+    let exe = std::env::current_exe().context("could not find the running browser binary")?;
+    let mut command = std::process::Command::new(exe);
+
+    // An incognito window opens incognito windows: the alternative is a chord
+    // that quietly drops you back into a session that records history.
+    if state.incognito() {
+        command.arg("--incognito");
+    }
+    match url {
+        Some(url) => command.arg(url),
+        None => command.arg("--palette"),
+    };
+
+    // Nothing may reach the child through our stdin, but its logs stay on our
+    // stderr: run from a terminal, that is where you would look for them.
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("could not launch another browser window")?;
+    let pid = child.id();
+
+    // Nobody would otherwise wait on this child, and an exit nobody waits on is
+    // a zombie for as long as this process lives -- which, for a browser, is all
+    // day. The thread costs nothing and ends when the window does.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+
+    tracing::info!(pid, "opened another window");
+    Ok(pid)
 }
 
 /// Show or hide the palette, and hand it focus when it appears.

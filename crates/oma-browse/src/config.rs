@@ -1,0 +1,639 @@
+//! The config file: every setting the browser has, in one dotfile.
+//!
+//! `~/.config/oma-browse/config.toml`, which is where the rest of an Omarchy
+//! desktop keeps its dotfiles -- `~/.config/hypr`, `~/.config/omarchy` -- so
+//! this one travels with them in the same dotfiles repository.
+//!
+//! Sections are named for the *surface* they affect rather than for the module
+//! that reads them, so "where do I change this" has one answer: `[chrome]` is
+//! our own interface, `[theme]` is what loaded websites get, `[engine]` is
+//! WebKit itself.
+//!
+//! Everything is optional and everything has a default, so a missing file is
+//! not a problem and neither is a file with one line in it. A file that does
+//! not parse *is* a problem, but not a fatal one: the browser says so, on the
+//! log and in `config show`, and runs on its defaults rather than refusing to
+//! start over a stray comma.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Where the browser goes when it is not told otherwise.
+///
+/// Empty, which `home_url` reads as the browser's own start page. That page is
+/// served from this process over loopback -- no DNS, no TLS, no network at all
+/// -- so a bare `oma-browse` paints as fast as the webview can start. A remote
+/// default would put a round trip in front of every launch.
+const DEFAULT_HOME: &str = "";
+
+/// The search engine a non-URL lands on. `{query}` is the URL-encoded input;
+/// without it the query is appended.
+const DEFAULT_SEARCH: &str = "https://duckduckgo.com/?q={query}";
+
+// ---------------------------------------------------------------------------
+// Veil
+// ---------------------------------------------------------------------------
+
+/// How see-through a surface is: a number, or `"auto"`.
+///
+/// `"auto"` is not a synonym for 1.0. For pages it means "solve for contrast
+/// against the wallpaper", which is a judgement the browser makes and can
+/// remake when the wallpaper changes; a number takes that decision away from it
+/// permanently. The two are different enough to be worth spelling differently.
+#[derive(Debug, Clone, Copy, PartialEq, schemars::JsonSchema)]
+#[schemars(with = "String", description = "`\"auto\"`, or an opacity from 0.0 to 1.0")]
+pub struct Veil(Option<f64>);
+
+impl Veil {
+    pub const AUTO: Veil = Veil(None);
+    pub const OPAQUE: Veil = Veil(Some(1.0));
+
+    /// The opacity to actually paint with, given what `auto` would work out to.
+    pub fn resolve(self, auto: f64) -> f64 {
+        self.0.unwrap_or(auto).clamp(0.0, 1.0)
+    }
+
+    /// The pinned value, if this is not `auto`.
+    pub fn fixed(self) -> Option<f64> {
+        self.0
+    }
+}
+
+impl Serialize for Veil {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(v) => s.serialize_f64(v),
+            None => s.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Veil {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        // Both spellings, because a config file is written by hand: `veil =
+        // 0.85` and `veil = "auto"` are the two things anyone would type.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Number(f64),
+            Word(String),
+        }
+
+        match Raw::deserialize(d)? {
+            Raw::Number(v) => Ok(Veil(Some(v.clamp(0.0, 1.0)))),
+            Raw::Word(w) if w.eq_ignore_ascii_case("auto") || w.trim().is_empty() => Ok(Veil::AUTO),
+            Raw::Word(w) => match w.trim().parse::<f64>() {
+                Ok(v) => Ok(Veil(Some(v.clamp(0.0, 1.0)))),
+                Err(_) => Err(D::Error::custom(format!(
+                    "expected a number from 0.0 to 1.0, or \"auto\", not {w:?}"
+                ))),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The file
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    /// The page a bare `oma-browse` opens, and where `nav home` goes. Empty
+    /// means the browser's own start page.
+    pub home: String,
+    /// Where anything that is not a URL gets searched.
+    pub search: String,
+
+    pub chrome: Chrome,
+    pub theme: Theme,
+    pub window: Window,
+    pub engine: Engine,
+    pub control: Control,
+    pub startup: Startup,
+    pub history: History,
+    pub downloads: Downloads,
+    pub screenshot: Screenshot,
+    pub tabs: Tabs,
+
+    /// Chord to command, overriding the built-in table. An empty command
+    /// unbinds the chord: `"ctrl+d" = ""`.
+    pub keys: BTreeMap<String, String>,
+
+    /// Why the file was ignored, when it was. Never read from the file itself.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+/// The browser's own interface: the palette and the tab strip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Chrome {
+    /// How see-through the palette card is. Opaque by default, deliberately:
+    /// it is a card you read dense text off, and it has no reason to inherit
+    /// the page's translucency. The strip has no surface of its own either way.
+    pub veil: Veil,
+    /// The font stack for our own surfaces. Nerd Font first, because the strip
+    /// and the palette draw glyphs from the patched range.
+    pub font: String,
+    /// Skip the GTK overlay surgery: tabs tile instead of stacking, and there
+    /// is no floating palette. An escape hatch for bisecting rendering
+    /// problems, and the config version of `OMA_LAYOUT=plain`.
+    pub plain_layout: bool,
+    pub palette: Palette,
+    pub strip: Strip,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Palette {
+    /// Share of the window's width the card takes, before the bounds below.
+    pub width_ratio: f64,
+    /// Narrowest it gets. Below this the two-line rows start wrapping.
+    pub min_width: i32,
+    /// Widest it gets. A launcher stretched across an ultrawide is a bar.
+    pub max_width: i32,
+    pub height: i32,
+    pub min_height: i32,
+    pub top_margin: i32,
+    pub side_margin: i32,
+    pub bottom_margin: i32,
+    /// How many results a search shows.
+    pub rows: usize,
+    /// How many recently-visited pages the idle menu lists.
+    pub history_rows: usize,
+    /// How many downloaded files it lists there. Short on purpose: this is
+    /// "open the thing I just saved"; `download list` is the whole list.
+    pub download_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Strip {
+    /// The floating row of favicons at the top of the window.
+    pub enabled: bool,
+    /// Its height in pixels, which is also the top inset given to every page --
+    /// turning the strip off gives that inset back.
+    pub height: i32,
+    /// Show the active tab's title in the middle of the strip.
+    pub title: bool,
+    /// How long to wait before redrawing after the tab model changes. One page
+    /// load fires a URL change, a title change and a favicon within
+    /// milliseconds; this is what stops that being three redraws.
+    pub debounce_ms: u64,
+}
+
+/// What loaded websites get.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Theme {
+    /// How see-through a page is. `"auto"` solves for contrast against the
+    /// wallpaper and follows Ghostty's `background-opacity`; a number pins it
+    /// whatever the wallpaper does. `OMA_VEIL` still wins over both.
+    pub veil: Veil,
+    /// Repaint neutral page surfaces onto the theme's ramp. Only greyscale
+    /// surfaces are touched, so brand colour survives.
+    pub recolor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Window {
+    pub width: f64,
+    pub height: f64,
+    /// A GTK titlebar. Off, because Omarchy tiles everything and paints its own
+    /// border, so it would be wasted rows.
+    pub decorations: bool,
+    /// The window title, which is what a tiling WM labels it by.
+    pub title: String,
+}
+
+/// WebKit itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Engine {
+    pub javascript: bool,
+    /// Right-click, Inspect Element.
+    pub devtools: bool,
+    /// Empty means WebKit's own.
+    pub user_agent: String,
+    /// Let media start without a click.
+    pub autoplay: bool,
+    pub webrtc: bool,
+    pub webgl: bool,
+    pub smooth_scrolling: bool,
+    /// The default font size a page gets, in pixels.
+    pub font_size: u32,
+    /// `always`, `never`, or `no-third-party`.
+    pub cookies: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Control {
+    /// The port the control plane listens on. `0` takes whatever is free, which
+    /// means reading the log to find it; a fixed port is what makes the browser
+    /// reachable by something that did not watch it start.
+    pub port: u16,
+    /// Write the live port to `$XDG_RUNTIME_DIR/oma-browse/port`.
+    pub port_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Startup {
+    /// Start every window incognito, as though `--incognito` were always passed.
+    pub incognito: bool,
+    /// Reopen the tabs that were open when the browser last closed.
+    ///
+    /// Off by default, and deliberately: a browser that reopens eleven tabs
+    /// because you asked it to open one is a browser you stop launching from a
+    /// keybind. `tab restore` does it on demand either way.
+    pub restore: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct History {
+    /// Remember where the browser has been. `false` is `--incognito`'s effect
+    /// on history, permanently, without its effect on anything else.
+    pub enabled: bool,
+    /// Beyond this the oldest entries are dropped.
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Downloads {
+    /// Where files land. Empty follows the XDG user directory, which is what
+    /// every other application on the desktop uses. `~` is expanded.
+    pub dir: String,
+    /// Say so, on the desktop, when a download finishes.
+    pub notify: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Screenshot {
+    /// Where `page screenshot` writes when told nowhere. Empty is
+    /// `$XDG_RUNTIME_DIR/oma-browse`: per-boot, user-private, and cleaned up by
+    /// the system rather than accumulating in your home directory.
+    pub dir: String,
+    /// Capture the whole scrollable document rather than the viewport.
+    pub full: bool,
+    /// Keep the page's transparency instead of compositing onto white.
+    pub transparent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tabs {
+    /// How many closed tabs `Ctrl-Shift-T` can walk back through.
+    pub reopen_depth: usize,
+    /// The zoom level a new tab starts at.
+    pub zoom: f64,
+    /// The ladder `Ctrl-+` and `Ctrl--` step along.
+    pub zoom_steps: Vec<f64>,
+    /// The size favicons are stored at. Sites do ship 512px icons, and one of
+    /// those is 40KB of base64 re-sent on every strip redraw.
+    pub favicon_size: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Defaults -- each one is today's hardcoded value, named where it came from
+// ---------------------------------------------------------------------------
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            home: DEFAULT_HOME.to_string(),
+            search: DEFAULT_SEARCH.to_string(),
+            chrome: Chrome::default(),
+            theme: Theme::default(),
+            window: Window::default(),
+            engine: Engine::default(),
+            control: Control::default(),
+            startup: Startup::default(),
+            history: History::default(),
+            downloads: Downloads::default(),
+            screenshot: Screenshot::default(),
+            tabs: Tabs::default(),
+            keys: BTreeMap::new(),
+            problem: None,
+        }
+    }
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Self {
+            veil: Veil::OPAQUE,
+            font: crate::strip::DEFAULT_FONT.to_string(),
+            plain_layout: false,
+            palette: Palette::default(),
+            strip: Strip::default(),
+        }
+    }
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            width_ratio: 0.5,
+            min_width: 420,
+            max_width: 900,
+            height: 420,
+            min_height: 200,
+            top_margin: 72,
+            side_margin: 24,
+            bottom_margin: 72,
+            rows: 24,
+            history_rows: 8,
+            download_rows: 5,
+        }
+    }
+}
+
+impl Default for Strip {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            height: crate::layout::STRIP_HEIGHT,
+            title: true,
+            debounce_ms: 80,
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self { veil: Veil::AUTO, recolor: true }
+    }
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self { width: 1400.0, height: 900.0, decorations: false, title: "oma-browse".to_string() }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        // WebKit's own defaults, restated, so that turning one off in the file
+        // is a change from what the browser was already doing.
+        Self {
+            javascript: true,
+            devtools: false,
+            user_agent: String::new(),
+            autoplay: true,
+            webrtc: true,
+            webgl: true,
+            smooth_scrolling: true,
+            font_size: 16,
+            cookies: "no-third-party".to_string(),
+        }
+    }
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        Self { port: 0, port_file: true }
+    }
+}
+
+impl Default for Startup {
+    fn default() -> Self {
+        Self { incognito: false, restore: false }
+    }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self { enabled: true, limit: crate::history::CAP }
+    }
+}
+
+impl Default for Downloads {
+    fn default() -> Self {
+        Self { dir: String::new(), notify: true }
+    }
+}
+
+impl Default for Screenshot {
+    fn default() -> Self {
+        Self { dir: String::new(), full: false, transparent: false }
+    }
+}
+
+impl Default for Tabs {
+    fn default() -> Self {
+        Self {
+            reopen_depth: crate::tabs::CLOSED_STACK,
+            zoom: 1.0,
+            zoom_steps: crate::tabs::ZOOM_STEPS.to_vec(),
+            favicon_size: 32,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing it
+// ---------------------------------------------------------------------------
+
+impl Config {
+    /// Read the file, or fall back to the defaults.
+    ///
+    /// Never fails. A browser that will not start because its config file has a
+    /// typo in it is a browser you cannot open the config file with.
+    pub fn load() -> Self {
+        let path = Self::path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match toml::from_str::<Config>(&raw) {
+            Ok(config) => config,
+            Err(e) => {
+                let problem = format!("{}: {}", path.display(), summarize(&e.to_string()));
+                tracing::warn!(%problem, "config ignored; using defaults");
+                Self { problem: Some(problem), ..Self::default() }
+            }
+        }
+    }
+
+    /// Where the file lives. `$OMA_BROWSE_CONFIG` wins, for a second profile or
+    /// a test that must not read the real one.
+    pub fn path() -> PathBuf {
+        if let Some(explicit) = std::env::var_os("OMA_BROWSE_CONFIG") {
+            return PathBuf::from(explicit);
+        }
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        config.join("oma-browse").join("config.toml")
+    }
+
+    /// The page to open at startup, as typed: a bare host or a search both work
+    /// here, exactly as they do in the palette.
+    pub fn home_url(&self, fallback: &str) -> String {
+        if self.home.trim().is_empty() {
+            return fallback.to_string();
+        }
+        crate::tabs::resolve_input(&self.home, &self.search)
+    }
+
+    /// Record something the browser noticed about its own configuration, so
+    /// `config show` can report it. Keeps the first: a later complaint is
+    /// usually a consequence of the first one.
+    pub fn note_problem(&mut self, problem: String) {
+        tracing::warn!(%problem, "config");
+        if self.problem.is_none() {
+            self.problem = Some(problem);
+        }
+    }
+
+    /// Write a commented file with every setting at its default.
+    ///
+    /// The defaults are written out rather than left implicit because a config
+    /// file you cannot read the options out of is a config file you have to
+    /// read the source to use.
+    pub fn write_template(force: bool) -> anyhow::Result<PathBuf> {
+        use anyhow::Context as _;
+
+        let path = Self::path();
+        if path.exists() && !force {
+            anyhow::bail!("{} already exists; pass --force to overwrite it", path.display());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        std::fs::write(&path, TEMPLATE)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+/// A `toml` error is a location, a source excerpt, and then the complaint
+/// itself on the last line. The excerpt is the part nobody needs in a log line;
+/// the other two are exactly what tells you which key to go and fix.
+fn summarize(message: &str) -> String {
+    let mut lines = message.lines().filter(|l| !l.trim().is_empty());
+    let Some(first) = lines.next() else { return message.to_string() };
+    match lines.next_back() {
+        Some(last) if last != first => format!("{first}: {}", last.trim()),
+        _ => first.to_string(),
+    }
+}
+
+/// What `config init` writes. Every value here is the default, so an untouched
+/// copy of this file changes nothing -- which the tests below enforce, in both
+/// directions: no drifted value, and no setting missing from it.
+const TEMPLATE: &str = include_str!("config.toml");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_file_is_the_defaults() {
+        assert_eq!(toml::from_str::<Config>("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn one_line_overrides_only_that_line() {
+        let config: Config = toml::from_str(r#"home = "https://example.com""#).unwrap();
+        assert_eq!(config.home, "https://example.com");
+        assert_eq!(config.search, Config::default().search, "everything else is untouched");
+        assert!(config.chrome.strip.enabled);
+    }
+
+    #[test]
+    fn a_section_keeps_the_defaults_of_its_other_keys() {
+        let config: Config = toml::from_str("[chrome.strip]\nheight = 40").unwrap();
+        assert_eq!(config.chrome.strip.height, 40);
+        assert!(config.chrome.strip.enabled, "a section is not an all-or-nothing block");
+    }
+
+    #[test]
+    fn a_misspelled_key_is_an_error_rather_than_silence() {
+        // The whole point of `deny_unknown_fields`: `recolour` here would
+        // otherwise do nothing at all, with nothing said about it.
+        let err = toml::from_str::<Config>("[theme]\nrecolour = false").unwrap_err();
+        assert!(err.to_string().contains("recolour"), "the message names the key: {err}");
+    }
+
+    #[test]
+    fn a_reported_problem_names_the_key_and_the_line() {
+        let err = toml::from_str::<Config>("[theme]\nrecolour = false").unwrap_err();
+        let summary = summarize(&err.to_string());
+        assert!(summary.contains("line 2"), "keeps the location: {summary}");
+        assert!(summary.contains("recolour"), "keeps the complaint: {summary}");
+        assert_eq!(summary.lines().count(), 1, "one line, for one log line");
+    }
+
+    #[test]
+    fn the_veil_takes_a_number_or_the_word_auto() {
+        #[derive(Deserialize)]
+        struct Holder {
+            veil: Veil,
+        }
+        let auto: Holder = toml::from_str(r#"veil = "auto""#).unwrap();
+        assert_eq!(auto.veil, Veil::AUTO);
+        assert_eq!(auto.veil.resolve(0.7), 0.7, "auto defers to what was worked out");
+
+        let pinned: Holder = toml::from_str("veil = 0.4").unwrap();
+        assert_eq!(pinned.veil.fixed(), Some(0.4));
+        assert_eq!(pinned.veil.resolve(0.7), 0.4, "a number overrules it");
+
+        // Out of range is clamped rather than refused: 1.5 plainly means opaque.
+        let over: Holder = toml::from_str("veil = 1.5").unwrap();
+        assert_eq!(over.veil.fixed(), Some(1.0));
+
+        assert!(toml::from_str::<Holder>(r#"veil = "mostly""#).is_err());
+    }
+
+    #[test]
+    fn the_template_parses_and_means_the_defaults() {
+        let config: Config = toml::from_str(TEMPLATE).expect("the template must parse");
+        assert_eq!(config, Config::default(), "an untouched template changes nothing");
+    }
+
+    /// The template is hand-written, so nothing but this stops a new setting
+    /// from being added and never documented.
+    #[test]
+    fn the_template_mentions_every_setting() {
+        let rendered = toml::Value::try_from(Config::default()).expect("serialises");
+        let mut missing = Vec::new();
+        collect_keys(&rendered, &mut Vec::new(), &mut |path, key| {
+            // Commented-out lines count: a setting whose default is "leave it
+            // to the system" is documented by showing what it would look like.
+            if !TEMPLATE.contains(key) {
+                missing.push(path.to_string());
+            }
+        });
+        assert!(missing.is_empty(), "settings missing from the template: {missing:?}");
+    }
+
+    /// Walk every leaf key of the serialised config, with its dotted path.
+    fn collect_keys(
+        value: &toml::Value,
+        path: &mut Vec<String>,
+        found: &mut impl FnMut(&str, &str),
+    ) {
+        let toml::Value::Table(table) = value else { return };
+        for (key, child) in table {
+            path.push(key.clone());
+            if matches!(child, toml::Value::Table(_)) {
+                collect_keys(child, path, found);
+            } else {
+                found(&path.join("."), key);
+            }
+            path.pop();
+        }
+    }
+}

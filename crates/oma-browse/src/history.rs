@@ -12,9 +12,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Beyond this the oldest entries are dropped. Generous enough to be useful and
-/// small enough that scoring it stays free.
-const CAP: usize = 5_000;
+/// Beyond this the oldest entries are dropped, unless the config says
+/// otherwise. Generous enough to be useful and small enough that scoring it
+/// stays free.
+pub const CAP: usize = 5_000;
 
 /// One page, however many times it has been seen.
 #[derive(Debug, Clone)]
@@ -26,8 +27,9 @@ pub struct Visit {
     pub last: u64,
 }
 
-#[derive(Default)]
 pub struct History {
+    /// See [`CAP`]; overridden by `history.limit` in the config file.
+    cap: usize,
     /// Most recently visited first.
     entries: Vec<Visit>,
     index: HashMap<String, usize>,
@@ -37,12 +39,30 @@ pub struct History {
     file: Option<PathBuf>,
 }
 
+impl Default for History {
+    /// Detached from disk, and holding the standard cap.
+    ///
+    /// Hand-written rather than derived: a derived `cap` is `0`, which is not
+    /// "unlimited" but "drop every entry on the way in".
+    fn default() -> Self {
+        Self { cap: CAP, entries: Vec::new(), index: HashMap::new(), dirty: false, file: None }
+    }
+}
+
 impl History {
     /// Read whatever was saved last time. A missing or corrupt file is an empty
     /// history, never an error: losing history must not stop the browser.
     pub fn load() -> Self {
+        Self::load_with(CAP)
+    }
+
+    /// The same, with the config file's cap.
+    pub fn load_with(cap: usize) -> Self {
         let file = path();
-        let mut history = History { file: Some(file.clone()), ..History::default() };
+        // A zero cap would drop every entry on the way in, which is what
+        // `history.enabled = false` is for and not what a limit means.
+        let cap = cap.max(1);
+        let mut history = History { cap, file: Some(file.clone()), ..History::default() };
         let Ok(raw) = std::fs::read_to_string(&file) else { return history };
         for line in raw.lines() {
             // `visits \t last \t url \t title`. Tabs, because a URL cannot
@@ -62,7 +82,7 @@ impl History {
     }
 
     fn push(&mut self, visit: Visit) {
-        if self.entries.len() < CAP {
+        if self.entries.len() < self.cap {
             self.entries.push(visit);
         }
     }
@@ -94,7 +114,7 @@ impl History {
                     0,
                     Visit { url: url.to_string(), title: String::new(), visits: 1, last: now },
                 );
-                self.entries.truncate(CAP);
+                self.entries.truncate(self.cap);
             }
         }
         self.reindex();

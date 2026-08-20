@@ -50,7 +50,7 @@ pub async fn capture(
         .ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = app.get_webview(&label).with_context(|| format!("no webview labelled {label}"))?;
 
-    let path = resolve_path(path)?;
+    let path = resolve_path(path, &state.config.screenshot.dir)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
@@ -111,12 +111,15 @@ fn write_png(
     Ok((width, height))
 }
 
-/// Where the PNG goes when the caller does not say.
+/// Somewhere to put a file the caller did not name.
 ///
-/// Under `$XDG_RUNTIME_DIR` beside the port file, so shots are per-boot,
-/// user-private, and cleaned up by the system rather than accumulating in the
-/// user's home.
-fn resolve_path(requested: Option<String>) -> Result<PathBuf> {
+/// Shared with `page source`, so the two agree: per-boot, user-private, and
+/// cleaned up by the system rather than accumulating in the user's home.
+pub fn scratch_file(
+    requested: Option<String>,
+    prefix: &str,
+    extension: &str,
+) -> Result<PathBuf> {
     if let Some(p) = requested.filter(|p| !p.trim().is_empty()) {
         return Ok(PathBuf::from(shellexpand(&p)));
     }
@@ -124,6 +127,32 @@ fn resolve_path(requested: Option<String>) -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("oma-browse");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("could not make {}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    Ok(dir.join(format!("{prefix}-{stamp}.{extension}")))
+}
+
+/// Where the PNG goes when the caller does not say.
+///
+/// Under `$XDG_RUNTIME_DIR` beside the port file, so shots are per-boot,
+/// user-private, and cleaned up by the system rather than accumulating in the
+/// user's home.
+fn resolve_path(requested: Option<String>, configured: &str) -> Result<PathBuf> {
+    if let Some(p) = requested.filter(|p| !p.trim().is_empty()) {
+        return Ok(PathBuf::from(shellexpand(&p)));
+    }
+    let dir = if configured.trim().is_empty() {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("oma-browse")
+    } else {
+        PathBuf::from(shellexpand(configured.trim()))
+    };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())

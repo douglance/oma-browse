@@ -91,7 +91,8 @@ impl ThemeCss {
         // a handful of pre-baked surfaces, so it needs to do arithmetic on them.
         format!(
             "{{\"css\":{css},\"recolor\":{recolor},\"tint\":[{tr},{tg},{tb}],\
-             \"fgRgb\":[{fr},{fg},{fb}],\"opacity\":{opacity}}}",
+             \"fgRgb\":[{fr},{fg},{fb}],\"opacity\":{opacity},\
+             \"accent\":{accent},\"selection\":{selection}}}",
             css = js_string(&self.page_css()),
             tr = self.tint.r,
             tg = self.tint.g,
@@ -100,6 +101,11 @@ impl ThemeCss {
             fg = s.foreground.g,
             fb = s.foreground.b,
             opacity = self.opacity,
+            // Hex strings rather than channels: nothing interpolates these, and
+            // the one consumer -- the link-hint label -- puts them straight into
+            // a `style` attribute. See `oma_browse::hints`.
+            accent = js_string(&s.accent.to_hex()),
+            selection = js_string(&s.selection.to_hex()),
         )
     }
 

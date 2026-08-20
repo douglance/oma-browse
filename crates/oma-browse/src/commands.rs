@@ -55,6 +55,7 @@ struct ThemeReloadArgs {
 /// each group function never reaches it. This lives beside `command_graph` so
 /// that adding a group and forgetting its title is a one-file mistake.
 pub const GROUPS: &[(&str, &str)] = &[
+    ("config", "Config"),
     ("nav", "Navigation"),
     ("tab", "Tabs"),
     ("page", "Page"),
@@ -64,6 +65,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("bookmark", "Bookmarks"),
     ("find", "Find"),
     ("share", "Share"),
+    ("download", "Downloads"),
     ("window", "Window"),
 ];
 
@@ -80,7 +82,9 @@ pub fn command_graph(state: Arc<AppState>) -> Cli {
         .group(history_group(state.clone()))
         .group(bookmark_group(state.clone()))
         .group(find_group(state.clone()))
+        .group(download_group(state.clone()))
         .group(share_group(state.clone()))
+        .group(config_group(state.clone()))
         .group(window_group(state))
 }
 
@@ -196,6 +200,196 @@ fn share_group(state: Arc<AppState>) -> Cli {
         .command("copy", copy)
         .command("webapp", webapp)
         .command("terminal", terminal)
+}
+
+// ---------------------------------------------------------------------------
+// download
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct Saved {
+    /// The file's own name, which is the part a human recognises.
+    name: String,
+    /// Where it went.
+    path: String,
+    url: String,
+    /// `running`, `done` or `failed`.
+    state: String,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct SavedList {
+    /// Newest first, so position 1 is the download just finished.
+    entries: Vec<Saved>,
+    /// Where new downloads land.
+    directory: String,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct DownloadArgs {
+    /// Which download, counting from the newest as 1. Defaults to the newest.
+    index: Option<usize>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct DownloadOptions {
+    /// Which download, counting from the newest as 1. See [`ToggleOptions`].
+    index: Option<usize>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct DownloadListOptions {
+    /// How many to return. Defaults to 50.
+    limit: Option<u32>,
+}
+
+fn saved(d: &crate::downloads::Download) -> Saved {
+    Saved {
+        name: d.name(),
+        path: d.path.display().to_string(),
+        url: d.url.clone(),
+        state: d.state().to_string(),
+    }
+}
+
+/// Pick one download out of the list, by position or "the newest".
+///
+/// Cloned out under the lock rather than returning a borrow: the store is behind
+/// a `std::sync::Mutex` and the caller is in an async fn, so the guard must not
+/// live across an await.
+fn pick(state: &Arc<AppState>, index: Option<usize>) -> std::result::Result<Saved, String> {
+    let list = state.downloads.lock().map_err(|_| "the download list is poisoned".to_string())?;
+    let entry = match index {
+        Some(n) => list.nth(n).ok_or_else(|| format!("there is no download {n}")),
+        None => list.entries().first().ok_or_else(|| "nothing has been downloaded".to_string()),
+    }?;
+    Ok(saved(entry))
+}
+
+fn download_group(state: Arc<AppState>) -> Cli {
+    let s = state.clone();
+    let list = CommandDef::typed::<NoArgs, DownloadListOptions, (), SavedList, _, _>(
+        "list",
+        move |ctx: TypedContext<NoArgs, DownloadListOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let limit = ctx.options.limit.unwrap_or(50) as usize;
+                let directory = state.download_path("x").parent().map(|p| p.display().to_string());
+                let Ok(downloads) = state.downloads.lock() else {
+                    return TypedResult::error("poisoned", "the download list is gone".to_string());
+                };
+                TypedResult::ok(SavedList {
+                    entries: downloads.entries().iter().take(limit).map(saved).collect(),
+                    directory: directory.unwrap_or_default(),
+                })
+            }
+        },
+    )
+    .description("List downloaded files, newest first")
+    .done();
+
+    let s = state.clone();
+    let open = CommandDef::typed::<DownloadArgs, DownloadOptions, (), Saved, _, _>(
+        "open",
+        move |ctx: TypedContext<DownloadArgs, DownloadOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let entry = match pick(&state, ctx.options.index.or(ctx.args.index)) {
+                    Ok(entry) => entry,
+                    Err(e) => return TypedResult::error("missing_id", e),
+                };
+                if !std::path::Path::new(&entry.path).exists() {
+                    return TypedResult::error(
+                        "gone",
+                        format!("{} is no longer on disk", entry.path),
+                    );
+                }
+                // `xdg-open`, not a guess at the application: the desktop
+                // already knows what opens a `.pdf`, and disagreeing with it is
+                // how a browser ends up with its own half-working file manager.
+                match handoff("xdg-open", &[entry.path.as_str()]).await {
+                    Ok(()) => TypedResult::ok(entry),
+                    Err(e) => TypedResult::error("desktop", e),
+                }
+            }
+        },
+    )
+    .description("Open a downloaded file with the desktop's own handler")
+    .done();
+
+    let s = state.clone();
+    let reveal = CommandDef::typed::<DownloadArgs, DownloadOptions, (), Saved, _, _>(
+        "reveal",
+        move |ctx: TypedContext<DownloadArgs, DownloadOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let entry = match pick(&state, ctx.options.index.or(ctx.args.index)) {
+                    Ok(entry) => entry,
+                    Err(e) => return TypedResult::error("missing_id", e),
+                };
+                let Some(dir) = std::path::Path::new(&entry.path).parent() else {
+                    return TypedResult::error("gone", "that file has no folder".to_string());
+                };
+                match handoff("xdg-open", &[&dir.display().to_string()]).await {
+                    Ok(()) => TypedResult::ok(entry),
+                    Err(e) => TypedResult::error("desktop", e),
+                }
+            }
+        },
+    )
+    .description("Open the folder a downloaded file is in")
+    .done();
+
+    let s = state.clone();
+    let copy = CommandDef::typed::<DownloadArgs, DownloadOptions, (), Saved, _, _>(
+        "copy",
+        move |ctx: TypedContext<DownloadArgs, DownloadOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let entry = match pick(&state, ctx.options.index.or(ctx.args.index)) {
+                    Ok(entry) => entry,
+                    Err(e) => return TypedResult::error("missing_id", e),
+                };
+                match handoff("wl-copy", &[entry.path.as_str()]).await {
+                    Ok(()) => TypedResult::ok(entry),
+                    Err(e) => TypedResult::error("clipboard", e),
+                }
+            }
+        },
+    )
+    .description("Copy a downloaded file's path to the Wayland clipboard")
+    .done();
+
+    let s = state;
+    let clear = CommandDef::typed::<NoArgs, NoOptions, (), Forgotten, _, _>(
+        "clear",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Ok(mut downloads) = state.downloads.lock() else {
+                    return TypedResult::error("poisoned", "the download list is gone".to_string());
+                };
+                let cleared = downloads.entries().len();
+                downloads.clear();
+                // The list, not the files. Deleting somebody's files because
+                // they tidied a list is not a thing a browser gets to do.
+                TypedResult::ok(Forgotten { cleared })
+            }
+        },
+    )
+    .description("Forget the download list. The files themselves are left alone")
+    .destructive(true)
+    .done();
+
+    Cli::create("download")
+        .description("Files this browser has saved")
+        .command("list", list)
+        .command("open", open)
+        .command("reveal", reveal)
+        .command("copy", copy)
+        .command("clear", clear)
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +687,23 @@ struct TabOpenOptions {
     background: bool,
 }
 
+#[derive(JsonSchema, Serialize)]
+struct Restored {
+    /// How many tabs were reopened.
+    opened: usize,
+    /// How many the last session held, whether or not they were already open.
+    saved: usize,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct MuteOptions {
+    /// Which tab, as reported by `tab list`. Defaults to the active tab.
+    id: Option<u32>,
+    /// `on`, `off` or `toggle`. Defaults to `toggle`. See [`ToggleOptions`].
+    action: Option<String>,
+}
+
 #[derive(Deserialize, incurs::Args)]
 struct TabIdArgs {
     /// Tab id, as reported by `tab list`. Defaults to the active tab.
@@ -513,11 +724,12 @@ struct TabSelectOptions {
 /// Shared by `tab open` and `nav home` so a new tab and Alt-Home cannot
 /// disagree about what "home" is.
 fn start_page(state: &AppState) -> String {
-    state
+    let built_in = state
         .base_url()
         .and_then(|b| b.join("start").ok())
         .map(|u| u.to_string())
-        .unwrap_or_else(|| "about:blank".to_string())
+        .unwrap_or_else(|| "about:blank".to_string());
+    state.config.home_url(&built_in)
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -543,13 +755,28 @@ fn tab_group(state: Arc<AppState>) -> Cli {
                 // used to compute this itself and the palette picked
                 // `about:blank`, so the three surfaces disagreed; it belongs
                 // here, where every caller gets it.
-                let url = match ctx.options.url.or(ctx.args.url) {
-                    Some(url) => url,
-                    None => start_page(&state),
+                let (url, blank) = match ctx.options.url.or(ctx.args.url) {
+                    Some(url) => (url, false),
+                    None => (start_page(&state), true),
                 };
                 match crate::tabs::open(&state, &url, ctx.options.background).await {
                     Ok(tab) => {
                         state.notify_tabs();
+                        // A tab opened with nowhere to go is a question, so ask
+                        // it: the palette is this browser's URL bar, and Ctrl-T
+                        // landing on the start page with nothing focused left
+                        // you a keystroke short of anywhere. A tab opened *at* a
+                        // URL already has its answer, and a background tab is
+                        // not the one you are looking at.
+                        if blank && !ctx.options.background {
+                            match crate::window::set_palette_visible(&state, true) {
+                                Ok(()) => state.set_palette_visible(true),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "opened a blank tab but could not summon the palette"
+                                ),
+                            }
+                        }
                         TypedResult::ok(tab)
                     }
                     Err(e) => TypedResult::error("webview", format!("{e:#}")),
@@ -685,8 +912,52 @@ fn tab_group(state: Arc<AppState>) -> Cli {
     .description("Reopen the most recently closed tab")
     .done();
 
+    let s = state.clone();
+    let mute = CommandDef::typed::<ToggleArgs, MuteOptions, (), Toggled, _, _>(
+        "mute",
+        move |ctx: TypedContext<ToggleArgs, MuteOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let action = ctx.options.action.or(ctx.args.action);
+                let raw = action.as_deref().unwrap_or("toggle");
+                let Some(action) = crate::tabs::Toggle::parse(raw) else {
+                    return TypedResult::error(
+                        "bad_action",
+                        format!("unknown action {raw:?}; expected on, off or toggle"),
+                    );
+                };
+                match crate::tabs::mute(&state, ctx.options.id, action).await {
+                    Ok(on) => TypedResult::ok(Toggled { on }),
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description("Silence a tab, or let it speak again. Per tab, like zoom")
+    .done();
+
+    let s = state.clone();
+    let restore = CommandDef::typed::<NoArgs, NoOptions, (), Restored, _, _>(
+        "restore",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let saved = crate::session::saved().len();
+                let opened = crate::session::restore(&state).await;
+                TypedResult::ok(Restored { opened, saved })
+            }
+        },
+    )
+    .description(
+        "Reopen the tabs from the last session, in the background. Anything \
+         already open is skipped, so running it twice changes nothing.",
+    )
+    .done();
+
     Cli::create("tab")
         .description("Open, close and switch tabs")
+        .command("mute", mute)
+        .command("restore", restore)
         .command("open", open)
         .command("list", list)
         .command("select", select)
@@ -868,6 +1139,91 @@ struct Zoomed {
     level: f64,
 }
 
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct SourceOptions {
+    /// Open the source in a new tab instead of returning it.
+    open: bool,
+    /// Write it here. Implied by `--open`, which needs a file to point at.
+    path: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Source {
+    url: String,
+    /// How many bytes of markup, so a caller can decide whether to print it.
+    bytes: usize,
+    /// The markup itself, omitted when it was written to a file instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+    /// Where it was written, when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct ToggleArgs {
+    /// `show`, `hide` or `toggle`. Defaults to `toggle`.
+    action: Option<String>,
+}
+
+/// Same reason as `nav go`'s `url`: over HTTP a positional argument is a path
+/// segment, so a JSON body carrying one is silently ignored and the command
+/// runs with its default. An option of the same name, which wins, is what makes
+/// the HTTP face agree with the CLI.
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ToggleOptions {
+    /// `show`, `hide` or `toggle`. Defaults to `toggle`.
+    action: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Toggled {
+    /// Where the thing ended up.
+    on: bool,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct PrintArgs {
+    // Same reason as `nav go`: over HTTP a positional is a path segment, and a
+    // path is all slashes.
+    /// Write a PDF here instead of opening the print dialog.
+    path: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct PrintOptions {
+    /// Write a PDF here instead of opening the print dialog.
+    path: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Printed {
+    /// The PDF written, or null when the print dialog was opened instead.
+    path: Option<String>,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct HintsArgs {
+    /// `click`, `newtab`, or `clear`. Defaults to `click`.
+    mode: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct HintsOptions {
+    /// `click`, `newtab`, or `clear`. Defaults to `click`. See [`ToggleOptions`].
+    mode: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Hinted {
+    /// How many hints were drawn. Zero means nothing clickable is on screen.
+    shown: u32,
+}
+
 fn page_group(state: Arc<AppState>) -> Cli {
     let s = state.clone();
     let eval = CommandDef::typed::<EvalArgs, EvalOptions, (), Evaluated, _, _>(
@@ -943,11 +1299,182 @@ fn page_group(state: Arc<AppState>) -> Cli {
     )
     .done();
 
+    let s = state.clone();
+    let hints = CommandDef::typed::<HintsArgs, HintsOptions, (), Hinted, _, _>(
+        "hints",
+        move |ctx: TypedContext<HintsArgs, HintsOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let asked = ctx.options.mode.or(ctx.args.mode);
+                let mode = match asked.as_deref().unwrap_or("click") {
+                    "click" | "open" | "show" => "click",
+                    "newtab" | "tab" | "background" => "newtab",
+                    "clear" | "hide" | "off" => "clear",
+                    other => {
+                        return TypedResult::error(
+                            "usage",
+                            format!("unknown mode {other:?}; use click, newtab or clear"),
+                        );
+                    }
+                };
+                // The script answers with the number of hints it drew, or is
+                // absent entirely on a page that runs no scripts of ours.
+                let js = format!(
+                    "window.__omaHints ? String(window.__omaHints(\"{mode}\")) : \"absent\""
+                );
+                match crate::tabs::eval(&state, &js).await {
+                    Ok(raw) => match raw.trim().trim_matches('"').parse::<u32>() {
+                        Ok(shown) => TypedResult::ok(Hinted { shown }),
+                        Err(_) => TypedResult::error(
+                            "no_script",
+                            "this page does not run our scripts, so it has no hints".to_string(),
+                        ),
+                    },
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Label every clickable thing in the viewport and activate the one you \
+         type. Also on a bare `f` (and `F` to open links in a new tab) whenever \
+         the caret is not in a text field.",
+    )
+    .done();
+
+    let s = state.clone();
+    let devtools = CommandDef::typed::<ToggleArgs, ToggleOptions, (), Toggled, _, _>(
+        "devtools",
+        move |ctx: TypedContext<ToggleArgs, ToggleOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let action = ctx.options.action.or(ctx.args.action);
+                let raw = action.as_deref().unwrap_or("toggle");
+                let Some(action) = crate::tabs::Toggle::parse(raw) else {
+                    return TypedResult::error(
+                        "bad_action",
+                        format!("unknown action {raw:?}; expected show, hide or toggle"),
+                    );
+                };
+                match crate::tabs::devtools(&state, action).await {
+                    Ok(on) => TypedResult::ok(Toggled { on }),
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Open WebKit's inspector on the active tab. It is a WebKit window of \
+         its own, so it is not themed and does not tile with the page.",
+    )
+    .done();
+
+    let s = state.clone();
+    let print = CommandDef::typed::<PrintArgs, PrintOptions, (), Printed, _, _>(
+        "print",
+        move |ctx: TypedContext<PrintArgs, PrintOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let to = ctx.options.path.or(ctx.args.path).filter(|p| !p.is_empty());
+                let to = to.map(|p| {
+                    let expanded = match p.strip_prefix("~/") {
+                        Some(rest) => {
+                            format!("{}/{rest}", std::env::var("HOME").unwrap_or_default())
+                        }
+                        None => p,
+                    };
+                    std::path::PathBuf::from(expanded)
+                });
+                match crate::tabs::print(&state, to).await {
+                    Ok(path) => TypedResult::ok(Printed { path }),
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Print the active tab. With a path it writes a PDF and never opens a \
+         dialog, which is what makes it usable from the CLI and from an agent.",
+    )
+    .done();
+
+    let s = state.clone();
+    let source = CommandDef::typed::<NoArgs, SourceOptions, (), Source, _, _>(
+        "source",
+        move |ctx: TypedContext<NoArgs, SourceOptions, ()>| {
+            let state = s.clone();
+            async move {
+                // The live DOM, with this browser's own injections taken back
+                // out. Not a re-fetch: a re-fetch gets a different page on
+                // anything behind a login, and the question "what is on my
+                // screen made of" is about the document that is on screen.
+                let js = r#"(function(){
+                    var root = document.documentElement.cloneNode(true);
+                    // Every id this browser injects, not just the veil's: the
+                    // strip's inset is `__oma_strip_inset`, and leaving it in
+                    // makes the source of every page look like it ships a
+                    // stylesheet it does not.
+                    var mine = root.querySelectorAll('[id^="__oma_"],.__oma_browse_backer');
+                    for (var i = 0; i < mine.length; i++) mine[i].remove();
+                    return "<!DOCTYPE html>\n" + root.outerHTML;
+                })()"#;
+                let raw = match crate::tabs::eval(&state, js).await {
+                    Ok(raw) => raw,
+                    Err(e) => return TypedResult::error("webview", format!("{e:#}")),
+                };
+                // `eval` answers with JSON, so the markup arrives as a quoted,
+                // escaped string.
+                let html = match serde_json::from_str::<String>(&raw) {
+                    Ok(html) => html,
+                    Err(_) => raw,
+                };
+                let url = here(&state).await.map(|(u, _)| u).unwrap_or_default();
+                let bytes = html.len();
+
+                let wants_file = ctx.options.open || ctx.options.path.is_some();
+                if !wants_file {
+                    return TypedResult::ok(Source { url, bytes, html: Some(html), path: None });
+                }
+
+                // `.txt`, not `.html`: the point is to read the markup, and a
+                // file WebKit recognises as HTML is one it renders instead.
+                let path = match crate::shot::scratch_file(ctx.options.path, "source", "txt") {
+                    Ok(path) => path,
+                    Err(e) => return TypedResult::error("io", format!("{e:#}")),
+                };
+                if let Err(e) = std::fs::write(&path, &html) {
+                    return TypedResult::error("io", format!("could not write {}: {e}", path.display()));
+                }
+                if ctx.options.open {
+                    let target = format!("file://{}", path.display());
+                    if let Err(e) = crate::tabs::open(&state, &target, false).await {
+                        return TypedResult::error("webview", format!("{e:#}"));
+                    }
+                }
+                TypedResult::ok(Source {
+                    url,
+                    bytes,
+                    html: None,
+                    path: Some(path.display().to_string()),
+                })
+            }
+        },
+    )
+    .description(
+        "The active page's markup, with this browser's own injections removed. \
+         `--open` puts it in a new tab as plain text.",
+    )
+    .done();
+
     Cli::create("page")
         .description("Inspect the active page")
+        .command("source", source)
+        .command("devtools", devtools)
+        .command("print", print)
         .command("eval", eval)
         .command("screenshot", screenshot)
         .command("zoom", zoom)
+        .command("hints", hints)
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1497,14 @@ struct PaletteArgs {
 #[derive(JsonSchema, Serialize)]
 struct PaletteState {
     visible: bool,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Dismissed {
+    /// Whether the palette was up and has now been put away.
+    palette: bool,
+    /// Whether the page was reachable to clear hints on.
+    hints: bool,
 }
 
 fn ui_group(state: Arc<AppState>) -> Cli {
@@ -1006,7 +1541,41 @@ fn ui_group(state: Arc<AppState>) -> Cli {
     .description("Show, hide or toggle the command palette, optionally staged into a command")
     .done();
 
-    Cli::create("ui").description("Drive the browser's own interface").command("palette", palette)
+    let s = state.clone();
+    let dismiss = CommandDef::typed::<NoArgs, NoOptions, (), Dismissed, _, _>(
+        "dismiss",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let palette = state.palette_visible();
+                if palette {
+                    if let Err(e) = crate::window::set_palette_visible(&state, false) {
+                        return TypedResult::error("webview", format!("{e:#}"));
+                    }
+                    state.set_palette_visible(false);
+                }
+                // Best effort: a page with no scripts of ours has no hints to
+                // clear, and Escape must not report that as a failure.
+                let hints = crate::tabs::eval(
+                    &state,
+                    "window.__omaHints ? String(window.__omaHints(\"clear\")) : \"absent\"",
+                )
+                .await
+                .is_ok();
+                TypedResult::ok(Dismissed { palette, hints })
+            }
+        },
+    )
+    .description(
+        "Put away whatever is open: the command palette, and any link hints on \
+         the page. This is what Escape runs.",
+    )
+    .done();
+
+    Cli::create("ui")
+        .description("Drive the browser's own interface")
+        .command("palette", palette)
+        .command("dismiss", dismiss)
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1591,101 @@ struct FullscreenArgs {
 #[derive(JsonSchema, Serialize)]
 struct WindowState {
     fullscreen: bool,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct WindowNewArgs {
+    /// A URL, a bare host, or search terms. Omitted, the new window lands on
+    /// the start page with its palette already up.
+    url: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct WindowNewOptions {
+    // Same as the positional, for callers whose transport cannot carry slashes.
+    /// A URL, a bare host, or search terms.
+    url: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Spawned {
+    /// The new window's process.
+    pid: u32,
+}
+
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct ConfigState {
+    /// Where the file is looked for, whether or not it exists.
+    path: String,
+    exists: bool,
+    /// Every setting as the browser resolved it: the file over the defaults.
+    settings: crate::config::Config,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct ConfigWritten {
+    path: String,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ConfigInitOptions {
+    /// Overwrite a config file that is already there.
+    force: Option<bool>,
+}
+
+/// Read the config file, and write a commented one to start from.
+///
+/// No `set` command, deliberately: the file is a dotfile people keep in a
+/// dotfiles repository, and a command that rewrote it would have to give up its
+/// comments and its ordering to do so.
+fn config_group(state: Arc<AppState>) -> Cli {
+    let s = state.clone();
+    let show = CommandDef::typed::<NoArgs, NoOptions, (), ConfigState, _, _>(
+        "show",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let path = crate::config::Config::path();
+                // Whatever is *running*, which is the file only if it parsed --
+                // and `problem` is how you find out it did not, since the
+                // warning went to a log nobody is reading. A complaint raised
+                // later, by a value that parsed but means nothing, lands here
+                // too; see `AppState::note_config_problem`.
+                let mut settings = state.config.clone();
+                settings.problem = state.config_problem();
+                TypedResult::ok(ConfigState {
+                    exists: path.exists(),
+                    path: path.display().to_string(),
+                    settings,
+                })
+            }
+        },
+    )
+    .description("Show the config file's path and every setting as resolved")
+    .done();
+
+    let init = CommandDef::typed::<NoArgs, ConfigInitOptions, (), ConfigWritten, _, _>(
+        "init",
+        move |ctx: TypedContext<NoArgs, ConfigInitOptions, ()>| async move {
+            match crate::config::Config::write_template(ctx.options.force.unwrap_or(false)) {
+                Ok(path) => TypedResult::ok(ConfigWritten { path: path.display().to_string() }),
+                Err(e) => TypedResult::error("config", format!("{e:#}")),
+            }
+        },
+    )
+    .description("Write a commented config file with every setting at its default")
+    .done();
+
+    Cli::create("config")
+        .description("The dotfile every setting comes from")
+        .command("show", show)
+        .command("init", init)
 }
 
 fn window_group(state: Arc<AppState>) -> Cli {
@@ -1052,6 +1716,28 @@ fn window_group(state: Arc<AppState>) -> Cli {
     .description("Take the window fullscreen, or bring it back")
     .done();
 
+    let s = state.clone();
+    let new = CommandDef::typed::<WindowNewArgs, WindowNewOptions, (), Spawned, _, _>(
+        "new",
+        move |ctx: TypedContext<WindowNewArgs, WindowNewOptions, ()>| {
+            let state = s.clone();
+            async move {
+                // Resolved here rather than in the child, so that what you type
+                // at Ctrl-N means the same thing as what you type at Ctrl-T: a
+                // bare host becomes https, and anything else becomes a search.
+                let url = ctx.options.url.or(ctx.args.url).map(|input| {
+                    crate::tabs::resolve_input(&input, &state.config.search)
+                });
+                match crate::window::spawn(&state, url) {
+                    Ok(pid) => TypedResult::ok(Spawned { pid }),
+                    Err(e) => TypedResult::error("spawn", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description("Open another browser window")
+    .done();
+
     let s = state;
     let close = CommandDef::typed::<NoArgs, NoOptions, (), Acted, _, _>(
         "close",
@@ -1070,6 +1756,7 @@ fn window_group(state: Arc<AppState>) -> Cli {
 
     Cli::create("window")
         .description("The native window itself")
+        .command("new", new)
         .command("fullscreen", fullscreen)
         .command("close", close)
 }

@@ -48,7 +48,7 @@ no audio sink and media-heavy sites come up blank rather than merely silent.
 ## Running
 
 ```sh
-oma-browse                          # the start page
+oma-browse                          # the home page — omarchy.org unless configured
 oma-browse https://example.com      # straight to a URL
 oma-browse --incognito              # forgets where it has been
 ```
@@ -56,12 +56,70 @@ oma-browse --incognito              # forgets where it has been
 `--private` is accepted as well, so `omarchy-launch-browser` can hand this
 binary a URL and have it do the right thing.
 
+### Configuration
+
+Every setting lives in one dotfile, `~/.config/oma-browse/config.toml`, beside
+the rest of an Omarchy desktop's config. It is entirely optional: everything has
+a default, and a file with one line in it overrides one thing.
+
+```sh
+oma-browse config init    # write a commented file with every setting at its default
+oma-browse config show    # the path, and every setting as the browser resolved it
+```
+
+Sections are named for the surface they affect — `[chrome]` is the browser's own
+interface, `[theme]` is what loaded websites get, `[engine]` is WebKit itself:
+
+```toml
+home = "https://omarchy.org"                    # empty = the browser's own start page
+search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
+
+[chrome]                    # veil, font, plain_layout
+[chrome.palette]            # the card's size, margins and row counts
+[chrome.strip]              # enabled, height, title, debounce_ms
+[theme]                     # veil, recolor
+[window]                    # width, height, decorations, title
+[engine]                    # javascript, devtools, user_agent, autoplay, webrtc,
+                            # webgl, smooth_scrolling, font_size, cookies
+[control]                   # port, port_file
+[startup]                   # incognito, restore
+[history]                   # enabled, limit
+[downloads]                 # dir, notify
+[screenshot]                # dir, full, transparent
+[tabs]                      # reopen_depth, zoom, zoom_steps, favicon_size
+[keys]                      # "ctrl+k" = "ui_palette --action toggle"
+```
+
+**Translucency is two settings, not one.** `[theme] veil` is how see-through a
+*page* is: `"auto"` solves for contrast against your wallpaper and follows
+Ghostty's `background-opacity`, so the browser is as translucent as the terminal
+beside it; a number pins it whatever the wallpaper does. `[chrome] veil` is the
+palette card, opaque by default because it is a card you read dense text off.
+They are independent — a solid page under a glass palette is a valid answer, and
+so is the reverse. `OMA_VEIL` still overrules both, as the bisecting hatch.
+
+**Keys** are remapped by chord: `"ctrl+shift+t" = "tab_reopen"`, with flags
+spelled as they are on the command line (`"tab_cycle --delta -1"`), and an empty
+command to unbind. Anything not named keeps its built-in binding.
+
+**A fixed `[control] port`** is what makes the browser reachable by a script that
+did not watch it start; `port_file` writes the live port to
+`$XDG_RUNTIME_DIR/oma-browse/port` for the same reason.
+
+A misspelled key is an error rather than silence — but not a fatal one. The
+browser says which key and which line, on the log and in `config show`, and
+starts on its defaults: a browser that will not open because of a typo is a
+browser you cannot open the config file with. A chord that will not parse or a
+command that does not exist loses that one binding and is reported the same way.
+`$OMA_BROWSE_CONFIG` overrides the path, for a second profile.
+
 ### Keys
 
 | | |
 |---|---|
 | `Ctrl-K` / `Ctrl-L` / `Ctrl-P` | palette — the URL bar, the tab list, everything |
 | `Ctrl-T` / `Ctrl-W` | new tab / close tab |
+| `Ctrl-N` | new window |
 | `Ctrl-Shift-T` | reopen the last closed tab |
 | `Ctrl-Tab` / `Ctrl-Shift-Tab` | next / previous tab |
 | `Ctrl-F`, then `Ctrl-G` / `Ctrl-Shift-G` | find, next, previous |
@@ -75,6 +133,12 @@ binary a URL and have it do the right thing.
 
 Keys are bound on the GTK toplevel rather than injected into the page, so they
 work on a site that blocks scripts and on whatever currently holds focus.
+
+`Ctrl-T` and `Ctrl-N` both come up with the palette open: a tab or a window with
+nowhere to go is a question, and in a browser with no toolbar the palette is
+where it gets answered. Given a URL — `tab open <url>`, `window new <url>` — both
+stay quiet. A window is a second *process*, since the tab model, the palette and
+the strip all belong to one window; `Ctrl-Shift-W` closes just the one you are in.
 
 ## Driving it
 

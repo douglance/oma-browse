@@ -33,16 +33,36 @@ pub struct Tab {
     pub icon: String,
 }
 
-/// How many closed tabs are worth remembering.
-const CLOSED_STACK: usize = 32;
+/// How many closed tabs are worth remembering, unless the config says otherwise.
+pub const CLOSED_STACK: usize = 32;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tabs {
     entries: Vec<TabEntry>,
     active: Option<u32>,
     next_id: u32,
     /// URLs of recently closed tabs, most recent last.
     closed: Vec<String>,
+    /// How deep that stack goes; see [`crate::config::Tabs::reopen_depth`].
+    reopen_depth: usize,
+}
+
+impl Default for Tabs {
+    fn default() -> Self {
+        Self::with_reopen_depth(CLOSED_STACK)
+    }
+}
+
+impl Tabs {
+    pub fn with_reopen_depth(reopen_depth: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            active: None,
+            next_id: 0,
+            closed: Vec::new(),
+            reopen_depth,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +121,7 @@ impl Tabs {
             self.closed.push(removed.url.clone());
             // A bounded stack. Nobody reopens the fortieth tab back, and this
             // is the only thing in the model that would otherwise grow forever.
-            if self.closed.len() > CLOSED_STACK {
+            while self.closed.len() > self.reopen_depth {
                 self.closed.remove(0);
             }
         }
@@ -217,7 +237,7 @@ impl Tabs {
 /// Turn whatever the user typed into something navigable.
 ///
 /// A bare host becomes https, anything that cannot be a host becomes a search.
-pub fn resolve_input(input: &str) -> String {
+pub fn resolve_input(input: &str, search: &str) -> String {
     let raw = input.trim();
     if raw.is_empty() {
         return "about:blank".to_string();
@@ -239,9 +259,18 @@ pub fn resolve_input(input: &str) -> String {
                     .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))));
 
     if looks_like_host {
-        format!("https://{raw}")
+        return format!("https://{raw}");
+    }
+
+    // `{query}` rather than a bare append, because plenty of engines want the
+    // terms in the middle of the URL rather than at the end of it. A template
+    // without the placeholder still works: the terms go on the end, which is
+    // what a half-written `?q=` in the config file was reaching for anyway.
+    let encoded = urlencode(raw);
+    if search.contains("{query}") {
+        search.replace("{query}", &encoded)
     } else {
-        format!("https://duckduckgo.com/?q={}", urlencode(raw))
+        format!("{search}{encoded}")
     }
 }
 
@@ -274,7 +303,7 @@ fn webview(app: &AppHandle<Wry>, label: &str) -> Result<Webview<Wry>> {
 /// Open a URL in a new tab.
 pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Result<Tab> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let url = resolve_input(input);
+    let url = resolve_input(input, &state.config.search);
     let parsed: url::Url = url.parse().with_context(|| format!("{url} is not a URL"))?;
 
     let (id, label) = {
@@ -304,8 +333,16 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     // overlay; move it into the content stack so it stacks with the other tabs.
     crate::layout::adopt_tab(&view)?;
 
+    // The download signal is on the shared web context, so this registers
+    // once however many tabs ask; see `downloads::watch`.
+    if let Err(e) = crate::downloads::watch(&view, state.clone()) {
+        tracing::warn!(error = %e, "not watching downloads");
+    }
     if let Err(e) = crate::favicon::watch(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "not watching this tab's favicon");
+    }
+    if let Err(e) = crate::engine::configure(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab kept WebKit's own settings");
     }
 
     if background {
@@ -368,7 +405,7 @@ fn futures_active(state: &Arc<AppState>) -> Option<u32> {
 /// Navigate the active tab.
 pub async fn navigate(state: &Arc<AppState>, input: &str) -> Result<String> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let url = resolve_input(input);
+    let url = resolve_input(input, &state.config.search);
     let parsed: url::Url = url.parse().with_context(|| format!("{url} is not a URL"))?;
 
     let label = {
@@ -398,7 +435,7 @@ pub async fn navigate(state: &Arc<AppState>, input: &str) -> Result<String> {
 /// than like a slider. Anything WebKit already holds that is off the ladder --
 /// set through `page zoom --level` -- steps to the next rung in the direction
 /// asked for.
-const ZOOM_STEPS: [f64; 16] =
+pub const ZOOM_STEPS: [f64; 16] =
     [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0];
 
 #[derive(Clone, Copy, Debug)]
@@ -409,11 +446,21 @@ pub enum ZoomChange {
     Set(f64),
 }
 
-fn stepped(current: f64, up: bool) -> f64 {
+/// The next rung in the direction asked for, or the end of the ladder.
+///
+/// The ladder is `tabs.zoom_steps`, which need not be Chrome's and need not be
+/// sorted by the person who wrote it -- so it is sorted here rather than
+/// trusting the file. An empty one leaves zoom alone rather than dividing by a
+/// ladder with no rungs.
+fn stepped(steps: &[f64], current: f64, up: bool) -> f64 {
+    let mut ladder: Vec<f64> = steps.iter().copied().filter(|s| *s > 0.0).collect();
+    ladder.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let Some((&first, &last)) = ladder.first().zip(ladder.last()) else { return current };
+
     if up {
-        ZOOM_STEPS.iter().copied().find(|s| *s > current + 1e-6).unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
+        ladder.iter().copied().find(|s| *s > current + 1e-6).unwrap_or(last)
     } else {
-        ZOOM_STEPS.iter().copied().rev().find(|s| *s < current - 1e-6).unwrap_or(ZOOM_STEPS[0])
+        ladder.iter().copied().rev().find(|s| *s < current - 1e-6).unwrap_or(first)
     }
 }
 
@@ -479,6 +526,232 @@ pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
     }
 }
 
+/// Show, hide or toggle WebKit's own inspector for the active tab.
+///
+/// The inspector is a real WebKit surface, not something this browser draws, so
+/// there is nothing to theme and nothing to keep in step -- the price is that it
+/// opens in its own window rather than in the tab, which on a tiling compositor
+/// is arguably the better shape anyway.
+///
+/// Developer extras are switched on here rather than at webview creation: it is
+/// a per-webview setting with a cost, and a browser that is not being debugged
+/// should not be carrying an inspector's worth of instrumentation.
+pub async fn devtools(state: &Arc<AppState>, action: Toggle) -> Result<bool> {
+    let (view, _) = active(state).await?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.with_webview(move |platform| {
+            use webkit2gtk::{SettingsExt, WebInspectorExt, WebViewExt};
+            let w = platform.inner();
+            if let Some(settings) = w.settings() {
+                settings.set_enable_developer_extras(true);
+            }
+            // Only available once developer extras are on, which is why the
+            // settings line above is not an optimisation.
+            let Some(inspector) = w.inspector() else {
+                let _ = tx.send(false);
+                return;
+            };
+            let open = inspector.is_attached() || inspector.attached_height() > 0;
+            let want = action.resolve(open);
+            if want {
+                inspector.show();
+            } else {
+                inspector.close();
+            }
+            let _ = tx.send(want);
+        })
+        .context("could not reach the webview")?;
+        rx.await.context("the webview did not answer about its inspector")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (view, action);
+        Err(anyhow!("unsupported on this platform"))
+    }
+}
+
+/// Silence a tab, or let it speak again.
+///
+/// Per tab and not per site, which is the same choice `zoom` makes: a tab is the
+/// thing on screen, and "which of these is making noise" is a question about
+/// tabs.
+pub async fn mute(state: &Arc<AppState>, id: Option<u32>, action: Toggle) -> Result<bool> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let label = {
+        let tabs = state.tabs.read().await;
+        match id {
+            Some(id) => tabs.label_of(id).ok_or_else(|| anyhow!("no tab with id {id}"))?,
+            None => tabs.active_label().ok_or_else(|| anyhow!("there is no active tab"))?,
+        }
+    };
+    let view = webview(&app, &label)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.with_webview(move |platform| {
+            use webkit2gtk::WebViewExt;
+            let w = platform.inner();
+            let want = action.resolve(w.is_muted());
+            w.set_is_muted(want);
+            let _ = tx.send(want);
+        })
+        .context("could not reach the webview")?;
+        rx.await.context("the webview did not report whether it is muted")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (view, action);
+        Err(anyhow!("unsupported on this platform"))
+    }
+}
+
+/// Print the active tab, or write it to a PDF.
+///
+/// With a path this never shows a dialog: "save this page as a PDF" is a thing
+/// an agent asks for as often as a person does, and a modal dialog on the CLI
+/// path would hang whoever called it. Without one it is GTK's print dialog,
+/// which is the only place the user's real printers live.
+pub async fn print(state: &Arc<AppState>, to: Option<std::path::PathBuf>) -> Result<Option<String>> {
+    let (view, _) = active(state).await?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.with_webview(move |platform| {
+            use gtk::prelude::*;
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            use webkit2gtk::{PrintOperation, PrintOperationExt};
+
+            let op = PrintOperation::new(&platform.inner());
+
+            // A `WebKitPrintOperation` runs asynchronously and holds no
+            // reference to itself. Dropping it at the end of this closure --
+            // which is what the obvious code does -- cancels the job before a
+            // byte is written, silently: `print()` returns, the command reports
+            // success, and no file appears. Hold a reference until the operation
+            // says it is done with itself.
+            let keep: Rc<RefCell<Option<PrintOperation>>> = Rc::new(RefCell::new(None));
+            let answer = Rc::new(RefCell::new(Some(tx)));
+
+            let done = answer.clone();
+            let alive = keep.clone();
+            let wrote = to.as_ref().map(|p| p.display().to_string());
+            op.connect_finished(move |_| {
+                alive.borrow_mut().take();
+                if let Some(tx) = done.borrow_mut().take() {
+                    let _ = tx.send(Ok(wrote.clone()));
+                }
+            });
+
+            let bad = answer.clone();
+            let alive = keep.clone();
+            op.connect_failed(move |_, error| {
+                alive.borrow_mut().take();
+                if let Some(tx) = bad.borrow_mut().take() {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+            });
+
+            *keep.borrow_mut() = Some(op.clone());
+
+            match &to {
+                Some(path) => {
+                    let settings = gtk::PrintSettings::new();
+                    // The destination is a *printer*, not a setting. Without
+                    // this GTK sends the job to the default CUPS queue and, on
+                    // a machine with no printer configured, that surfaces as
+                    // "Broken pipe" -- which is what this looked like before.
+                    // "Print to File" is GTK's own file backend, the same entry
+                    // the print dialog lists first, and the name Epiphany uses.
+                    settings.set_printer(FILE_PRINTER);
+                    // Its output takes a URI, and only a URI: a bare path
+                    // prints nowhere and says nothing.
+                    settings.set("output-uri", Some(format!("file://{}", path.display()).as_str()));
+                    settings.set("output-file-format", Some("pdf"));
+                    op.set_print_settings(&settings);
+                    op.print();
+                }
+                None => {
+                    // No parent window: the dialog is a real toplevel either way
+                    // under a tiling compositor, and reaching for the browser's
+                    // own window from here means another downcast that can fail.
+                    op.run_dialog(None::<&gtk::Window>);
+                }
+            }
+        })
+        .context("could not reach the webview")?;
+
+        // A print job that never answers must not hold the caller forever --
+        // the dialog path in particular waits on a human.
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(Ok(path))) => Ok(path),
+            Ok(Ok(Err(e))) => Err(anyhow!("printing failed: {e}")),
+            Ok(Err(_)) => Err(anyhow!("the webview dropped the print job")),
+            Err(_) => Err(anyhow!("the print job did not finish within two minutes")),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (view, to);
+        Err(anyhow!("unsupported on this platform"))
+    }
+}
+
+/// GTK's built-in "save it to a file instead" printer.
+///
+/// Not a CUPS queue: GTK's file backend registers it itself, so it exists on a
+/// machine with no printers at all -- which is most machines this will run on.
+#[cfg(target_os = "linux")]
+const FILE_PRINTER: &str = "Print to File";
+
+/// The active tab's webview and label, which four commands here all want first.
+async fn active(state: &Arc<AppState>) -> Result<(tauri::webview::Webview<tauri::Wry>, String)> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let label = state
+        .tabs
+        .read()
+        .await
+        .active_label()
+        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let view = webview(&app, &label)?;
+    Ok((view, label))
+}
+
+/// `show`, `hide` or `toggle`, resolved against what is currently true.
+///
+/// Three commands take exactly this argument, and a shared type is what stops
+/// one of them growing a fourth spelling nobody else accepts.
+#[derive(Debug, Clone, Copy)]
+pub enum Toggle {
+    On,
+    Off,
+    Flip,
+}
+
+impl Toggle {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "show" | "on" | "open" | "true" => Some(Toggle::On),
+            "hide" | "off" | "close" | "false" => Some(Toggle::Off),
+            "toggle" | "flip" => Some(Toggle::Flip),
+            _ => None,
+        }
+    }
+
+    pub fn resolve(self, current: bool) -> bool {
+        match self {
+            Toggle::On => true,
+            Toggle::Off => false,
+            Toggle::Flip => !current,
+        }
+    }
+}
+
 pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
     let app = state.app_handle().context("the window is not up yet")?;
     let label = state
@@ -491,16 +764,26 @@ pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
 
     #[cfg(target_os = "linux")]
     {
+        // Sorted once, here, rather than inside the GTK closure: the config is
+        // not `Send` to borrow across it, and this runs on every step.
+        let mut steps = state.config.tabs.zoom_steps.clone();
+        steps.retain(|s| *s > 0.0);
+        steps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         view.with_webview(move |platform| {
             use webkit2gtk::WebViewExt;
             let w = platform.inner();
             let current = w.zoom_level();
             let next = match change {
-                ZoomChange::In => stepped(current, true),
-                ZoomChange::Out => stepped(current, false),
+                ZoomChange::In => stepped(&steps, current, true),
+                ZoomChange::Out => stepped(&steps, current, false),
                 ZoomChange::Reset => 1.0,
-                ZoomChange::Set(v) => v.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]),
+                ZoomChange::Set(v) => {
+                    let low = steps.first().copied().unwrap_or(ZOOM_STEPS[0]);
+                    let high = steps.last().copied().unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
+                    v.clamp(low.min(high), high.max(low))
+                }
             };
             w.set_zoom_level(next);
             let _ = tx.send(next);
@@ -591,32 +874,52 @@ pub enum HistoryAction {
 mod tests {
     use super::*;
 
+    /// The stock template, so a test reads as what it is testing.
+    const SEARCH: &str = "https://duckduckgo.com/?q={query}";
+
+    #[test]
+    fn a_toggle_reads_every_spelling_and_nothing_else() {
+        for (raw, from_false, from_true) in [
+            ("show", true, true),
+            ("on", true, true),
+            ("hide", false, false),
+            ("off", false, false),
+            ("toggle", true, false),
+        ] {
+            let t = Toggle::parse(raw).unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(t.resolve(false), from_false, "{raw} from off");
+            assert_eq!(t.resolve(true), from_true, "{raw} from on");
+        }
+        assert!(Toggle::parse("").is_none());
+        assert!(Toggle::parse("yes").is_none(), "an unknown spelling must be rejected, not guessed");
+    }
+
     #[test]
     fn bare_hosts_become_https() {
-        assert_eq!(resolve_input("github.com"), "https://github.com");
-        assert_eq!(resolve_input("github.com/rust-lang"), "https://github.com/rust-lang");
-        assert_eq!(resolve_input("localhost:3000"), "https://localhost:3000");
+        assert_eq!(resolve_input("github.com", SEARCH), "https://github.com");
+        assert_eq!(resolve_input("github.com/rust-lang", SEARCH), "https://github.com/rust-lang");
+        assert_eq!(resolve_input("localhost:3000", SEARCH), "https://localhost:3000");
     }
 
     #[test]
     fn explicit_schemes_pass_through() {
-        assert_eq!(resolve_input("http://example.com"), "http://example.com");
-        assert_eq!(resolve_input("https://example.com"), "https://example.com");
+        assert_eq!(resolve_input("http://example.com", SEARCH), "http://example.com");
+        assert_eq!(resolve_input("https://example.com", SEARCH), "https://example.com");
     }
 
     #[test]
     fn prose_becomes_a_search() {
         assert_eq!(
-            resolve_input("how do i tile windows"),
+            resolve_input("how do i tile windows", SEARCH),
             "https://duckduckgo.com/?q=how+do+i+tile+windows"
         );
         // A single word with no dot is a search, not a host.
-        assert!(resolve_input("omarchy").starts_with("https://duckduckgo.com/?q="));
+        assert!(resolve_input("omarchy", SEARCH).starts_with("https://duckduckgo.com/?q="));
     }
 
     #[test]
     fn empty_input_is_blank_not_a_search() {
-        assert_eq!(resolve_input("   "), "about:blank");
+        assert_eq!(resolve_input("   ", SEARCH), "about:blank");
     }
 
     #[test]
