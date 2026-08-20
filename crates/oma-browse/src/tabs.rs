@@ -620,13 +620,24 @@ pub async fn mute(state: &Arc<AppState>, id: Option<u32>, action: Toggle) -> Res
 /// user's real printers live. It is opt-in rather than the default because
 /// under this runtime it does not work: the dialog renders, takes the keyboard
 /// focus, and then accepts no input at all -- not Escape, not Alt-F4 -- while
-/// GTK's grab keeps every key away from the browser too, so the window is
-/// unusable until the two-minute timeout below fires. `run_dialog` runs a
-/// nested GTK main loop, and tao pumps GTK by hand from its own loop, so the
-/// nested one never gets the events. Fixing it means building the dialog
-/// ourselves from `gtk_print_unix_dialog_*` and driving it with
-/// `connect_response` instead of a nested loop -- there are no gtk-rs bindings
-/// for that, so it is raw FFI and a job of its own.
+/// GTK's grab keeps every key away from the browser too, so the window takes no
+/// keys until the dialog goes away. `run_dialog` runs a nested GTK main loop,
+/// and tao pumps GTK by hand from its own loop, so the nested one never gets
+/// the events.
+///
+/// It is only GTK's input path that is dead, which is the way out: the
+/// compositor can still act on the window even though GTK cannot, so SUPER+W --
+/// close-window on Omarchy -- dismisses it. The control plane keeps answering
+/// throughout, so `oma-browse --window <pid> tab list` works while it is up.
+/// Closing the dialog that way leaves the job in limbo, though: neither
+/// `connect_finished` nor `connect_failed` fires, and the caller waits out the
+/// two-minute timeout below.
+///
+/// Fixing it properly means building the dialog ourselves from
+/// `gtk_print_unix_dialog_*` and driving it with `connect_response` instead of
+/// a nested loop -- there are no gtk-rs bindings for that, so it is raw FFI and
+/// a job of its own. Note `unsafe_code` is denied workspace-wide; that site is
+/// the case the lint's own comment says may lift it.
 pub async fn print(
     state: &Arc<AppState>,
     to: Option<std::path::PathBuf>,
