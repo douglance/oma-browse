@@ -3217,7 +3217,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "topcoat",
  "tower",
  "tracing",
@@ -3236,7 +3236,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
 
