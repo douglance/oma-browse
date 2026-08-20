@@ -611,11 +611,26 @@ pub async fn mute(state: &Arc<AppState>, id: Option<u32>, action: Toggle) -> Res
 
 /// Print the active tab, or write it to a PDF.
 ///
-/// With a path this never shows a dialog: "save this page as a PDF" is a thing
-/// an agent asks for as often as a person does, and a modal dialog on the CLI
-/// path would hang whoever called it. Without one it is GTK's print dialog,
-/// which is the only place the user's real printers live.
-pub async fn print(state: &Arc<AppState>, to: Option<std::path::PathBuf>) -> Result<Option<String>> {
+/// A path writes a PDF and never shows a dialog: "save this page as a PDF" is a
+/// thing an agent asks for as often as a person does, and a modal dialog on the
+/// CLI path would hang whoever called it.
+///
+/// `dialog` asks for GTK's print dialog instead, which is the only place the
+/// user's real printers live. It is opt-in rather than the default because
+/// under this runtime it does not work: the dialog renders, takes the keyboard
+/// focus, and then accepts no input at all -- not Escape, not Alt-F4 -- while
+/// GTK's grab keeps every key away from the browser too, so the window is
+/// unusable until the two-minute timeout below fires. `run_dialog` runs a
+/// nested GTK main loop, and tao pumps GTK by hand from its own loop, so the
+/// nested one never gets the events. Fixing it means building the dialog
+/// ourselves from `gtk_print_unix_dialog_*` and driving it with
+/// `connect_response` instead of a nested loop -- there are no gtk-rs bindings
+/// for that, so it is raw FFI and a job of its own.
+pub async fn print(
+    state: &Arc<AppState>,
+    to: Option<std::path::PathBuf>,
+    dialog: bool,
+) -> Result<Option<String>> {
     let (view, _) = active(state).await?;
 
     #[cfg(target_os = "linux")]
@@ -640,7 +655,7 @@ pub async fn print(state: &Arc<AppState>, to: Option<std::path::PathBuf>) -> Res
 
             let done = answer.clone();
             let alive = keep.clone();
-            let wrote = to.as_ref().map(|p| p.display().to_string());
+            let wrote = to.as_ref().filter(|_| !dialog).map(|p| p.display().to_string());
             op.connect_finished(move |_| {
                 alive.borrow_mut().take();
                 if let Some(tx) = done.borrow_mut().take() {
@@ -659,7 +674,7 @@ pub async fn print(state: &Arc<AppState>, to: Option<std::path::PathBuf>) -> Res
 
             *keep.borrow_mut() = Some(op.clone());
 
-            match &to {
+            match to.as_ref().filter(|_| !dialog) {
                 Some(path) => {
                     let settings = gtk::PrintSettings::new();
                     // The destination is a *printer*, not a setting. Without
@@ -677,10 +692,17 @@ pub async fn print(state: &Arc<AppState>, to: Option<std::path::PathBuf>) -> Res
                     op.print();
                 }
                 None => {
-                    // No parent window: the dialog is a real toplevel either way
-                    // under a tiling compositor, and reaching for the browser's
-                    // own window from here means another downcast that can fail.
-                    op.run_dialog(None::<&gtk::Window>);
+                    // The parent matters, and getting it wrong is not cosmetic.
+                    // A parentless GTK dialog under Wayland never receives
+                    // keyboard focus while GTK's modal grab still holds every
+                    // key away from the browser: the dialog could not be
+                    // dismissed with Escape *or* Alt-F4, Ctrl-T stopped opening
+                    // tabs, and the only way out was killing the process. With
+                    // the browser's own window as `transient-for` the dialog is
+                    // focusable and Escape closes it.
+                    let parent =
+                        platform.inner().toplevel().and_then(|w| w.downcast::<gtk::Window>().ok());
+                    op.run_dialog(parent.as_ref());
                 }
             }
         })

@@ -113,12 +113,59 @@
     }
 
     var m = v.match(/rgba?\(([^)]+)\)/i);
-    if (!m) return null;
-    var p = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
-    if (p.length < 3) return null;
-    for (var i = 0; i < 3; i++) if (!isFinite(p[i])) return null;
-    if (p.length < 4 || !isFinite(p[3])) p[3] = 1;
-    return p;
+    if (m) {
+      var p = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
+      if (p.length < 3) return null;
+      for (var i = 0; i < 3; i++) if (!isFinite(p[i])) return null;
+      if (p.length < 4 || !isFinite(p[3])) p[3] = 1;
+      return p;
+    }
+
+    // Everything else the engine calls a colour: `black`, `hsl()`, `color-mix()`,
+    // `lab()`. Wikipedia is the case that proved this matters -- its infobox is
+    // `.infobox { color: black }`, and CSSOM hands a declaration back as
+    // *authored*, so this saw the word rather than `rgb(0, 0, 0)`, called it
+    // "not a colour", and left the text black on a surface it had just made
+    // transparent. A keyword list would fix `black` and miss the next syntax;
+    // asking the engine cannot go out of date.
+    var normal = normalise(v);
+    return normal === v ? null : channels(normal);
+  }
+
+  // The engine's own colour parser, borrowed. Assigning a canvas `fillStyle`
+  // normalises anything it recognises to `#rrggbb` or `rgba(...)` and silently
+  // *keeps the previous value* for anything it does not -- which is the whole
+  // test, done against two different sentinels so a value that happens to equal
+  // one of them is not mistaken for a rejection.
+  var swatch = null;
+  var normalised = {};
+
+  function normalise(value) {
+    if (Object.prototype.hasOwnProperty.call(normalised, value)) return normalised[value];
+    var out = value;
+    try {
+      if (!swatch) swatch = document.createElement("canvas").getContext("2d");
+      if (swatch) {
+        swatch.fillStyle = "#010203";
+        swatch.fillStyle = value;
+        var first = swatch.fillStyle;
+        if (first !== "#010203") {
+          out = first;
+        } else {
+          swatch.fillStyle = "#040506";
+          swatch.fillStyle = value;
+          // Still moved, so `#010203` really was the answer the first time.
+          if (swatch.fillStyle !== "#040506") out = first;
+        }
+      }
+    } catch (e) {
+      /* No canvas (a CSP that forbids it, a document with no view). */
+    }
+    // Bounded: a page has far fewer distinct colour literals than rules that
+    // mention them, and this runs once per rule per declaration on every
+    // recolour.
+    if (Object.keys(normalised).length < 4000) normalised[value] = out;
+    return out;
   }
 
   function lightness(value) {

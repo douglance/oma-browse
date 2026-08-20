@@ -1117,7 +1117,9 @@ struct ShotOptions {
     path: Option<String>,
     /// Capture the whole scrollable document instead of just the viewport.
     full: bool,
-    /// Composite onto white instead of preserving the page's transparency.
+    /// Flatten the shot onto the theme's background colour instead of
+    /// leaving it transparent. A translucent PNG looks fine on a white
+    /// viewer and hides dark-on-dark text; this shows what is on screen.
     opaque: bool,
 }
 
@@ -1197,12 +1199,31 @@ struct PrintArgs {
 struct PrintOptions {
     /// Write a PDF here instead of opening the print dialog.
     path: Option<String>,
+    /// Open GTK's print dialog instead of writing a PDF. Currently broken
+    /// under this runtime -- see `tabs::print` -- so it is opt-in.
+    dialog: bool,
 }
 
 #[derive(JsonSchema, Serialize)]
 struct Printed {
     /// The PDF written, or null when the print dialog was opened instead.
     path: Option<String>,
+}
+
+/// Where a PDF goes when the caller did not name a file.
+///
+/// The downloads directory under the page's own title, because a PDF of a page
+/// is a file the user went looking for, and `$XDG_RUNTIME_DIR` -- where the
+/// screenshots go -- is wiped at reboot.
+async fn default_pdf(state: &std::sync::Arc<crate::state::AppState>) -> std::path::PathBuf {
+    let title = {
+        let tabs = state.tabs.read().await;
+        tabs.list().iter().find(|t| t.active).map(|t| t.title.clone()).unwrap_or_default()
+    };
+    let title = title.trim();
+    let stem = if title.is_empty() { "page" } else { title };
+    let dir = crate::downloads::download_dir();
+    crate::downloads::unique(&dir, &format!("{stem}.pdf"))
 }
 
 #[derive(Deserialize, incurs::Args)]
@@ -1385,7 +1406,17 @@ fn page_group(state: Arc<AppState>) -> Cli {
                     };
                     std::path::PathBuf::from(expanded)
                 });
-                match crate::tabs::print(&state, to).await {
+                let dialog = ctx.options.dialog;
+                // No path and no `--dialog` writes a PDF where the user's other
+                // downloads go. Defaulting to the dialog would be the obvious
+                // choice and is the wrong one: it is unusable here and takes the
+                // whole window down with it for two minutes.
+                let to = match to {
+                    Some(path) => Some(path),
+                    None if dialog => None,
+                    None => Some(default_pdf(&state).await),
+                };
+                match crate::tabs::print(&state, to, dialog).await {
                     Ok(path) => TypedResult::ok(Printed { path }),
                     Err(e) => TypedResult::error("webview", format!("{e:#}")),
                 }
@@ -1393,8 +1424,10 @@ fn page_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description(
-        "Print the active tab. With a path it writes a PDF and never opens a \
-         dialog, which is what makes it usable from the CLI and from an agent.",
+        "Print the active tab to a PDF, in the downloads directory under the \
+         page's own title unless a path says otherwise. Never opens a dialog, \
+         which is what makes it usable from the CLI, from an agent and from a \
+         key; `--dialog` asks for GTK's printer chooser instead.",
     )
     .done();
 
