@@ -1,0 +1,9 @@
+# Chosen to fit how this codebase is already written rather than to change it.
+# Stock rustfmt reflows about three times as much; these two settings bring that
+# down to a sweep that almost entirely *tightens*, because the prose-heavy style
+# here already keeps lines near 100 and prefers one-line struct literals.
+#
+# `cargo fmt --all --check` is a CI gate, so this file is the tie-breaker for
+# every formatting argument that would otherwise happen in review.
+max_width = 100
+use_small_heuristics = "Max"

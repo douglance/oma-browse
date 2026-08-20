@@ -1,3 +1,6 @@
 /target
-/assets
 Cargo.lock.bak
+
+# `assets/` is deliberately *not* ignored. `server.rs` does `include_bytes!` on
+# assets/mark.png and assets/icon.png, and the README links those plus the two
+# screenshots, so a clone without them neither builds nor renders.

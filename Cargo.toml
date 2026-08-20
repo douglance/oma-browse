@@ -9,6 +9,51 @@ rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/douglance/oma-browse"
 
+# Denied in CI rather than merely warned about, because a warning nobody reads
+# is a lint nobody has. `cargo clippy --workspace --all-targets -- -D warnings`
+# is the gate; see .github/workflows/ci.yml.
+#
+# Every lint switched off below is switched off with a reason, and the reason is
+# never "it fired a lot". If a lint is wrong for this codebase often enough to be
+# annoying, it is wrong for a reason worth writing down; if it is only wrong once
+# it gets a scoped `#[allow]` at the site instead.
+[workspace.lints.rust]
+# There is no `unsafe` in this tree today and adding some should be a decision,
+# not a reflex. The one place it is already known to be needed -- driving GTK's
+# print dialog through `gtk_print_unix_dialog_*`, which gtk-rs 0.18 does not
+# bind -- can lift this with a scoped `#[allow]` and an explanation.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The panic family. This binary is somebody's browser: a panic takes the window
+# and every open tab with it, and there is nearly always a `Result` to return
+# instead. Tests are exempt -- see the `cfg_attr(test, allow(..))` at the top of
+# each crate root -- because an `unwrap` in a test *is* the assertion.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+# Off, with reasons.
+#
+# `doc_markdown` wants backticks around anything CamelCase, and the prose here is
+# full of proper nouns: WebKit, WebKitGTK, MiniBrowser, Omarchy, Hyprland.
+# Backticking a product name says "this is an identifier", which is false and
+# reads worse. It cannot tell the two apart, so it goes.
+doc_markdown = "allow"
+# The casts in here are deliberate f64 <-> integer pixel arithmetic: rects,
+# scroll offsets, zoom levels. Truncation is the *intent* at every one of those
+# sites, and 28 `try_into().unwrap_or()` dances would trade a real risk that does
+# not exist here for noise that does.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Every fallible function in this workspace returns `anyhow::Error`, which tells
+# a caller nothing it could branch on. An `# Errors` section per function would
+# be the same sentence 200 times.
+missing_errors_doc = "allow"
+
 [workspace.dependencies]
 oma-theme = { path = "crates/oma-theme" }
 

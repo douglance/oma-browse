@@ -1,0 +1,26 @@
+# Grouped and monthly on purpose. This workspace pins `webkit2gtk` and `gtk` to
+# whatever Tauri pins, so an ungrouped weekly bump would open pull requests that
+# cannot merge -- see the comment on those two in crates/oma-browse/Cargo.toml.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for the routine churn, so review is one read.
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # These must match Tauri's own pins exactly: `with_webview` hands back a
+      # `webkit2gtk::WebView`, and a version skew gives two incompatible copies
+      # of the same types. They move when Tauri moves, by hand.
+      - dependency-name: webkit2gtk
+      - dependency-name: gtk
+      - dependency-name: cairo-rs
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -1,0 +1,103 @@
+name: CI
+
+# Pull requests and pushes to the default branch. Nothing on tags: there is no
+# release yet, and a workflow that has never run is not a gate.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # So a red build can be re-run without pushing an empty commit.
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first. CI here compiles WebKit
+# bindings, which is not a thing to do twice for a result nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on a warning from the compiler as well as from clippy. The workspace
+  # lint table in Cargo.toml decides *which* warnings; this decides that a
+  # warning is a failure.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Formatting first and on its own: it needs no system libraries and no build,
+  # so it answers in seconds and catches the most common reason for a red run
+  # without holding a runner for ten minutes.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--all-targets` so tests and benches are linted too. A lint that only
+      # runs on shipping code misses the place most `unwrap`s actually live.
+      - run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      # Both injected runtimes are `include_str!` strings as far as Rust is
+      # concerned, so a syntax error in either one compiles, ships, and silently
+      # never runs. The only symptom is a page that stays unthemed, or `f` that
+      # stops drawing link hints. Rust cannot see it; node can.
+      - name: Check the injected page scripts parse
+        run: |
+          OMA_DUMP_SCRIPT="$RUNNER_TEMP/page.js" cargo test -p oma-theme --test dump_script --locked
+          OMA_DUMP_HINTS="$RUNNER_TEMP/hints.js" cargo test -p oma-browse hints::tests::dump --locked
+          node --check "$RUNNER_TEMP/page.js"
+          node --check "$RUNNER_TEMP/hints.js"
+
+  # Kept separate from `test` because it is the slow one and it is the one that
+  # answers the question a clone actually asks: does this build at all?
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+      # `assets/mark.png` and `assets/icon.png` reach the binary through
+      # `include_bytes!`, so a checkout missing them fails right here. That is
+      # the correct failure and an obscure one; this names it.
+      - name: The committed assets are the ones the binary embeds
+        run: |
+          test -f assets/mark.png || { echo "assets/mark.png is missing -- server.rs include_bytes! needs it"; exit 1; }
+          test -f assets/icon.png || { echo "assets/icon.png is missing -- server.rs include_bytes! needs it"; exit 1; }
+
+  # Not a gate. `cargo audit` fails on an advisory filed against a transitive
+  # dependency we cannot fix today, and a red X nobody can clear is a red X
+  # everyone learns to ignore.
+  audit:
+    name: audit (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check advisories bans licenses sources
