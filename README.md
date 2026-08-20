@@ -149,10 +149,31 @@ curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png
 curl --unix-socket "$S" --get http://x/cmd/page/eval --data-urlencode 'js=document.title'
 ```
 
+For an agent, the same graph is an MCP server. `oma-browse --mcp` speaks MCP on
+stdin and stdout the way an MCP client expects, and relays it to the window you
+were last looking at, so a tool call opens a tab in the browser you can see:
+
 ```sh
-oma-browse --llms          # the whole command graph, machine-readable
 oma-browse mcp add         # register it with an MCP client
+oma-browse --llms          # or the whole command graph, machine-readable
 ```
+
+Tooling that cannot open a Unix socket — something in a container, or on another
+machine through a tunnel — can ask for a port instead. It is off by default:
+
+```toml
+[control]
+remote_port = 7788     # loopback, and every process on the box can use it
+```
+
+```sh
+curl http://127.0.0.1:7788/json/list                    # the live windows
+curl http://127.0.0.1:7788/cmd/tab/list                 # this one
+curl "http://127.0.0.1:7788/cmd/tab/list?window=<pid>"  # another one, via its socket
+```
+
+That port carries the command graph and its MCP endpoint, and nothing else — the
+palette is not on it.
 
 For engine-level debugging there is no protocol to reimplement: WebKit ships a
 remote inspector, and it takes an address from the environment.
@@ -168,6 +189,24 @@ WEBKIT_INSPECTOR_SERVER=127.0.0.1:2999 oma-browse    # then attach a DevTools cl
 > machine. The browser binds nothing at all on the network — its own chrome (the
 > palette, the tab strip, the start page) is served to its own webviews over an
 > `oma-chrome://` URI scheme handled inside the process.
+
+## Making it your browser
+
+`xdg-open`, link handlers and application launchers all resolve a browser
+through a `.desktop` file, so being the default browser means installing one.
+
+```sh
+cargo build --release
+install -Dm755 target/release/oma-browse ~/.local/bin/oma-browse
+install -Dm644 assets/oma-browse.desktop ~/.local/share/applications/oma-browse.desktop
+install -Dm644 assets/icon.png ~/.local/share/icons/hicolor/128x128/apps/oma-browse.png
+update-desktop-database ~/.local/share/applications
+xdg-settings set default-web-browser oma-browse.desktop
+```
+
+A URL opened that way lands in the window you already have, as a new tab — the
+`.desktop` file's *New Window* and *New Incognito Window* actions are how you ask
+for a second one, and so is `Ctrl-N`.
 
 ## Theming
 

@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=oma-browse
+GenericName=Web Browser
+Comment=An Omarchy-themed, agent-drivable browser
+Exec=oma-browse %u
+Icon=oma-browse
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
+StartupNotify=true
+# Hyprland matches window rules on this, and it is what the browser sets.
+StartupWMClass=oma-browse
+Actions=NewWindow;NewIncognitoWindow;
+
+# A URL above is handed to the window you already have; these two say otherwise
+# on purpose, which is what a launcher's "New Window" is for.
+[Desktop Action NewWindow]
+Name=New Window
+Exec=oma-browse --new
+
+[Desktop Action NewIncognitoWindow]
+Name=New Incognito Window
+Exec=oma-browse --incognito

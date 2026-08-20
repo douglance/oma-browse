@@ -306,54 +306,22 @@ pub fn socket_for(dir: &Path, target: Target) -> Option<PathBuf> {
 
 /// Run an argv in a live window and bring back what it printed.
 pub async fn forward(dir: &Path, target: Target, request: &Request) -> Result<Reply, Failure> {
-    let Some(path) = socket_for(dir, target) else { return Err(Failure::NoWindow) };
-    let stream = match tokio::net::UnixStream::connect(&path).await {
-        Ok(stream) => stream,
-        // It was alive a moment ago and is not now: that is a window closing
-        // between the probe and the call, not a broken one.
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Err(Failure::NoWindow);
-        }
-        Err(e) => return Err(Failure::Transport(e.into())),
-    };
-    talk(stream, request).await
+    talk(connect(dir, target).await?, request).await
 }
 
 async fn talk(stream: tokio::net::UnixStream, request: &Request) -> Result<Reply, Failure> {
-    use http_body_util::BodyExt as _;
-
     let body = serde_json::to_vec(request).map_err(|e| Failure::Transport(e.into()))?;
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| Failure::Transport(e.into()))?;
-    // The connection future is what actually moves bytes; without driving it the
-    // request never leaves.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!(error = %e, "control connection ended");
-        }
-    });
-
-    let http = hyper::Request::builder()
+    let http = http::Request::builder()
         .method("POST")
         .uri(ROUTE)
-        // Required by HTTP/1.1 and meaningless here: there is no host.
-        .header("host", "oma-browse")
+        .header("host", HOST)
         .header("content-type", "application/json")
-        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+        .body(body)
         .map_err(|e| Failure::Transport(e.into()))?;
 
-    let response = sender.send_request(http).await.map_err(|e| Failure::Transport(e.into()))?;
+    let response = send(stream, http).await?;
     let status = response.status();
-    let bytes =
-        response.into_body().collect().await.map_err(|e| Failure::Transport(e.into()))?.to_bytes();
-
+    let bytes = response.into_body();
     if !status.is_success() {
         return Err(Failure::Protocol(format!(
             "{status}: {}",
@@ -371,6 +339,64 @@ async fn talk(stream: tokio::net::UnixStream, request: &Request) -> Result<Reply
     Ok(reply)
 }
 
+/// The Host every request to a window carries.
+///
+/// There is no host -- the address is a path on disk -- but HTTP/1.1 insists on
+/// the header, and the MCP service refuses names it does not know as
+/// DNS-rebinding protection. `localhost` is the one both are happy with.
+pub const HOST: &str = "localhost";
+
+/// Open a window's socket, ready to send it a request.
+pub async fn connect(dir: &Path, target: Target) -> Result<tokio::net::UnixStream, Failure> {
+    let Some(path) = socket_for(dir, target) else { return Err(Failure::NoWindow) };
+    match tokio::net::UnixStream::connect(&path).await {
+        Ok(stream) => Ok(stream),
+        // It was alive a moment ago and is not now: that is a window closing
+        // between the probe and the call, not a broken one.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(Failure::NoWindow)
+        }
+        Err(e) => Err(Failure::Transport(e.into())),
+    }
+}
+
+/// One HTTP request over an open socket, and the whole answer back.
+///
+/// Every conversation with a window goes through here -- the CLI's argv, the
+/// remote port's proxying, and the MCP relay -- so there is one place that knows
+/// how this browser speaks HTTP to itself.
+pub async fn send(
+    stream: tokio::net::UnixStream,
+    request: http::Request<Vec<u8>>,
+) -> Result<http::Response<Vec<u8>>, Failure> {
+    use http_body_util::BodyExt as _;
+
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| Failure::Transport(e.into()))?;
+    // The connection future is what actually moves bytes; without driving it the
+    // request never leaves.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!(error = %e, "control connection ended");
+        }
+    });
+
+    let (parts, body) = request.into_parts();
+    let request =
+        http::Request::from_parts(parts, http_body_util::Full::new(hyper::body::Bytes::from(body)));
+    let response = sender.send_request(request).await.map_err(|e| Failure::Transport(e.into()))?;
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.map_err(|e| Failure::Transport(e.into()))?.to_bytes();
+    Ok(http::Response::from_parts(parts, bytes.to_vec()))
+}
+
 /// Hand an HTTP request to another window and bring its answer back.
 ///
 /// What the remote port uses to answer `?window=<pid>`: one port can then reach
@@ -380,43 +406,12 @@ pub async fn proxy(
     pid: u32,
     request: http::Request<Vec<u8>>,
 ) -> Result<http::Response<Vec<u8>>, Failure> {
-    use http_body_util::BodyExt as _;
-
-    let path = socket_in(dir, pid);
-    let stream = match tokio::net::UnixStream::connect(&path).await {
-        Ok(stream) => stream,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Err(Failure::NoWindow);
-        }
-        Err(e) => return Err(Failure::Transport(e.into())),
-    };
-
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| Failure::Transport(e.into()))?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!(error = %e, "proxied connection ended");
-        }
-    });
-
+    let stream = connect(dir, Target::Window(pid)).await?;
     let (mut parts, body) = request.into_parts();
-    // The window on the other end has no name and does not care; HTTP/1.1 still
-    // insists on a Host.
-    parts.headers.insert("host", http::HeaderValue::from_static("oma-browse"));
-    let request =
-        http::Request::from_parts(parts, http_body_util::Full::new(hyper::body::Bytes::from(body)));
-
-    let response = sender.send_request(request).await.map_err(|e| Failure::Transport(e.into()))?;
-    let (parts, body) = response.into_parts();
-    let bytes = body.collect().await.map_err(|e| Failure::Transport(e.into()))?.to_bytes();
-    Ok(http::Response::from_parts(parts, bytes.to_vec()))
+    // Whatever the caller dialled, the window on the other end knows itself by
+    // one name.
+    parts.headers.insert("host", http::HeaderValue::from_static(HOST));
+    send(stream, http::Request::from_parts(parts, body)).await
 }
 
 // ---------------------------------------------------------------------------

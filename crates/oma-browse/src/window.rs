@@ -506,6 +506,10 @@ pub fn spawn(incognito: bool, url: Option<String>, quiet: bool) -> Result<u32> {
     if incognito {
         command.arg("--incognito");
     }
+    // `--new` on both paths: this is Ctrl-N, and a new window is the whole
+    // point. Without it the URL would be handed to the window we are standing
+    // in (see `main::join`).
+    command.arg("--new");
     match url {
         Some(url) => command.arg(url),
         None => command.arg("--palette"),

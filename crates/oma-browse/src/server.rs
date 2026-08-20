@@ -90,9 +90,12 @@ async fn remote_listener(
                 port,
                 "answering commands on a loopback port: every process on this machine can drive this browser"
             );
-            let router = routes
-                .route("/json/list", windows_route(dir.to_path_buf(), pid))
-                .layer(axum::middleware::from_fn(elsewhere));
+            let router = routes.route("/json/list", windows_route(dir.to_path_buf(), pid)).layer(
+                axum::middleware::from_fn({
+                    let dir = dir.to_path_buf();
+                    move |request, next| elsewhere(dir.clone(), request, next)
+                }),
+            );
             Some((listener, router))
         }
         Err(e) => {
@@ -129,6 +132,7 @@ fn windows_route(dir: PathBuf, mine: u32) -> axum::routing::MethodRouter {
 /// the others are reached over their sockets -- the same socket the CLI uses,
 /// rather than a second mechanism that could disagree with it.
 async fn elsewhere(
+    dir: PathBuf,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -141,7 +145,6 @@ async fn elsewhere(
         return next.run(request).await;
     }
 
-    let dir = crate::control::runtime_dir();
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes.to_vec(),

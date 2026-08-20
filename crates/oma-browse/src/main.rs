@@ -17,6 +17,7 @@ mod hints;
 mod history;
 mod keys;
 mod layout;
+mod mcp;
 mod server;
 mod session;
 mod shot;
@@ -39,7 +40,7 @@ use crate::state::AppState;
 /// rewrites its own `--private` to `--incognito` for non-Firefox, non-Edge
 /// browsers, so both of those have to land in GUI mode.
 enum Invocation {
-    Gui { url: Option<String>, incognito: bool, palette: bool },
+    Gui { url: Option<String>, incognito: bool, palette: bool, fresh: bool },
     Command,
 }
 
@@ -47,6 +48,7 @@ fn classify(args: &[String]) -> Invocation {
     let mut url = None;
     let mut incognito = false;
     let mut palette = false;
+    let mut fresh = false;
 
     for arg in args {
         match arg.as_str() {
@@ -55,13 +57,16 @@ fn classify(args: &[String]) -> Invocation {
             // send the new window to, so Ctrl-N comes up asking where to go
             // rather than sitting on the start page. See `window::spawn`.
             "--palette" => palette = true,
+            // Also ours: `window new` sets it so Ctrl-N opens a window rather
+            // than handing its URL to the window that is already up.
+            "--new" => fresh = true,
             a if looks_like_url(a) => url = Some(normalize_url(a)),
             // Anything else is a subcommand or a flag for one; hand the whole
             // argv to incurs and let it do the parsing and the error messages.
             _ => return Invocation::Command,
         }
     }
-    Invocation::Gui { url, incognito, palette }
+    Invocation::Gui { url, incognito, palette, fresh }
 }
 
 fn looks_like_url(s: &str) -> bool {
@@ -75,6 +80,10 @@ fn normalize_url(s: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // Logs on stderr, always. stdout is the answer -- a command's JSON, or a
+        // relayed MCP frame -- and a log line in the middle of it is a parse
+        // error for whatever is reading.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "oma_browse=info,oma_theme=info".into()),
@@ -84,7 +93,50 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match classify(&args) {
         Invocation::Command => command(args).await,
-        Invocation::Gui { url, incognito, palette } => gui(url, incognito, palette).await,
+        Invocation::Gui { url, incognito, palette, fresh } => {
+            // A URL from a launcher, a link handler or `xdg-open` belongs in the
+            // browser you already have -- opening a second whole browser for a
+            // clicked link is not what any other browser does. `--new` and
+            // `--incognito` say otherwise, and are obeyed.
+            if let Some(url) = url.as_deref()
+                && !fresh
+                && !incognito
+                && join(url).await
+            {
+                return Ok(());
+            }
+            gui(url, incognito, palette).await
+        }
+    }
+}
+
+/// Hand a URL to the window that is already open. `false` if there is none.
+async fn join(url: &str) -> bool {
+    let config = config::Config::load();
+    let dir = control::dir_for(&config.control);
+    let argv = vec!["tab".to_string(), "open".to_string(), url.to_string()];
+    let request = control::Request::from_process(argv);
+    match control::forward(&dir, control::Target::Current, &request).await {
+        Ok(reply) if reply.exit_code.unwrap_or(0) == 0 => {
+            tracing::info!(url, "opened in the window that was already up");
+            true
+        }
+        // The window took the question and did not like it -- a URL it cannot
+        // parse, say. Opening a second browser would not make that URL any
+        // better, so pass the complaint on and stop here.
+        Ok(reply) => {
+            tracing::warn!(url, answer = %reply.stdout.trim(), "the browser would not open that");
+            true
+        }
+        Err(control::Failure::NoWindow) => false,
+        // A window is there but would not take it. Being the browser ourselves
+        // is a worse answer than saying what went wrong and letting the user
+        // try again -- but a link that goes nowhere is worse than both, so open
+        // a window and carry on.
+        Err(e) => {
+            tracing::warn!(error = %e, "could not hand the URL over; opening a window instead");
+            false
+        }
     }
 }
 
@@ -102,6 +154,12 @@ async fn command(argv: Vec<String>) -> Result<()> {
     // part of every invocation.
     let config = config::Config::load();
     let dir = control::dir_for(&config.control);
+
+    // MCP is a protocol, not a command: it gets its own path to the window
+    // rather than one argv at a time.
+    if argv.iter().any(|a| a == "--mcp") && mcp::relay(&dir, target).await? {
+        return Ok(());
+    }
 
     if !control::runs_locally(&argv) {
         let request = control::Request::from_process(argv.clone());
@@ -314,6 +372,25 @@ mod tests {
                 }
                 _ => panic!("{flag} must open the GUI"),
             }
+        }
+    }
+
+    #[test]
+    fn a_new_window_flag_is_gui_and_refuses_to_join() {
+        // `window new` passes this. Without it, Ctrl-N with a URL would hand the
+        // URL to the window it was pressed in and open nothing.
+        match classify(&args(&["--new", "https://example.com"])) {
+            Invocation::Gui { fresh, url, .. } => {
+                assert!(fresh);
+                assert_eq!(url.as_deref(), Some("https://example.com"));
+            }
+            _ => panic!("--new must open the GUI"),
+        }
+        // And a URL on its own does not set it, which is what lets a launcher's
+        // link land in the window you already have.
+        match classify(&args(&["https://example.com"])) {
+            Invocation::Gui { fresh, .. } => assert!(!fresh),
+            _ => panic!("a bare URL must open the GUI"),
         }
     }
 
