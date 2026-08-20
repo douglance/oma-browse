@@ -49,6 +49,12 @@ impl Rgb {
 
     /// The same crude luminance sum Omarchy uses to auto-detect light themes
     /// when no `mode` key is present (`r + g + b > 382` means light).
+    /// Relative luminance, 0..1. Used to decide how much veil a wallpaper needs.
+    pub fn luminance(self) -> f64 {
+        (0.2126 * f64::from(self.r) + 0.7152 * f64::from(self.g) + 0.0722 * f64::from(self.b))
+            / 255.0
+    }
+
     pub fn channel_sum(self) -> u16 {
         u16::from(self.r) + u16::from(self.g) + u16::from(self.b)
     }

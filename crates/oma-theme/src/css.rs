@@ -75,9 +75,32 @@ impl ThemeCss {
         // running it through a format string means doubling every one of them,
         // which is both unreadable and a standing invitation to a compile error
         // three edits from now.
-        PAGE_SCRIPT
-            .replace("__OMA_CSS__", &js_string(&self.page_css()))
-            .replace("__OMA_RECOLOR__", if recolor { "true" } else { "false" })
+        PAGE_SCRIPT.replace("__OMA_CONFIG__", &self.page_config(recolor))
+    }
+
+    /// The values the page runtime needs in order to map the site's own colours
+    /// onto our ramp. It maps them per *stylesheet rule*, so it needs the target
+    /// colours rather than a pre-baked set of attribute selectors.
+    ///
+    /// Hand-rolled JSON: this crate has no `serde_json` at runtime, and the
+    /// shape is four strings and a bool.
+    fn page_config(&self, recolor: bool) -> String {
+        let s = &self.semantic;
+        // The two ends of the ramp go over as raw channels, not CSS strings: the
+        // runtime interpolates between them per colour rather than picking from
+        // a handful of pre-baked surfaces, so it needs to do arithmetic on them.
+        format!(
+            "{{\"css\":{css},\"recolor\":{recolor},\"tint\":[{tr},{tg},{tb}],\
+             \"fgRgb\":[{fr},{fg},{fb}],\"opacity\":{opacity}}}",
+            css = js_string(&self.page_css()),
+            tr = self.tint.r,
+            tg = self.tint.g,
+            tb = self.tint.b,
+            fr = s.foreground.r,
+            fg = s.foreground.g,
+            fb = s.foreground.b,
+            opacity = self.opacity,
+        )
     }
 
     fn page_css(&self) -> String {
@@ -97,36 +120,21 @@ impl ThemeCss {
              ::-webkit-scrollbar-thumb {{ background: {muted}; border: 2px solid {surface}; }}\n\
              ::-webkit-scrollbar-thumb:hover {{ background: {fg}; }}\n\
              ::-webkit-scrollbar-corner {{ background: {surface}; }}\n\
-             html {{ background-color: {canvas_a} !important; }}\n\
+             #__oma_browse_veil {{ position: fixed !important; inset: 0 !important;                z-index: -2147483645 !important; pointer-events: none !important;                background-color: {canvas_a} !important; }}\n\
              body {{ background-color: transparent !important; }}\n\
-             [data-oma-surface=\"canvas\"] {{ background-color: transparent !important; }}\n\
-             [data-oma-surface=\"surface\"] {{ background-color: {surface_a} !important; }}\n\
-             [data-oma-surface=\"raised\"] {{ background-color: {raised_a} !important; }}\n\
-             {float_rule}\n\
-             [data-oma-fg=\"normal\"] {{ color: {fg} !important; }}\n\
-             [data-oma-fg=\"muted\"] {{ color: {muted} !important; }}\n\
-             [data-oma-semantic=\"error\"] {{ color: {error} !important; }}\n\
-             [data-oma-semantic=\"warning\"] {{ color: {warning} !important; }}\n\
-             [data-oma-semantic=\"success\"] {{ color: {success} !important; }}",
+             {float_rule}",
             mode = self.mode.as_str(),
             vars = s.to_css_vars("oma-page"),
             surface = s.surface.to_hex(),
             raised = s.raised.to_hex(),
-            // WebKitGTK's transparent mode zeroes the webview's own background
-            // alpha, so the tint cannot come from `set_background_color` — it has
-            // to be painted here. Exactly one element carries it, or nested
-            // layouts would stack it into mud.
+            // The veil. It cannot come from `set_background_color` (WebKit
+            // zeroes the webview's alpha in transparent mode) and it cannot come
+            // from `html` either — WebKit skips the root background entirely
+            // when the view is transparent. So a real element carries it, and
+            // exactly one, or nested layouts would stack it into mud.
             canvas_a = self.tint.to_css(self.opacity),
-            // Raised surfaces stay a touch more solid than the canvas, so cards
-            // and inputs read as sitting *on* the translucent background.
-            surface_a = self.tint.mix(s.foreground, 0.06).to_css((self.opacity + 0.14).min(1.0)),
-            raised_a = self.tint.mix(s.foreground, 0.12).to_css((self.opacity + 0.28).min(1.0)),
-            // Floating surfaces sit above content rather than beside it, so they
-            // carry more alpha than a raised one — enough that text underneath
-            // reads as texture rather than as words — and blur what they cover.
-            // The desktop still shows through, because blurring a translucent
-            // backdrop leaves it translucent; Hyprland's own blur takes it from
-            // there, so the two compose instead of fighting.
+            // The surface/raised fills now live in the runtime config instead:
+            // the page maps them per stylesheet rule, not per element.
             float_rule = self.float_rule(),
             fg = s.foreground.to_hex(),
             muted = s.muted_foreground.to_hex(),
@@ -135,9 +143,6 @@ impl ThemeCss {
             focus = s.focus.to_hex(),
             selection = s.selection.to_hex(),
             sel_fg = s.selection_foreground().to_hex(),
-            error = s.error.to_hex(),
-            warning = s.warning.to_hex(),
-            success = s.success.to_hex(),
         )
     }
 
@@ -411,289 +416,9 @@ fn js_string(s: &str) -> String {
     out
 }
 
-/// The page-side runtime. Injected as a WebKitGTK user script, so it runs at
-/// document-start on every navigation, and re-running it updates the same style
-/// element rather than stacking new ones.
-const PAGE_SCRIPT: &str = r#"(function () {
-  var ID = "__oma_browse_theme";
-  var CSS = __OMA_CSS__;
-  var RECOLOR = __OMA_RECOLOR__;
+/// The page-side runtime. See `page.js` for what it does and why.
+///
+/// Injected as a WebKitGTK user script, so it runs at document-start on every
+/// navigation, and re-running it tears the previous instance down first.
+const PAGE_SCRIPT: &str = include_str!("page.js");
 
-  function ensureStyle() {
-    var style = document.getElementById(ID);
-    if (!style) {
-      style = document.createElement("style");
-      style.id = ID;
-      (document.head || document.documentElement).appendChild(style);
-    }
-    if (style.textContent !== CSS) style.textContent = CSS;
-    promote(style);
-    return style;
-  }
-
-  // Keep our sheet last in the document.
-  //
-  // At document-start there is no `<head>` yet, so the element lands directly on
-  // `<html>`, ahead of everything the parser is about to insert. `!important`
-  // beats a site's ordinary rules from anywhere, but an `!important` of the
-  // site's own wins on document order -- and single-page apps go on appending
-  // stylesheets long after load. That is the whole of the "themed on one visit,
-  // untouched on the next" behaviour: nothing raced, our rules were simply
-  // outranked by whatever happened to be inserted after them.
-  function promote(style) {
-    style = style || document.getElementById(ID);
-    var head = document.head;
-    if (style && head && head.lastElementChild !== style) head.appendChild(style);
-  }
-
-  function channels(value) {
-    if (!value) return null;
-    var m = String(value).match(/rgba?\(([^)]+)\)/i);
-    if (!m) return null;
-    var p = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
-    if (p.length < 3) return null;
-    for (var i = 0; i < 3; i++) if (!isFinite(p[i])) return null;
-    if (p.length < 4 || !isFinite(p[3])) p[3] = 1;
-    return p;
-  }
-
-  function lightness(value) {
-    var p = channels(value);
-    if (!p || p[3] < 0.03) return null;
-    return (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) / 255;
-  }
-
-  // Only repaint surfaces the site left grey. A channel spread this small means
-  // the colour carries no brand intent, so replacing it is safe; anything more
-  // saturated is the site's own identity and must survive theming.
-  function isNeutral(value) {
-    var p = channels(value);
-    if (!p || p[3] < 0.03) return false;
-    return Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]) <= 34;
-  }
-
-  // The page's *own* base lightness, judged against nothing of ours.
-  //
-  // Every surface is classified by how far it sits from this value, so reading
-  // it after our stylesheet has landed measures the veil we just painted and
-  // reports that a plain white page is as far from its own background as it is
-  // possible to be -- which is exactly how an all-white site ends up opaque
-  // instead of transparent. Disable our sheet for the length of the read, and
-  // cache the answer for the life of the document.
-  function baseLightness() {
-    if (typeof window.__omaBase === "number") return window.__omaBase;
-    var style = document.getElementById(ID);
-    var was = style ? style.disabled : false;
-    if (style) style.disabled = true;
-    var l = null;
-    try {
-      if (document.body) l = lightness(getComputedStyle(document.body).backgroundColor);
-      if (l === null && document.documentElement) {
-        l = lightness(getComputedStyle(document.documentElement).backgroundColor);
-      }
-    } catch (e) {}
-    if (style) style.disabled = was;
-    // A site that paints no background at all leaves the browser canvas showing,
-    // which is white on the overwhelming majority of the web.
-    if (l === null) return 1;
-    window.__omaBase = l;
-    return l;
-  }
-
-  var BASE = 1;
-
-  // Give the blur something to blur.
-  //
-  // `backdrop-filter` samples an opaque backdrop and nothing else -- verified in
-  // this engine and in stock MiniBrowser, at backdrop alpha 0, 0.5 and 1.0. On a
-  // transparent page there is nothing behind a sticky header but glyphs floating
-  // on air, so the filter spreads their brightness outward and the result reads
-  // as bloom rather than blur.
-  //
-  // The fix is an opaque patch the exact size of the float, laid *under* the
-  // page content on a negative z-index. Negative-z children paint before in-flow
-  // block backgrounds, so content still draws on top of it and the float's
-  // backdrop becomes opaque-plus-text: blurrable. That rectangle was already
-  // hidden behind the float, so no transparency is lost; the rest of the page is
-  // untouched.
-  var backerSeq = 0;
-
-  function syncBackers() {
-    if (!document.body) return;
-    var floats = document.querySelectorAll("[data-oma-layer=\"float\"]");
-    var live = {};
-    for (var i = 0; i < floats.length; i++) {
-      var el = floats[i];
-      var id = el.getAttribute("data-oma-float");
-      if (!id) {
-        id = String(++backerSeq);
-        el.setAttribute("data-oma-float", id);
-      }
-      live[id] = 1;
-      var r = el.getBoundingClientRect();
-      var b = document.querySelector("[data-oma-backer=\"" + id + "\"]");
-      if (r.width < 2 || r.height < 2) {
-        if (b) b.style.display = "none";
-        continue;
-      }
-      if (!b) {
-        b = document.createElement("div");
-        b.className = "__oma_browse_backer";
-        b.setAttribute("data-oma-backer", id);
-        b.setAttribute("data-oma-seen", "");
-        b.setAttribute("aria-hidden", "true");
-        document.body.appendChild(b);
-      }
-      b.style.display = "block";
-      b.style.left = r.left + "px";
-      b.style.top = r.top + "px";
-      b.style.width = r.width + "px";
-      b.style.height = r.height + "px";
-    }
-    var known = document.querySelectorAll("[data-oma-backer]");
-    for (var j = 0; j < known.length; j++) {
-      if (!live[known[j].getAttribute("data-oma-backer")]) {
-        known[j].parentNode.removeChild(known[j]);
-      }
-    }
-  }
-
-  var backerPending = false;
-  function queueBackers() {
-    if (backerPending) return;
-    backerPending = true;
-    requestAnimationFrame(function () {
-      backerPending = false;
-      syncBackers();
-    });
-  }
-
-  // Does this element paint over its siblings rather than beside them?
-  //
-  // A surface we make transparent stops occluding whatever scrolls beneath it,
-  // and for an ordinary block that is the entire point. For a sticky header it
-  // is a bug you can read straight off the screen: the headlines slide up
-  // *through* the site's own navigation and the two render on top of each
-  // other. Those surfaces have to keep hiding what is behind them.
-  //
-  // True overlap testing would mean hit-testing every painted rect on every
-  // scroll, which is both expensive and stale the moment it finishes. Being out
-  // of the normal flow is a cheap, static stand-in, and it is very nearly the
-  // same question: a box the flow does not reserve room for is a box that lands
-  // on top of something.
-  //
-  // `relative` is deliberately not on the list even when it carries a z-index.
-  // It stays in flow, so it displaces its siblings rather than covering them --
-  // and sites lean on it heavily for plain layout. Google News wraps its entire
-  // 4938px article column in one, so treating it as an overlay turns the whole
-  // page into a single opaque slab.
-  function floats(el, cs) {
-    var p = cs.position;
-    if (p === "fixed" || p === "sticky" || p === "-webkit-sticky") return true;
-    if (p !== "absolute") return false;
-    // An absolute box as tall as the document is a layout wrapper wearing an
-    // overlay's positioning. Overlays are viewport-sized at most.
-    var r;
-    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
-    return r.height > 0 && r.height <= window.innerHeight * 1.2;
-  }
-
-  function classify(el) {
-    if (el.nodeType !== 1 || el.id === ID) return;
-    var cs;
-    try { cs = getComputedStyle(el); } catch (e) { return; }
-    el.setAttribute("data-oma-seen", "");
-
-    if (isNeutral(cs.backgroundColor)) {
-      // Map the site's depth ordering onto our ramp instead of flattening every
-      // neutral surface to one colour.
-      var d = Math.abs((lightness(cs.backgroundColor) || 0) - BASE);
-      el.setAttribute("data-oma-surface", d < 0.1 ? "canvas" : d < 0.3 ? "surface" : "raised");
-      // Only neutral surfaces need this. One in the site's own brand colour is
-      // still opaque after theming, so nothing bleeds through it anyway.
-      if (floats(el, cs)) el.setAttribute("data-oma-layer", "float");
-    }
-    if (isNeutral(cs.color)) {
-      // Dim greys stay dim: keep the site's own hierarchy of emphasis.
-      var lc = lightness(cs.color);
-      var muted = lc !== null && Math.abs(lc - BASE) < 0.45;
-      el.setAttribute("data-oma-fg", muted ? "muted" : "normal");
-    }
-  }
-
-  // Walk the whole document, but in slices.
-  //
-  // A single pass is both slow and, if it is capped, wrong: Wikipedia runs to
-  // ~10k elements, and stopping early leaves everything past the cap painted in
-  // the site's own colours -- visible as a white block halfway down the page.
-  // Tagging is idempotent and marked, so each slice only looks at elements it
-  // has not seen, and the work spreads across frames instead of blocking paint.
-  var SLICE = 1500;
-  var queue = [];
-  var draining = false;
-
-  function drain() {
-    var budget = SLICE;
-    while (queue.length && budget-- > 0) classify(queue.pop());
-    if (queue.length) {
-      requestAnimationFrame(drain);
-    } else {
-      draining = false;
-      // Floats are only known once the slice that classified them has run.
-      queueBackers();
-    }
-  }
-
-  function scan(root) {
-    if (!root || !root.querySelectorAll) return;
-    BASE = baseLightness();
-    if (root.nodeType === 1 && !root.hasAttribute("data-oma-seen")) queue.push(root);
-    var fresh = root.querySelectorAll("*:not([data-oma-seen])");
-    for (var i = 0; i < fresh.length; i++) queue.push(fresh[i]);
-    if (!draining && queue.length) {
-      draining = true;
-      requestAnimationFrame(drain);
-    }
-  }
-
-  function apply() {
-    if (!document.documentElement) return;
-    // Measured before the sheet exists on the first pass, cached thereafter.
-    BASE = baseLightness();
-    ensureStyle();
-    if (RECOLOR) {
-      scan(document.body || document.documentElement);
-      queueBackers();
-    }
-  }
-
-  apply();
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", apply, { once: true });
-  }
-  window.addEventListener("load", apply, { once: true });
-
-  if (RECOLOR && !window.__omaBackerBound) {
-    window.__omaBackerBound = true;
-    // Capture phase, so scrolling inside a nested scroller moves the patches
-    // too -- a sticky header inside one is exactly the case that needs them.
-    window.addEventListener("scroll", queueBackers, true);
-    window.addEventListener("resize", queueBackers);
-  }
-
-  if (RECOLOR && window.MutationObserver && !window.__omaObserving) {
-    window.__omaObserving = true;
-    var pending = false;
-    new MutationObserver(function () {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(function () {
-        pending = false;
-        // Re-appending is itself a mutation, so this settles after one extra
-        // pass rather than looping: the second time round it is already last.
-        promote();
-        scan(document.body || document.documentElement);
-      });
-    }).observe(document.documentElement, { childList: true, subtree: true });
-  }
-})();"#;

@@ -1,10 +1,16 @@
 //! oma-browse — an Omarchy-themed, agent-drivable browser.
 
+mod bookmarks;
 mod commands;
+mod dispatch;
+mod favicon;
+mod fuzzy;
+mod history;
 mod layout;
 mod server;
 mod shot;
 mod state;
+mod strip;
 mod tabs;
 mod ui;
 mod window;
@@ -62,6 +68,12 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new());
     let cli = commands::command_graph(state.clone());
 
+    // The registry every non-CLI surface dispatches through. `try_` rather than
+    // `tool_catalog()`, which panics when two commands expose the same name:
+    // that turns a latent panic reachable from any invocation into a startup
+    // error, which is the right shape for a mistake in the graph.
+    let catalog = cli.try_tool_catalog().map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match classify(&args) {
         // A subcommand: dispatch through incurs and exit. `serve` reads argv
@@ -72,7 +84,7 @@ async fn main() -> Result<()> {
         }
 
         Invocation::Gui { url, incognito } => {
-            let server = server::build(&cli, state.clone()).await?;
+            let server = server::build(&cli, catalog.clone(), state.clone()).await?;
             let addr = server.addr;
             tracing::info!(%addr, ?url, incognito, "oma-browse control plane up");
 
@@ -109,9 +121,9 @@ async fn main() -> Result<()> {
             // Omarchy emits no D-Bus signal and no broadcast on a theme change:
             // it swaps the directory, rewrites `theme.name`, and runs its hooks.
             // Watching the *parent* directory catches it without asking the user
-            // to install anything. (`oma-browse theme install-hook` wires up the
-            // faster, official path, but is deliberately opt-in — it writes into
-            // their Omarchy config.)
+            // to install anything. Omarchy's own `theme-set` hook can call
+            // `oma-browse theme reload` for a faster path, but that is the
+            // user's to install: it writes into their Omarchy config.
             spawn_theme_watcher(state.clone());
 
             window::run(window::Launch {
@@ -123,6 +135,7 @@ async fn main() -> Result<()> {
                 opacity,
                 page_script,
                 first_tab,
+                catalog,
             })
         }
     }

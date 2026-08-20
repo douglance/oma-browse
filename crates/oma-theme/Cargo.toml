@@ -14,6 +14,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 notify = "8"
+# Only to measure the wallpaper's brightness, so the veil can open as far as the
+# desktop behind it allows. Default features off: we decode, we do not encode.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

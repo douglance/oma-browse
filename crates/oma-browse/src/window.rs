@@ -18,6 +18,13 @@ use crate::state::AppState;
 /// The palette webview's label. Reserved: it is never a tab.
 pub const PALETTE_LABEL: &str = "palette";
 
+/// How long to wait before redrawing the strip after something changes.
+///
+/// One page load fires a URL change, a title change and a favicon, in that
+/// order and milliseconds apart. Redrawing on each is three reloads of the same
+/// row, and the middle one shows a title with no icon.
+const STRIP_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(80);
+
 pub struct Launch {
     pub state: Arc<AppState>,
     pub base: url::Url,
@@ -33,6 +40,9 @@ pub struct Launch {
     /// Label for the first tab, allocated before Tauri takes the thread — for
     /// the same reason.
     pub first_tab: String,
+    /// The command registry, so keyboard shortcuts dispatch through the same
+    /// graph the CLI and MCP do rather than reimplementing it.
+    pub catalog: incurs::tool::ToolCatalog,
 }
 
 pub fn run(launch: Launch) -> Result<()> {
@@ -45,15 +55,22 @@ pub fn run(launch: Launch) -> Result<()> {
         opacity,
         page_script,
         first_tab,
+        catalog,
     } = launch;
 
     // The veil is painted once, in CSS. Every native surface underneath it is
     // fully transparent, so the two never compound -- see
     // `AppState::background_color`.
+    state.set_incognito(incognito);
+
     let translucent = opacity.clamp(0.0, 1.0) < 1.0;
     let alpha = if translucent { 0 } else { 255 };
     let bg = tauri::window::Color(background.r, background.g, background.b, alpha);
+    // The strip is transparent whatever the theme is doing: it floats over the
+    // page now, and an opaque one would be the bar this deliberately is not.
+    let strip_bg = tauri::window::Color(background.r, background.g, background.b, 0);
     let palette_url = base.join("palette")?;
+    let strip_url = base.join("strip")?;
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -104,8 +121,30 @@ pub fn run(launch: Launch) -> Result<()> {
                 )
                 .context("could not create the first tab")?;
 
+            // Favicons are per webview, and this is the first one.
+            if let Err(e) = crate::favicon::watch(&content, state.clone()) {
+                tracing::warn!(error = %e, "not watching the first tab's favicon");
+            }
+
             crate::layout::install(&palette)?;
-            crate::layout::install_keys(&palette, state.clone())?;
+            crate::layout::install_keys(&palette, catalog.clone(), state.runtime())?;
+
+            // After the surgery, not before: `install` sweeps everything in the
+            // window box except the palette into the content stack, and a strip
+            // created earlier would be swept in with it and become a tab-shaped
+            // hole in the page. It also needs the overlay to exist, since that
+            // is what it floats in.
+            let strip = window
+                .add_child(
+                    WebviewBuilder::new(crate::strip::LABEL, WebviewUrl::External(strip_url.clone()))
+                        .transparent(true)
+                        .background_color(strip_bg),
+                    LogicalPosition::new(0.0, 0.0),
+                    LogicalSize::new(1400.0, f64::from(crate::layout::STRIP_HEIGHT)),
+                )
+                .context("could not create the tab strip webview")?;
+            crate::layout::adopt_strip(&strip)?;
+            spawn_strip_refresh(state.clone());
 
             // Nothing holds keyboard focus after the surgery, so page-level key
             // handlers — which is where every shortcut lives — would never fire.
@@ -136,7 +175,15 @@ pub fn instrument(
             let state = title_state.clone();
             let label = webview.label().to_string();
             state.runtime().spawn(async move {
-                state.tabs.write().await.update_title(&label, title);
+                let url = state.tabs.read().await.url_for(&label);
+                state.tabs.write().await.update_title(&label, title.clone());
+                if !state.incognito()
+                    && let Some(url) = url
+                {
+                    let mut history = state.history.write().await;
+                    history.set_title(&url, &title);
+                    history.flush();
+                }
                 state.notify_tabs();
             });
         })
@@ -145,7 +192,12 @@ pub fn instrument(
             let label = webview.label().to_string();
             let url = payload.url().to_string();
             state.runtime().spawn(async move {
-                state.tabs.write().await.update_url(&label, url);
+                state.tabs.write().await.update_url(&label, url.clone());
+                if !state.incognito() {
+                    let mut history = state.history.write().await;
+                    history.record(&url, crate::history::now());
+                    history.flush();
+                }
                 state.notify_tabs();
             });
         })
@@ -165,16 +217,20 @@ pub fn instrument(
 pub async fn restyle(state: &Arc<AppState>) -> Result<()> {
     let app = state.app_handle().context("the window is not up yet")?;
 
-    let (script, dark, color) = {
+    let (script, dark, color, strip_color) = {
         let theme = state.theme.read().await;
         let bg = theme.css.tint;
         // Fully transparent while the theme is translucent -- see
         // `AppState::background_color`; the veil belongs to the CSS alone.
         let alpha = if theme.css.opacity < 1.0 { 0 } else { 255 };
         (
-            theme.css.page_script(state.recolor()),
+            // The strip's inset goes back in with it: this is the same
+            // injection `AppState::page_script` composes for a fresh tab, and a
+            // restyled page has to end up in the same state as a new one.
+            format!("{}\n{}", theme.css.page_script(state.recolor()), crate::strip::inset_script()),
             theme.mode.is_dark(),
             tauri::window::Color(bg.r, bg.g, bg.b, alpha),
+            tauri::window::Color(bg.r, bg.g, bg.b, 0),
         )
     };
 
@@ -201,11 +257,74 @@ pub async fn restyle(state: &Arc<AppState>) -> Result<()> {
         });
     }
 
+    // The strip is our own page as well, so like the palette it only needs the
+    // new stylesheet, which a reload fetches.
+    if let Some(strip) = app.get_webview(crate::strip::LABEL) {
+        // Transparent in every theme -- see `run`.
+        let _ = strip.set_background_color(Some(strip_color));
+        let _ = strip.reload();
+    }
+
     if let Some(window) = app.get_window("main") {
         let _ = window.set_background_color(Some(color));
     }
 
     Ok(())
+}
+
+/// Redraw the strip whenever the tab model changes.
+///
+/// The first subscriber to [`crate::state::UiEvent`]. A reload rather than a
+/// diff: the strip is a local page of a dozen elements, so re-rendering it
+/// server-side costs less than a mechanism for telling it what changed would.
+fn spawn_strip_refresh(state: Arc<AppState>) {
+    let runtime = state.runtime();
+    runtime.spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut events = state.subscribe();
+        loop {
+            match events.recv().await {
+                Ok(_) => {}
+                // Lagging means more changed than we heard about, which is the
+                // same instruction as any single event: redraw.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+
+            tokio::time::sleep(STRIP_DEBOUNCE).await;
+            while events.try_recv().is_ok() {}
+
+            if let Some(strip) =
+                state.app_handle().and_then(|app| app.get_webview(crate::strip::LABEL))
+            {
+                let _ = strip.reload();
+            }
+        }
+    });
+}
+
+/// Take the window fullscreen, or bring it back. Returns the new state.
+///
+/// Tauri's own call rather than `gtk::Window::fullscreen`, so this is the
+/// Wayland fullscreen state the compositor understands — under Hyprland that is
+/// a real fullscreen, not a window resized to fill its tile.
+pub fn set_fullscreen(state: &Arc<AppState>, want: Option<bool>) -> Result<bool> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let window = app.get_window("main").context("the main window has gone away")?;
+    let now = window.is_fullscreen().unwrap_or(false);
+    let want = want.unwrap_or(!now);
+    if want != now {
+        window.set_fullscreen(want).context("could not change the fullscreen state")?;
+    }
+    Ok(want)
+}
+
+/// Close the window, and with it the browser.
+pub fn close(state: &Arc<AppState>) -> Result<()> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let window = app.get_window("main").context("the main window has gone away")?;
+    window.close().context("could not close the window")
 }
 
 /// Show or hide the palette, and hand it focus when it appears.

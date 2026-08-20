@@ -48,6 +48,10 @@ pub enum UiEvent {
 pub struct AppState {
     pub theme: RwLock<ThemeState>,
     pub tabs: RwLock<Tabs>,
+    /// Where the browser has been. Empty and never written in an incognito
+    /// window -- see [`AppState::set_incognito`].
+    pub history: RwLock<crate::history::History>,
+    pub bookmarks: RwLock<crate::bookmarks::Bookmarks>,
     /// Set once, after Tauri's `setup` runs. Everything that touches a webview
     /// goes through here, so commands work identically from the GUI, the CLI
     /// and MCP.
@@ -59,6 +63,14 @@ pub struct AppState {
     /// Whether the palette is currently up. Plain atomic rather than an async
     /// lock: it is read from key handlers on the GTK thread.
     palette: std::sync::atomic::AtomicBool,
+    /// A command the palette should open already asking for its argument.
+    ///
+    /// Ctrl-F is "find", which is a command that needs text, so the chord opens
+    /// the palette *staged* into that command rather than dropping the user in
+    /// a list to search for it. Taken and cleared when the palette renders.
+    stage: std::sync::Mutex<Option<String>>,
+    /// Whether this window forgets where it has been.
+    incognito: std::sync::atomic::AtomicBool,
     /// Whether to repaint neutral page surfaces.
     ///
     /// On by default. A browser that themes its own chrome but leaves every page
@@ -77,6 +89,10 @@ impl AppState {
         Self {
             theme: RwLock::new(ThemeState::load()),
             tabs: RwLock::new(Tabs::default()),
+            history: RwLock::new(crate::history::History::load()),
+            bookmarks: RwLock::new(crate::bookmarks::Bookmarks::load()),
+            incognito: std::sync::atomic::AtomicBool::new(false),
+            stage: std::sync::Mutex::new(None),
             app: OnceLock::new(),
             rt: tokio::runtime::Handle::current(),
             palette: std::sync::atomic::AtomicBool::new(false),
@@ -84,6 +100,20 @@ impl AppState {
             base: OnceLock::new(),
             events,
         }
+    }
+
+    /// An app state whose history and bookmarks are detached from disk.
+    ///
+    /// `new` loads both stores from the user's real state directory, which makes
+    /// any test that asserts on their contents depend on the developer's own
+    /// browsing. The palette tests count rows; one stray bookmark was enough to
+    /// fail them.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        let mut state = Self::new();
+        *state.history.get_mut() = crate::history::History::default();
+        *state.bookmarks.get_mut() = crate::bookmarks::Bookmarks::default();
+        state
     }
 
     /// Called once from Tauri's `setup`.
@@ -102,7 +132,33 @@ impl AppState {
     /// focus — and it would never work on a page that blocks scripts. They are
     /// bound on the GTK toplevel instead; see [`crate::layout::install_keys`].
     pub async fn page_script(&self) -> String {
-        self.theme.read().await.css.page_script(self.recolor())
+        let theme = self.theme.read().await.css.page_script(self.recolor());
+        // The strip's inset rides along with the theme's injection rather than
+        // being a second `initialization_script`: both have to be re-applied on
+        // every navigation, and there is only one hook for that.
+        format!("{theme}\n{}", crate::strip::inset_script())
+    }
+
+    /// Ask the palette to open staged into a command.
+    pub fn set_stage(&self, tool: Option<String>) {
+        if let Ok(mut slot) = self.stage.lock() {
+            *slot = tool;
+        }
+    }
+
+    /// Read and clear the staged command; the next summon starts clean.
+    pub fn take_stage(&self) -> Option<String> {
+        self.stage.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    pub fn incognito(&self) -> bool {
+        self.incognito.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set once, from the launch flags. Checked before anything is written to
+    /// history, so an incognito window leaves no trace on disk.
+    pub fn set_incognito(&self, on: bool) {
+        self.incognito.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn recolor(&self) -> bool {

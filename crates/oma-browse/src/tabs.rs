@@ -23,13 +23,26 @@ pub struct Tab {
     pub url: String,
     pub title: String,
     pub active: bool,
+    /// The site's favicon as a `data:` URL, or empty until one arrives.
+    ///
+    /// Skipped everywhere the tab is serialised: the strip renders it inline,
+    /// but a few hundred bytes of base64 per tab is noise in `tab list` output
+    /// and worse in an MCP reply, where it would be spent tokens.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub icon: String,
 }
+
+/// How many closed tabs are worth remembering.
+const CLOSED_STACK: usize = 32;
 
 #[derive(Debug, Default)]
 pub struct Tabs {
     entries: Vec<TabEntry>,
     active: Option<u32>,
     next_id: u32,
+    /// URLs of recently closed tabs, most recent last.
+    closed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +51,9 @@ struct TabEntry {
     label: String,
     url: String,
     title: String,
+    /// See [`Tab::icon`]. Kept per tab rather than per origin: WebKit already
+    /// has the origin-keyed cache, and this is only what to paint right now.
+    icon: String,
 }
 
 impl Tabs {
@@ -45,7 +61,13 @@ impl Tabs {
         let id = self.next_id;
         self.next_id += 1;
         let label = format!("tab-{id}");
-        self.entries.push(TabEntry { id, label: label.clone(), url, title: String::new() });
+        self.entries.push(TabEntry {
+            id,
+            label: label.clone(),
+            url,
+            title: String::new(),
+            icon: String::new(),
+        });
         (id, label)
     }
 
@@ -72,6 +94,18 @@ impl Tabs {
         let index = self.entries.iter().position(|t| t.id == id)?;
         let removed = self.entries.remove(index);
 
+        // Remember where it was pointing, so Ctrl-Shift-T can bring it back.
+        // Only the URL: a webview cannot be resurrected, and reloading the page
+        // is what every other browser does here too.
+        if !removed.url.is_empty() && removed.url != "about:blank" {
+            self.closed.push(removed.url.clone());
+            // A bounded stack. Nobody reopens the fortieth tab back, and this
+            // is the only thing in the model that would otherwise grow forever.
+            if self.closed.len() > CLOSED_STACK {
+                self.closed.remove(0);
+            }
+        }
+
         if self.active == Some(id) {
             // Prefer the tab that slid into this slot, else the one before it —
             // the behaviour every other browser has trained people to expect.
@@ -84,6 +118,17 @@ impl Tabs {
         Some(removed.label)
     }
 
+    /// The most recently closed tab's URL, taken off the stack.
+    pub fn take_closed(&mut self) -> Option<String> {
+        self.closed.pop()
+    }
+
+    /// The URL a webview is currently showing, for attaching a title to the
+    /// history entry the page load created.
+    pub fn url_for(&self, label: &str) -> Option<String> {
+        self.entries.iter().find(|t| t.label == label).map(|t| t.url.clone())
+    }
+
     pub fn update_title(&mut self, label: &str, title: String) {
         if let Some(t) = self.entries.iter_mut().find(|t| t.label == label) {
             t.title = title;
@@ -92,7 +137,28 @@ impl Tabs {
 
     pub fn update_url(&mut self, label: &str, url: String) {
         if let Some(t) = self.entries.iter_mut().find(|t| t.label == label) {
+            // A new page means the old page's icon is wrong. Clearing it here
+            // rather than waiting for the next one to arrive is the difference
+            // between a stale favicon and a blank slot for a moment.
+            if t.url != url {
+                t.icon.clear();
+            }
             t.url = url;
+        }
+    }
+
+    /// Record a favicon, reporting whether it actually changed.
+    ///
+    /// WebKit re-notifies on every load, including reloads and same-icon
+    /// navigations within a site, and every change reloads the strip -- so the
+    /// answer here is what keeps a page of redirects from thrashing it.
+    pub fn update_icon(&mut self, label: &str, icon: String) -> bool {
+        match self.entries.iter_mut().find(|t| t.label == label) {
+            Some(t) if t.icon != icon => {
+                t.icon = icon;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -105,6 +171,7 @@ impl Tabs {
                 url: t.url.clone(),
                 title: if t.title.is_empty() { t.url.clone() } else { t.title.clone() },
                 active: self.active == Some(t.id),
+                icon: t.icon.clone(),
             })
             .collect()
     }
@@ -129,6 +196,21 @@ impl Tabs {
 
     pub fn nth(&self, index: usize) -> Option<u32> {
         self.entries.get(index).map(|t| t.id)
+    }
+
+    /// The tab at a 1-based position, counting from the end when `pos` is
+    /// negative. Drives Ctrl-1..Ctrl-9, where every browser makes the last
+    /// chord mean "the last tab" rather than "the ninth".
+    ///
+    /// Out of range is `None` rather than a clamp: Ctrl-5 with four tabs open
+    /// should do nothing, not land somewhere the user did not aim for.
+    pub fn by_position(&self, pos: i32) -> Option<u32> {
+        let len = self.entries.len() as i32;
+        let index = if pos < 0 { len + pos } else { pos - 1 };
+        if index < 0 {
+            return None;
+        }
+        self.nth(index as usize)
     }
 }
 
@@ -222,6 +304,10 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     // overlay; move it into the content stack so it stacks with the other tabs.
     crate::layout::adopt_tab(&view)?;
 
+    if let Err(e) = crate::favicon::watch(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "not watching this tab's favicon");
+    }
+
     if background {
         // Newly packed webviews are visible and expanding, which would split the
         // content area with the active tab. Hide it immediately.
@@ -308,6 +394,127 @@ pub async fn navigate(state: &Arc<AppState>, input: &str) -> Result<String> {
 ///
 /// Tauri exposes `reload` but not back/forward or stop; wry 0.56 has them and
 /// does not re-export them either. `with_webview` is the way through.
+/// Chrome's zoom ladder, so that stepping feels like every other browser rather
+/// than like a slider. Anything WebKit already holds that is off the ladder --
+/// set through `page zoom --level` -- steps to the next rung in the direction
+/// asked for.
+const ZOOM_STEPS: [f64; 16] =
+    [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0];
+
+#[derive(Clone, Copy, Debug)]
+pub enum ZoomChange {
+    In,
+    Out,
+    Reset,
+    Set(f64),
+}
+
+fn stepped(current: f64, up: bool) -> f64 {
+    if up {
+        ZOOM_STEPS.iter().copied().find(|s| *s > current + 1e-6).unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
+    } else {
+        ZOOM_STEPS.iter().copied().rev().find(|s| *s < current - 1e-6).unwrap_or(ZOOM_STEPS[0])
+    }
+}
+
+/// Zoom the active tab, returning the level it settled on.
+///
+/// Per tab, because that is where WebKit keeps it. Chrome remembers zoom per
+/// origin and reapplies it on the next visit; that needs somewhere to persist a
+/// map, and is a separate thing from the keys doing what the keys should do.
+/// What to do with the find controller.
+#[derive(Clone, Debug)]
+pub enum FindAction {
+    /// Start a fresh search, highlighting every hit and jumping to the first.
+    Search(String),
+    Next,
+    Previous,
+    /// Drop the highlight and forget the term.
+    Stop,
+}
+
+/// Search the active page.
+///
+/// WebKit keeps the search state on the webview's own `FindController`, which
+/// is why "next" needs no argument: the controller still holds the term from
+/// the last `search`. That also means stopping matters -- the highlight
+/// survives navigation otherwise.
+pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let label = state
+        .tabs
+        .read()
+        .await
+        .active_label()
+        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let view = webview(&app, &label)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        view.with_webview(move |platform| {
+            use webkit2gtk::{FindController, FindControllerExt, FindOptions, WebViewExt};
+            let Some(finder): Option<FindController> = platform.inner().find_controller() else {
+                tracing::warn!("this webview has no find controller");
+                return;
+            };
+            match action {
+                FindAction::Search(text) => {
+                    // Case-insensitive and wrapping, which is what every
+                    // browser's Ctrl-F does and what anyone expects.
+                    let options = FindOptions::CASE_INSENSITIVE | FindOptions::WRAP_AROUND;
+                    finder.search(&text, options.bits(), u32::MAX);
+                }
+                FindAction::Next => finder.search_next(),
+                FindAction::Previous => finder.search_previous(),
+                FindAction::Stop => finder.search_finish(),
+            }
+        })
+        .context("could not reach the webview")?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (view, action);
+        Err(anyhow!("unsupported on this platform"))
+    }
+}
+
+pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let label = state
+        .tabs
+        .read()
+        .await
+        .active_label()
+        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let view = webview(&app, &label)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.with_webview(move |platform| {
+            use webkit2gtk::WebViewExt;
+            let w = platform.inner();
+            let current = w.zoom_level();
+            let next = match change {
+                ZoomChange::In => stepped(current, true),
+                ZoomChange::Out => stepped(current, false),
+                ZoomChange::Reset => 1.0,
+                ZoomChange::Set(v) => v.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]),
+            };
+            w.set_zoom_level(next);
+            let _ = tx.send(next);
+        })
+        .context("could not reach the webview")?;
+        rx.await.context("the webview did not report a zoom level")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (view, change);
+        Err(anyhow!("unsupported on this platform"))
+    }
+}
+
 pub async fn history(state: &Arc<AppState>, action: HistoryAction) -> Result<()> {
     let app = state.app_handle().context("the window is not up yet")?;
     let label = state
@@ -438,5 +645,26 @@ mod tests {
         tabs.set_active(c);
         tabs.remove(c);
         assert_eq!(tabs.active_id(), Some(a), "falls back to the previous tab at the end");
+    }
+
+    #[test]
+    fn positions_count_from_one_and_from_the_end() {
+        let mut tabs = Tabs::default();
+        assert_eq!(tabs.by_position(1), None, "no tabs, nowhere to go");
+
+        let (a, _) = tabs.allocate("a".into());
+        let (b, _) = tabs.allocate("b".into());
+        let (c, _) = tabs.allocate("c".into());
+
+        assert_eq!(tabs.by_position(1), Some(a), "Ctrl-1 is the first tab, not the second");
+        assert_eq!(tabs.by_position(2), Some(b));
+        assert_eq!(tabs.by_position(-1), Some(c), "Ctrl-9 means the last tab");
+        assert_eq!(tabs.by_position(-3), Some(a));
+
+        // Aiming past either end does nothing rather than clamping onto a tab
+        // the chord did not name.
+        assert_eq!(tabs.by_position(4), None);
+        assert_eq!(tabs.by_position(-4), None);
+        assert_eq!(tabs.by_position(0), None, "there is no zeroth tab");
     }
 }

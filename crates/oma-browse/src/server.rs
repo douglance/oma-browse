@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use incurs::cli::Cli;
+use incurs::tool::ToolCatalog;
 use tokio::net::TcpListener;
 use topcoat::router::tower::TowerService;
 
@@ -16,8 +17,8 @@ pub struct Server {
 }
 
 /// Bind loopback on an ephemeral port and compose the two frameworks onto it.
-pub async fn build(cli: &Cli, state: Arc<AppState>) -> Result<Server> {
-    let topcoat_router = crate::ui::router(state);
+pub async fn build(cli: &Cli, catalog: ToolCatalog, state: Arc<AppState>) -> Result<Server> {
+    let topcoat_router = crate::ui::router(state, catalog);
 
     // incurs is *nested*, never merged: `build_cli_router` registers `/` and
     // `/{*path}` catch-alls that would otherwise swallow every Topcoat route.
