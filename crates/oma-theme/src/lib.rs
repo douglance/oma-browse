@@ -10,11 +10,15 @@
 //!   `omarchy-theme-color` so we inherit its alias/derivation cascade verbatim.
 //! * [`ShellTokens`] — the surface language from `shell.toml`: control states,
 //!   the launcher card, menu rows, the type scale.
+// An `unwrap` in a test is the assertion, and a `panic!` in one is how a test
+// fails. The workspace lints that forbid both in shipping code would otherwise
+// fire on every test in the tree; the non-test build still checks the real code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod color;
 pub mod css;
-pub mod palette;
 pub mod opacity;
+pub mod palette;
 pub mod paths;
 pub mod semantic;
 pub mod shell;

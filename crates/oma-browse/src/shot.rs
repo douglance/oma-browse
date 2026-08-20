@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tauri::Manager as _;
 use serde::Serialize;
+use tauri::Manager as _;
 
 use crate::state::AppState;
 
@@ -47,12 +47,8 @@ pub async fn capture(
     // Omarchy theme, and the whole reason to ask for an opaque shot is to see
     // the thing the way the user sees it.
     let ground = state.theme.read().await.css.tint;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = app.get_webview(&label).with_context(|| format!("no webview labelled {label}"))?;
 
     let path = resolve_path(path, &state.config.screenshot.dir)?;
@@ -78,14 +74,9 @@ pub async fn capture(
 
         // The callback lands back on the GTK main thread, and a cairo surface is
         // not `Send`, so the PNG is written here and only the dimensions travel.
-        platform.inner().snapshot(
-            region,
-            options,
-            None::<&gio::Cancellable>,
-            move |result| {
-                let _ = tx.send(write_png(result, &target, ground));
-            },
-        );
+        platform.inner().snapshot(region, options, None::<&gio::Cancellable>, move |result| {
+            let _ = tx.send(write_png(result, &target, ground));
+        });
     })
     .context("could not reach the webview to snapshot it")?;
 
@@ -152,11 +143,7 @@ fn flatten(
 ///
 /// Shared with `page source`, so the two agree: per-boot, user-private, and
 /// cleaned up by the system rather than accumulating in the user's home.
-pub fn scratch_file(
-    requested: Option<String>,
-    prefix: &str,
-    extension: &str,
-) -> Result<PathBuf> {
+pub fn scratch_file(requested: Option<String>, prefix: &str, extension: &str) -> Result<PathBuf> {
     if let Some(p) = requested.filter(|p| !p.trim().is_empty()) {
         return Ok(PathBuf::from(shellexpand(&p)));
     }
@@ -164,8 +151,7 @@ pub fn scratch_file(
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("oma-browse");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("could not make {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not make {}", dir.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -199,7 +185,7 @@ fn resolve_path(requested: Option<String>, configured: &str) -> Result<PathBuf> 
 
 /// `~` only. Anything more is the shell's job, and this is also called over
 /// HTTP where there is no shell to have done it.
-fn shellexpand(path: &str) -> String {
+pub fn shellexpand(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(home) => PathBuf::from(home).join(rest).display().to_string(),

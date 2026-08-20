@@ -18,9 +18,16 @@ use crate::state::AppState;
 /// The palette webview's label. Reserved: it is never a tab.
 pub const PALETTE_LABEL: &str = "palette";
 
+/// The scheme the browser's own pages are served on.
+///
+/// Not `http://127.0.0.1:port`. The palette is a page with a procedure endpoint
+/// behind it that can run any command in the catalog, and a loopback port puts
+/// that in reach of every process on the machine. A custom scheme is answered
+/// inside this process, by this process's webviews, and by nothing else.
+pub const CHROME_SCHEME: &str = "oma-chrome";
+
 pub struct Launch {
     pub state: Arc<AppState>,
-    pub base: url::Url,
     pub start_url: url::Url,
     pub incognito: bool,
     /// Theme background, so nothing flashes white before first paint (tauri#10011).
@@ -36,6 +43,9 @@ pub struct Launch {
     /// The command registry, so keyboard shortcuts dispatch through the same
     /// graph the CLI and MCP do rather than reimplementing it.
     pub catalog: incurs::tool::ToolCatalog,
+    /// The browser's own pages, served to its own webviews over
+    /// [`CHROME_SCHEME`] rather than over a socket anything else could reach.
+    pub chrome: axum::Router,
     /// Come up with the palette already asking where to go. Set by `window new`
     /// when it has no URL to hand the window it is opening; never by a bare
     /// launch, which is someone starting the browser rather than asking it a
@@ -46,7 +56,6 @@ pub struct Launch {
 pub fn run(launch: Launch) -> Result<()> {
     let Launch {
         state,
-        base,
         start_url,
         incognito,
         background,
@@ -54,6 +63,7 @@ pub fn run(launch: Launch) -> Result<()> {
         page_script,
         first_tab,
         catalog,
+        chrome,
         open_palette,
     } = launch;
 
@@ -72,10 +82,27 @@ pub fn run(launch: Launch) -> Result<()> {
     // The strip is transparent whatever the theme is doing: it floats over the
     // page now, and an opaque one would be the bar this deliberately is not.
     let strip_bg = tauri::window::Color(background.r, background.g, background.b, 0);
-    let palette_url = base.join("palette")?;
-    let strip_url = base.join("strip")?;
+    // Before the builder takes `state`: the exit hook below outlives the setup
+    // closure, and by then there is no `AppState` to ask.
+    let exit_dir = crate::control::dir_for(&state.config.control);
+    // The chrome comes off the custom scheme, not the listener: these are our
+    // pages, loaded by our webviews, and nothing outside this process has any
+    // business reaching them.
+    let palette_url: url::Url = format!("{CHROME_SCHEME}://localhost/palette").parse()?;
+    let strip_url: url::Url = format!("{CHROME_SCHEME}://localhost/strip").parse()?;
 
+    let chrome_runtime = state.runtime();
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol(CHROME_SCHEME, move |ctx, request, responder| {
+            let label = ctx.webview_label().to_string();
+            let router = chrome.clone();
+            // Off the GTK thread: rendering a page runs the same async router
+            // the listener does, and blocking here would freeze the window that
+            // is waiting for the answer.
+            chrome_runtime.spawn(async move {
+                responder.respond(chrome_page(router, label, request).await);
+            });
+        })
         .setup(move |app| {
             state.set_app_handle(app.handle().clone());
 
@@ -95,13 +122,28 @@ pub fn run(launch: Launch) -> Result<()> {
                 .build()
                 .context("could not create the window")?;
 
+            // "The window I was last looking at" is a question only the window
+            // can answer, so it answers it: every focus re-points `current.sock`
+            // at this process, and `oma-browse tab open <url>` follows the link.
+            // The alternative was asking the compositor, which hard-codes
+            // Hyprland into a browser to learn something it already knows.
+            let focus_dir = crate::control::dir_for(&state.config.control);
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::Focused(true)) {
+                    crate::control::point_current_in(&focus_dir, std::process::id());
+                }
+            });
+
             // Created first so it is the widget we can find the vbox through;
             // `layout::install` then lifts it out into the overlay.
             let palette = window
                 .add_child(
-                    WebviewBuilder::new(PALETTE_LABEL, WebviewUrl::External(palette_url.clone()))
-                        .transparent(translucent)
-                        .background_color(bg),
+                    WebviewBuilder::new(
+                        PALETTE_LABEL,
+                        WebviewUrl::CustomProtocol(palette_url.clone()),
+                    )
+                    .transparent(translucent)
+                    .background_color(bg),
                     LogicalPosition::new(0.0, 0.0),
                     LogicalSize::new(720.0, 420.0),
                 )
@@ -153,7 +195,7 @@ pub fn run(launch: Launch) -> Result<()> {
                     .add_child(
                         WebviewBuilder::new(
                             crate::strip::LABEL,
-                            WebviewUrl::External(strip_url.clone()),
+                            WebviewUrl::CustomProtocol(strip_url.clone()),
                         )
                         .transparent(true)
                         .background_color(strip_bg),
@@ -186,10 +228,72 @@ pub fn run(launch: Launch) -> Result<()> {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .context("the Tauri event loop exited with an error")?;
+        // `build` then `run` rather than `Builder::run`, which is the same two
+        // calls with an empty callback: this is the only hook that fires before
+        // the process goes. Tauri exits it directly, so nothing on this stack
+        // unwinds and a `Drop` guard would be a lie -- which is also why the
+        // socket's liveness is settled by connecting to it rather than by
+        // trusting that this ran.
+        .build(tauri::generate_context!())
+        .context("could not start the Tauri application")?
+        .run(move |_app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                crate::control::unlink_in(&exit_dir, std::process::id());
+            }
+        });
 
     Ok(())
+}
+
+/// Answer one request for a page of the browser's own chrome.
+///
+/// The router is the one `server.rs` composes, so the palette is the same page
+/// however it is reached; only the way in differs.
+async fn chrome_page(
+    router: axum::Router,
+    label: String,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    use tower::ServiceExt as _;
+
+    let (parts, body) = request.into_parts();
+    if !may_see(&label, parts.uri.path()) {
+        tracing::warn!(webview = %label, path = %parts.uri.path(), "refused the chrome");
+        return refusal(tauri::http::StatusCode::FORBIDDEN, "not for this webview");
+    }
+
+    let request = axum::http::Request::from_parts(parts, axum::body::Body::from(body));
+    let Ok(response) = router.oneshot(request).await;
+    let (parts, body) = response.into_parts();
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => tauri::http::Response::from_parts(parts, bytes.to_vec()),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read a chrome response");
+            refusal(tauri::http::StatusCode::INTERNAL_SERVER_ERROR, "the page did not finish")
+        }
+    }
+}
+
+/// Who may ask for what.
+///
+/// The scheme is registered on the shared web context, so a *page* could ask for
+/// it too -- and the palette's procedure endpoint runs commands. The chrome
+/// belongs to the two webviews that are the chrome; a tab gets the start page
+/// and the artwork on it, which is all a tab is ever pointed at.
+fn may_see(label: &str, path: &str) -> bool {
+    if label == PALETTE_LABEL || label == crate::strip::LABEL {
+        return true;
+    }
+    matches!(path, "/start" | "/mark.png" | "/icon.png" | "/favicon.ico")
+        || path.starts_with("/_topcoat/assets/")
+}
+
+fn refusal(status: tauri::http::StatusCode, message: &str) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(message.as_bytes().to_vec())
+        .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
 }
 
 /// Attach the callbacks that keep the tab model in step with what a webview is
@@ -320,7 +424,14 @@ fn spawn_strip_refresh(state: Arc<AppState>) {
         let mut events = state.subscribe();
         loop {
             match events.recv().await {
-                Ok(_) => {}
+                // The strip re-renders from `AppState` either way, so the
+                // payload is worth a line in the log and nothing more. It is
+                // worth that much: a restyle that did not land is otherwise
+                // indistinguishable from a theme that did not change.
+                Ok(crate::state::UiEvent::ThemeChanged { name, mode }) => {
+                    tracing::debug!(theme = %name, ?mode, "redrawing the strip for a new theme");
+                }
+                Ok(crate::state::UiEvent::TabsChanged) => {}
                 // Lagging means more changed than we heard about, which is the
                 // same instruction as any single event: redraw.
                 Err(RecvError::Lagged(_)) => {}
@@ -380,13 +491,19 @@ pub fn close(state: &Arc<AppState>) -> Result<()> {
 ///
 /// The child is told to open its palette when it is being sent nowhere in
 /// particular, so Ctrl-N lands in the same "where to?" state Ctrl-T does.
-pub fn spawn(state: &Arc<AppState>, url: Option<String>) -> Result<u32> {
+///
+/// `quiet` sends its logs to nowhere. Ctrl-N wants them: a window opened from a
+/// browser you started in a terminal should keep reporting to that terminal. A
+/// window opened by `oma-browse tab open` does not -- that command returns to a
+/// prompt, and a browser writing to the prompt it left behind is noise the user
+/// did not ask for.
+pub fn spawn(incognito: bool, url: Option<String>, quiet: bool) -> Result<u32> {
     let exe = std::env::current_exe().context("could not find the running browser binary")?;
     let mut command = std::process::Command::new(exe);
 
     // An incognito window opens incognito windows: the alternative is a chord
     // that quietly drops you back into a session that records history.
-    if state.incognito() {
+    if incognito {
         command.arg("--incognito");
     }
     match url {
@@ -394,8 +511,10 @@ pub fn spawn(state: &Arc<AppState>, url: Option<String>) -> Result<u32> {
         None => command.arg("--palette"),
     };
 
-    // Nothing may reach the child through our stdin, but its logs stay on our
-    // stderr: run from a terminal, that is where you would look for them.
+    // Nothing may reach the child through our stdin either way.
+    if quiet {
+        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
     let child = command
         .stdin(std::process::Stdio::null())
         .spawn()

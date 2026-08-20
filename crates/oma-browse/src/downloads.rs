@@ -287,11 +287,8 @@ pub fn watch<R: tauri::Runtime>(
             // last path segment. `Content-Disposition` arrives with the
             // response, later, and is applied then when it says something
             // better -- see the `notify::response` hook below.
-            let url = download
-                .request()
-                .and_then(|r| r.uri())
-                .map(|u| u.to_string())
-                .unwrap_or_default();
+            let url =
+                download.request().and_then(|r| r.uri()).map(|u| u.to_string()).unwrap_or_default();
             let from_url = url
                 .parse::<url::Url>()
                 .map(|u| name_from_url(&u))
@@ -371,11 +368,8 @@ fn settle(
     let Some(destination) = download.destination() else { return };
     let path = PathBuf::from(destination.as_str());
     let url = download.request().and_then(|r| r.uri()).map(|u| u.to_string());
-    let closed = state
-        .downloads
-        .lock()
-        .ok()
-        .and_then(|mut list| list.finish(&path, url.as_deref(), ok));
+    let closed =
+        state.downloads.lock().ok().and_then(|mut list| list.finish(&path, url.as_deref(), ok));
     let Some(entry) = closed else { return };
 
     tracing::info!(path = %path.display(), ok, "download settled");

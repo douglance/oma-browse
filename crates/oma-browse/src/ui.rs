@@ -650,7 +650,11 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
                     id: format!("do-hist:{}", mark.url),
                     close_id: String::new(),
                     icon: "★".to_string(),
-                    title: if mark.title.is_empty() { mark.url.clone() } else { mark.title.clone() },
+                    title: if mark.title.is_empty() {
+                        mark.url.clone()
+                    } else {
+                        mark.title.clone()
+                    },
                     sub: mark.url.clone(),
                     section: "Bookmarks".to_string(),
                 },
@@ -712,21 +716,25 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
     if searching {
         // Best first, and no section headings: they are noise once the list is
         // three rows deep, and the rows no longer come in section order anyway.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         // A bookmarked page is usually also in history. Keep the better-scoring
         // row -- which the bookmark bonus makes the bookmark -- and drop the
         // duplicate rather than showing the same URL twice.
         let mut seen = std::collections::HashSet::new();
         scored.retain(|(_, row)| seen.insert(row.id.clone()));
-        out.extend(scored.into_iter().take(state.config.chrome.palette.rows).map(|(_, mut row)| {
-            row.section = String::new();
-            row
-        }));
+        out.extend(scored.into_iter().take(state.config.chrome.palette.rows).map(
+            |(_, mut row)| {
+                row.section = String::new();
+                row
+            },
+        ));
     } else {
         // Idle: a menu, in declared order, with history as a short recent list
         // rather than thousands of rows.
         let mut menu: Vec<Row> = Vec::new();
-        menu.extend(scored.iter().filter(|(_, r)| r.section == "Open tabs").map(|(_, r)| r.clone()));
+        menu.extend(
+            scored.iter().filter(|(_, r)| r.section == "Open tabs").map(|(_, r)| r.clone()),
+        );
         for (_, title) in crate::commands::GROUPS {
             menu.extend(
                 scored
@@ -736,10 +744,7 @@ async fn rows(state: &Arc<AppState>, reg: &Registry, query: &str) -> Vec<Row> {
             );
         }
         menu.extend(
-            scored
-                .iter()
-                .filter(|(_, r)| r.section == "Bookmarks")
-                .map(|(_, r)| r.clone()),
+            scored.iter().filter(|(_, r)| r.section == "Bookmarks").map(|(_, r)| r.clone()),
         );
         menu.extend(
             scored
@@ -982,7 +987,7 @@ mod tests {
                 .iter()
                 .filter_map(|c| super::score_command(c, q).map(|s| (s, c)))
                 .collect();
-            hits.sort_by(|a, b| b.0.cmp(&a.0));
+            hits.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             hits.first().map(|(_, c)| c.name.clone()).unwrap_or_default()
         };
 

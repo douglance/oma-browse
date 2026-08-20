@@ -81,6 +81,18 @@ fn percent_decode(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A tap rather than an assertion, matching `oma-theme`'s `dump_script`:
+    /// `OMA_DUMP_HINTS=<path> cargo test -p oma-browse hints::tests::dump`
+    /// writes the link-hint runtime out so a real JavaScript parser can see it.
+    /// A syntax error in here is invisible from Rust -- the script is a `&str`
+    /// to the compiler, so it builds, ships, and simply never runs, and the
+    /// only symptom is that `f` stops drawing hints.
+    #[test]
+    fn dump() {
+        let Ok(path) = std::env::var("OMA_DUMP_HINTS") else { return };
+        std::fs::write(path, script()).expect("write");
+    }
+
     #[test]
     fn the_script_carries_the_sentinel() {
         let js = script();

@@ -63,10 +63,10 @@ fn worth_keeping(url: &str, base: Option<&url::Url>) -> bool {
     }
     match base {
         Some(base) => !url.starts_with(base.as_str()),
-        // Before the control plane's address is known, fall back to the shape of
-        // it. A user's own loopback page is a rare thing to lose; ours is a
-        // certain thing to duplicate.
-        None => !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:"),
+        // Before the chrome's base is known, fall back to its scheme. A user's
+        // own page is a rare thing to lose; ours is a certain thing to
+        // duplicate.
+        None => !url.starts_with(crate::window::CHROME_SCHEME),
     }
 }
 
@@ -133,8 +133,7 @@ fn read() -> Vec<String> {
 /// at. Anything already open is skipped, so running this twice is not a way to
 /// end up with two of everything.
 pub async fn restore(state: &Arc<AppState>) -> usize {
-    let already: Vec<String> =
-        state.tabs.read().await.list().into_iter().map(|t| t.url).collect();
+    let already: Vec<String> = state.tabs.read().await.list().into_iter().map(|t| t.url).collect();
 
     let mut opened = 0;
     for url in saved() {
@@ -199,8 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_base_loopback_is_assumed_to_be_ours() {
-        assert!(!worth_keeping("http://127.0.0.1:41234/start", None));
+    fn without_a_base_our_own_scheme_still_reads_as_ours() {
+        assert!(!worth_keeping("oma-chrome://localhost/start", None));
         assert!(worth_keeping("https://omarchy.org", None));
+        // No longer a guess: the chrome is not on loopback at all, so a
+        // loopback tab is the user's and worth restoring either way.
+        assert!(worth_keeping("http://127.0.0.1:3000/", None));
     }
 }

@@ -514,13 +514,9 @@ fn bookmark_group(state: Arc<AppState>) -> Cli {
                 let Some(url) = url.filter(|u| !u.is_empty()) else {
                     return TypedResult::error("usage", "there is no page to bookmark".to_string());
                 };
-                let title = ctx
-                    .options
-                    .title
-                    .or_else(|| current.map(|(_, t)| t))
-                    .unwrap_or_default();
-                let added =
-                    state.bookmarks.write().await.add(&url, &title, crate::history::now());
+                let title =
+                    ctx.options.title.or_else(|| current.map(|(_, t)| t)).unwrap_or_default();
+                let added = state.bookmarks.write().await.add(&url, &title, crate::history::now());
                 TypedResult::ok(Bookmarked { url, title, added })
             }
         },
@@ -567,11 +563,7 @@ fn bookmark_group(state: Arc<AppState>) -> Cli {
                     entries: marks
                         .entries()
                         .iter()
-                        .map(|b| Visited {
-                            url: b.url.clone(),
-                            title: b.title.clone(),
-                            visits: 0,
-                        })
+                        .map(|b| Visited { url: b.url.clone(), title: b.title.clone(), visits: 0 })
                         .collect(),
                 })
             }
@@ -816,15 +808,20 @@ fn tab_group(state: Arc<AppState>) -> Cli {
                             Some(id) => Some(id),
                             // Ctrl-5 with four tabs open is a miss, not an
                             // error worth a notification.
-                            None => return TypedResult::ok(TabList {
-                                tabs: state.tabs.read().await.list(),
-                            }),
+                            None => {
+                                return TypedResult::ok(TabList {
+                                    tabs: state.tabs.read().await.list(),
+                                });
+                            }
                         },
                         None => None,
                     },
                 };
                 let Some(id) = id else {
-                    return TypedResult::error("missing_id", "which tab? pass an id from `tab list`");
+                    return TypedResult::error(
+                        "missing_id",
+                        "which tab? pass an id from `tab list`",
+                    );
                 };
                 match crate::tabs::select(&state, id).await {
                     Ok(()) => {
@@ -1476,7 +1473,10 @@ fn page_group(state: Arc<AppState>) -> Cli {
                     Err(e) => return TypedResult::error("io", format!("{e:#}")),
                 };
                 if let Err(e) = std::fs::write(&path, &html) {
-                    return TypedResult::error("io", format!("could not write {}: {e}", path.display()));
+                    return TypedResult::error(
+                        "io",
+                        format!("could not write {}: {e}", path.display()),
+                    );
                 }
                 if ctx.options.open {
                     let target = format!("file://{}", path.display());
@@ -1758,10 +1758,12 @@ fn window_group(state: Arc<AppState>) -> Cli {
                 // Resolved here rather than in the child, so that what you type
                 // at Ctrl-N means the same thing as what you type at Ctrl-T: a
                 // bare host becomes https, and anything else becomes a search.
-                let url = ctx.options.url.or(ctx.args.url).map(|input| {
-                    crate::tabs::resolve_input(&input, &state.config.search)
-                });
-                match crate::window::spawn(&state, url) {
+                let url = ctx
+                    .options
+                    .url
+                    .or(ctx.args.url)
+                    .map(|input| crate::tabs::resolve_input(&input, &state.config.search));
+                match crate::window::spawn(state.incognito(), url, false) {
                     Ok(pid) => TypedResult::ok(Spawned { pid }),
                     Err(e) => TypedResult::error("spawn", format!("{e:#}")),
                 }
@@ -1838,7 +1840,9 @@ fn theme_group(state: Arc<AppState>) -> Cli {
             }
         },
     )
-    .description("Re-read the live Omarchy theme and restyle. This is what the theme-set hook calls.")
+    .description(
+        "Re-read the live Omarchy theme and restyle. This is what the theme-set hook calls.",
+    )
     .done();
 
     let css_state = state.clone();

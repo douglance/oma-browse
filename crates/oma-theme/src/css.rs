@@ -40,8 +40,14 @@ pub struct ThemeCss {
 impl ThemeCss {
     pub fn build(theme: &Theme) -> Self {
         let semantic = SemanticPalette::derive(&theme.palette);
-        let chrome =
-            render_chrome(&theme.palette, &theme.shell, theme.mode(), &semantic, theme.tint, theme.opacity);
+        let chrome = render_chrome(
+            &theme.palette,
+            &theme.shell,
+            theme.mode(),
+            &semantic,
+            theme.tint,
+            theme.opacity,
+        );
 
         Self {
             fingerprint: fingerprint(&chrome),
@@ -219,11 +225,8 @@ impl<'a> Surface<'a> {
     /// A colour mixed toward the theme's own "away from the background" direction,
     /// so derived shades stay right in both light and dark themes.
     fn shade(&self, base: Rgb, amount: f64) -> Rgb {
-        let toward = if self.palette.mode().is_dark() {
-            Rgb::new(255, 255, 255)
-        } else {
-            Rgb::new(0, 0, 0)
-        };
+        let toward =
+            if self.palette.mode().is_dark() { Rgb::new(255, 255, 255) } else { Rgb::new(0, 0, 0) };
         base.mix(toward, amount)
     }
 }
@@ -310,9 +313,8 @@ fn render_chrome(
         ("selected", "selected", 0.18),
     ] {
         let color = shell.color("controls", &format!("{state}-color")).unwrap_or(fg);
-        let fill_alpha = shell
-            .number("controls", &format!("{state}-fill-alpha"))
-            .unwrap_or(default_alpha);
+        let fill_alpha =
+            shell.number("controls", &format!("{state}-fill-alpha")).unwrap_or(default_alpha);
         let _ = writeln!(css, "  --oma-control-{css_name}-fg: {};", color.to_hex());
         let _ = writeln!(css, "  --oma-control-{css_name}-fill: {};", color.to_css(fill_alpha));
         let _ = writeln!(
@@ -336,13 +338,11 @@ fn render_chrome(
     );
 
     // --- the omnibar, dressed as Omarchy's launcher -------------------------
-    let _ = writeln!(css, "  --oma-omnibar-bg: {};", s.css("launcher", "background", || bg.to_hex()));
+    let _ =
+        writeln!(css, "  --oma-omnibar-bg: {};", s.css("launcher", "background", || bg.to_hex()));
     let _ = writeln!(css, "  --oma-omnibar-fg: {};", s.css("launcher", "text", || fg.to_hex()));
-    let _ = writeln!(
-        css,
-        "  --oma-omnibar-scrim: {};",
-        s.css("launcher", "scrim", || bg.to_css(0.5))
-    );
+    let _ =
+        writeln!(css, "  --oma-omnibar-scrim: {};", s.css("launcher", "scrim", || bg.to_css(0.5)));
     let _ = writeln!(
         css,
         "  --oma-omnibar-border: {};",
@@ -362,7 +362,8 @@ fn render_chrome(
     // --- menus and popups ---------------------------------------------------
     let _ = writeln!(css, "  --oma-menu-bg: {};", s.css("menu", "background", || bg.to_hex()));
     let _ = writeln!(css, "  --oma-menu-fg: {};", s.css("menu", "text", || fg.to_hex()));
-    let _ = writeln!(css, "  --oma-menu-border: {};", s.paint("menu", "border", || fg.to_css(0.25)));
+    let _ =
+        writeln!(css, "  --oma-menu-border: {};", s.paint("menu", "border", || fg.to_css(0.25)));
     let _ = writeln!(
         css,
         "  --oma-menu-selected-bg: {};",
@@ -375,8 +376,13 @@ fn render_chrome(
     );
     let _ = writeln!(css, "  --oma-popup-bg: {};", s.css("popups", "background", || bg.to_hex()));
     let _ = writeln!(css, "  --oma-popup-fg: {};", s.css("popups", "text", || fg.to_hex()));
-    let _ = writeln!(css, "  --oma-popup-border: {};", s.paint("popups", "border", || accent.to_hex()));
-    let _ = writeln!(css, "  --oma-tooltip-bg: {};", s.css("tooltip", "background", || bg.to_css(0.97)));
+    let _ =
+        writeln!(css, "  --oma-popup-border: {};", s.paint("popups", "border", || accent.to_hex()));
+    let _ = writeln!(
+        css,
+        "  --oma-tooltip-bg: {};",
+        s.css("tooltip", "background", || bg.to_css(0.97))
+    );
     let _ = writeln!(css, "  --oma-tooltip-fg: {};", s.css("tooltip", "text", || fg.to_hex()));
 
     // --- the focus ring, matching the Hyprland active-window border ---------
@@ -394,7 +400,6 @@ fn render_chrome(
     css.push_str("}\n");
     css
 }
-
 
 /// A JavaScript string literal, quotes included.
 ///
@@ -427,4 +432,3 @@ fn js_string(s: &str) -> String {
 /// Injected as a WebKitGTK user script, so it runs at document-start on every
 /// navigation, and re-running it tears the previous instance down first.
 const PAGE_SCRIPT: &str = include_str!("page.js");
-

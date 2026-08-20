@@ -225,7 +225,8 @@ theme_type\tdark
 
     #[test]
     fn detects_light_mode_by_luminance_when_absent() {
-        let p = Palette::from_resolver_output("background\t#eff1f5\nforeground\t#4c4f69\n").unwrap();
+        let p =
+            Palette::from_resolver_output("background\t#eff1f5\nforeground\t#4c4f69\n").unwrap();
         assert_eq!(p.mode(), Mode::Light);
     }
 

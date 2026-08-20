@@ -32,7 +32,10 @@ pub enum Token {
     /// A Hyprland-style gradient, e.g. `"rgba(aaaaaaee) rgba(bbbbbbee) 45deg"`.
     /// Kept whole so a focus ring can render the real gradient instead of
     /// silently flattening it.
-    Gradient { stops: Vec<Rgb>, angle_deg: f64 },
+    Gradient {
+        stops: Vec<Rgb>,
+        angle_deg: f64,
+    },
     Number(f64),
     Bool(bool),
     Text(String),
@@ -333,7 +336,8 @@ loop-b = "general.loop-a"
 
     #[test]
     fn user_layer_wins_over_theme_layer() {
-        let mut t = ShellTokens::parse("[menu]\nbackground = \"#111111\"\ntext = \"#eeeeee\"\n").unwrap();
+        let mut t =
+            ShellTokens::parse("[menu]\nbackground = \"#111111\"\ntext = \"#eeeeee\"\n").unwrap();
         t.merge_str("[menu]\nbackground = \"#222222\"\n").unwrap();
         assert_eq!(t.color("menu", "background"), Some(Rgb::new(0x22, 0x22, 0x22)));
         // Keys the user did not override survive.

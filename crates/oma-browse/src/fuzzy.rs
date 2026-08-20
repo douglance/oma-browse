@@ -40,9 +40,11 @@ fn bonus_at(chars: &[char], index: usize) -> i32 {
     let cur = chars[index];
     if is_separator(prev) {
         BONUS_BOUNDARY
-    } else if prev.is_lowercase() && cur.is_uppercase() {
-        BONUS_CAMEL
-    } else if prev.is_ascii_digit() && cur.is_alphabetic() {
+    // Both of these are the same kind of edge -- a case change and a
+    // digit-to-letter change each start a new word without a separator.
+    } else if (prev.is_lowercase() && cur.is_uppercase())
+        || (prev.is_ascii_digit() && cur.is_alphabetic())
+    {
         BONUS_CAMEL
     } else {
         0
@@ -142,7 +144,10 @@ mod tests {
 
     #[test]
     fn initials_find_a_host() {
-        assert_eq!(best("ycom", &["en.wikipedia.org", "news.ycombinator.com"]), "news.ycombinator.com");
+        assert_eq!(
+            best("ycom", &["en.wikipedia.org", "news.ycombinator.com"]),
+            "news.ycombinator.com"
+        );
         assert_eq!(best("wiki", &["news.ycombinator.com", "en.wikipedia.org"]), "en.wikipedia.org");
     }
 

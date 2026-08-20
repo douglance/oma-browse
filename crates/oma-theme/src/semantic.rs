@@ -152,7 +152,9 @@ mod tests {
 
     #[test]
     fn maps_ansi_slots_to_status_colours() {
-        let s = SemanticPalette::derive(&palette("color1\t#f7768e\ncolor3\t#e0af68\ncolor2\t#9ece6a\n"));
+        let s = SemanticPalette::derive(&palette(
+            "color1\t#f7768e\ncolor3\t#e0af68\ncolor2\t#9ece6a\n",
+        ));
         assert_eq!(s.error, Rgb::new(0xf7, 0x76, 0x8e));
         assert_eq!(s.warning, Rgb::new(0xe0, 0xaf, 0x68));
         assert_eq!(s.success, Rgb::new(0x9e, 0xce, 0x6a));
@@ -161,8 +163,20 @@ mod tests {
     #[test]
     fn emits_every_token() {
         let css = SemanticPalette::derive(&palette("")).to_css_vars("oma");
-        for name in ["canvas", "surface", "raised", "fg", "muted", "accent", "border", "focus",
-                     "selection", "error", "warning", "success"] {
+        for name in [
+            "canvas",
+            "surface",
+            "raised",
+            "fg",
+            "muted",
+            "accent",
+            "border",
+            "focus",
+            "selection",
+            "error",
+            "warning",
+            "success",
+        ] {
             assert!(css.contains(&format!("--oma-{name}:")), "missing --oma-{name}");
         }
     }

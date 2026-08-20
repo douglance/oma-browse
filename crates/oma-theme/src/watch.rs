@@ -73,10 +73,7 @@ pub fn watch_theme_changes() -> Result<(mpsc::Receiver<String>, impl Watcher), E
 /// inotify reports as a rename into the directory.
 fn is_theme_swap(event: &Event) -> bool {
     let touches = |name: &str| {
-        event
-            .paths
-            .iter()
-            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
+        event.paths.iter().any(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
     };
 
     match event.kind {
@@ -127,9 +124,7 @@ pub fn install_hook(exe: &Path) -> Result<std::path::PathBuf, Error> {
 }
 
 fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
-    {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))

@@ -50,13 +50,9 @@ impl Default for History {
 }
 
 impl History {
-    /// Read whatever was saved last time. A missing or corrupt file is an empty
-    /// history, never an error: losing history must not stop the browser.
-    pub fn load() -> Self {
-        Self::load_with(CAP)
-    }
-
-    /// The same, with the config file's cap.
+    /// Read whatever was saved last time, keeping `cap` entries. A missing or
+    /// corrupt file is an empty history, never an error: losing history must
+    /// not stop the browser.
     pub fn load_with(cap: usize) -> Self {
         let file = path();
         // A zero cap would drop every entry on the way in, which is what
@@ -68,8 +64,7 @@ impl History {
             // `visits \t last \t url \t title`. Tabs, because a URL cannot
             // contain one and a title with a tab in it is not worth a parser.
             let mut parts = line.splitn(4, '\t');
-            let (Some(visits), Some(last), Some(url)) =
-                (parts.next(), parts.next(), parts.next())
+            let (Some(visits), Some(last), Some(url)) = (parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
@@ -88,12 +83,7 @@ impl History {
     }
 
     fn reindex(&mut self) {
-        self.index = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (v.url.clone(), i))
-            .collect();
+        self.index = self.entries.iter().enumerate().map(|(i, v)| (v.url.clone(), i)).collect();
     }
 
     /// Note a visit, moving the page to the front.
@@ -157,7 +147,9 @@ impl History {
         let body: String = self
             .entries
             .iter()
-            .map(|v| format!("{}\t{}\t{}\t{}\n", v.visits, v.last, v.url, v.title.replace('\t', " ")))
+            .map(|v| {
+                format!("{}\t{}\t{}\t{}\n", v.visits, v.last, v.url, v.title.replace('\t', " "))
+            })
             .collect();
         let Some(file) = self.file.as_ref() else { return };
         if let Some(dir) = file.parent() {
@@ -175,9 +167,9 @@ fn worth_keeping(url: &str) -> bool {
     if url.is_empty() || url == "about:blank" {
         return false;
     }
-    // Our own control plane is on loopback with an ephemeral port, so match the
-    // host rather than a fixed address.
-    !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:")
+    // Our own chrome has a scheme of its own, which makes this exact: the
+    // start page is `oma-chrome://localhost/start` and nothing else is.
+    !url.starts_with(crate::window::CHROME_SCHEME)
 }
 
 pub fn now() -> u64 {
@@ -224,9 +216,14 @@ mod tests {
     fn our_own_pages_are_not_history() {
         let mut h = History::default();
         h.record("about:blank", 1);
-        h.record("http://127.0.0.1:41234/start", 1);
+        h.record("oma-chrome://localhost/start", 1);
         h.record("", 1);
         assert!(h.entries().is_empty());
+
+        // And the other half of the bargain: now that the chrome has a scheme of
+        // its own, a loopback page is unambiguously the user's own work.
+        h.record("http://127.0.0.1:3000/", 2);
+        assert_eq!(h.entries().len(), 1);
     }
 
     #[test]
@@ -235,7 +232,10 @@ mod tests {
         h.record("https://a.example", 1);
         h.record("https://b.example", 2);
         h.set_title("https://a.example", "Alpha");
-        assert_eq!(h.entries().iter().find(|v| v.url == "https://a.example").unwrap().title, "Alpha");
+        assert_eq!(
+            h.entries().iter().find(|v| v.url == "https://a.example").unwrap().title,
+            "Alpha"
+        );
         assert_eq!(h.entries()[0].title, "");
     }
 

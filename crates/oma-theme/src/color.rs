@@ -78,8 +78,8 @@ impl FromStr for Rgb {
 
         let expand = |c: char| -> Result<u8, Error> {
             let d = c.to_digit(16).ok_or_else(bad)? as u8;
-            Ok(d * 17
-        )};
+            Ok(d * 17)
+        };
         let byte = |a: char, b: char| -> Result<u8, Error> {
             let hi = a.to_digit(16).ok_or_else(bad)? as u8;
             let lo = b.to_digit(16).ok_or_else(bad)? as u8;

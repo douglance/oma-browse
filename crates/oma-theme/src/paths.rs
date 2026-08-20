@@ -63,7 +63,5 @@ pub fn theme_set_hook_dir() -> PathBuf {
 }
 
 pub(crate) fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }

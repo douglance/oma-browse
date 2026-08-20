@@ -234,18 +234,21 @@ pub struct Engine {
     pub cookies: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Control {
-    /// The port the control plane listens on. `0` takes whatever is free, which
-    /// means reading the log to find it; a fixed port is what makes the browser
-    /// reachable by something that did not watch it start.
-    pub port: u16,
-    /// Write the live port to `$XDG_RUNTIME_DIR/oma-browse/port`.
-    pub port_file: bool,
+    /// Where this window's control socket goes. Empty is
+    /// `$XDG_RUNTIME_DIR/oma-browse`, which is where anything driving the
+    /// browser should look for it.
+    pub socket: String,
+    /// Also answer commands on this loopback port. `0` is off, and off is the
+    /// default: a port is reachable by every process and every account on the
+    /// machine, where the socket is reachable by you. Turn it on deliberately,
+    /// for tooling that cannot open a Unix socket.
+    pub remote_port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Startup {
     /// Start every window incognito, as though `--incognito` were always passed.
@@ -278,7 +281,7 @@ pub struct Downloads {
     pub notify: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Screenshot {
     /// Where `page screenshot` writes when told nowhere. Empty is
@@ -362,12 +365,7 @@ impl Default for Palette {
 
 impl Default for Strip {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            height: crate::layout::STRIP_HEIGHT,
-            title: true,
-            debounce_ms: 80,
-        }
+        Self { enabled: true, height: crate::layout::STRIP_HEIGHT, title: true, debounce_ms: 80 }
     }
 }
 
@@ -401,18 +399,6 @@ impl Default for Engine {
     }
 }
 
-impl Default for Control {
-    fn default() -> Self {
-        Self { port: 0, port_file: true }
-    }
-}
-
-impl Default for Startup {
-    fn default() -> Self {
-        Self { incognito: false, restore: false }
-    }
-}
-
 impl Default for History {
     fn default() -> Self {
         Self { enabled: true, limit: crate::history::CAP }
@@ -422,12 +408,6 @@ impl Default for History {
 impl Default for Downloads {
     fn default() -> Self {
         Self { dir: String::new(), notify: true }
-    }
-}
-
-impl Default for Screenshot {
-    fn default() -> Self {
-        Self { dir: String::new(), full: false, transparent: false }
     }
 }
 
@@ -459,14 +439,14 @@ impl Config {
 
         // The happy path is strict: `deny_unknown_fields` is what turns a
         // misspelled key from silence into a message.
-        if let Ok(config) = toml::from_str::<Config>(&raw) {
-            return config;
-        }
-
-        // It did not parse. Salvage what does rather than reverting the file
-        // wholesale -- one key the browser has since renamed should cost the
-        // user that key, not every setting they ever wrote.
-        let strict = toml::from_str::<Config>(&raw).unwrap_err().to_string();
+        // Salvage what parses rather than reverting the file wholesale -- one
+        // key the browser has since renamed should cost the user that key, not
+        // every setting they ever wrote. Taking the error out of the same parse
+        // that failed, rather than parsing twice to get at it.
+        let strict = match toml::from_str::<Config>(&raw) {
+            Ok(config) => return config,
+            Err(e) => e.to_string(),
+        };
         let mut notes = Vec::new();
         let salvaged = toml::from_str::<toml::Value>(&raw)
             .ok()
@@ -522,16 +502,6 @@ impl Config {
         crate::tabs::resolve_input(&self.home, &self.search)
     }
 
-    /// Record something the browser noticed about its own configuration, so
-    /// `config show` can report it. Keeps the first: a later complaint is
-    /// usually a consequence of the first one.
-    pub fn note_problem(&mut self, problem: String) {
-        tracing::warn!(%problem, "config");
-        if self.problem.is_none() {
-            self.problem = Some(problem);
-        }
-    }
-
     /// Write a commented file with every setting at its default.
     ///
     /// The defaults are written out rather than left implicit because a config
@@ -582,9 +552,8 @@ fn migrate(value: &mut toml::Value, notes: &mut Vec<String>) {
         let Some(moved) = take_path(value, from) else { continue };
         match merge_at(value, to, moved) {
             true => notes.push(format!("`{from}` is now `{to}`, and was read as such")),
-            false => notes.push(format!(
-                "`{from}` is now `{to}`, which the file also sets -- `{to}` won"
-            )),
+            false => notes
+                .push(format!("`{from}` is now `{to}`, which the file also sets -- `{to}` won")),
         }
     }
 }
@@ -678,8 +647,7 @@ fn prune_unknown(
         if known.contains_key(key) {
             return true;
         }
-        let full =
-            if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+        let full = if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
         notes.push(format!("`{full}` is not a setting, and was ignored"));
         false
     });
@@ -689,8 +657,7 @@ fn prune_unknown(
             continue;
         }
         let Some(known_child) = known.get(key.as_str()) else { continue };
-        let full =
-            if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+        let full = if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
         prune_unknown(child, known_child, &full, notes);
     }
 }
@@ -822,7 +789,8 @@ mod tests {
     /// One unknown key costs one unknown key.
     #[test]
     fn an_unknown_key_does_not_take_the_file_with_it() {
-        let config = salvage("home = \"https://example.com\"\nnonsense = 1\n[theme]\nrecolor = false\n");
+        let config =
+            salvage("home = \"https://example.com\"\nnonsense = 1\n[theme]\nrecolor = false\n");
 
         assert_eq!(config.home, "https://example.com");
         assert!(!config.theme.recolor, "settings after the bad key still apply");

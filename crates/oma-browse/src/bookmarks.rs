@@ -59,10 +59,8 @@ impl Bookmarks {
             self.save();
             return false;
         }
-        self.entries.insert(
-            0,
-            Bookmark { url: url.to_string(), title: title.to_string(), added: now },
-        );
+        self.entries
+            .insert(0, Bookmark { url: url.to_string(), title: title.to_string(), added: now });
         self.save();
         true
     }
@@ -76,10 +74,6 @@ impl Bookmarks {
             self.save();
         }
         removed
-    }
-
-    pub fn contains(&self, url: &str) -> bool {
-        self.entries.iter().any(|b| b.url == url)
     }
 
     pub fn entries(&self) -> &[Bookmark] {

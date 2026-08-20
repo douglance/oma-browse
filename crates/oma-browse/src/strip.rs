@@ -15,11 +15,11 @@
 //! inset scrolls away. Taking the height out of the window instead would mean
 //! the page could never reach the top of the screen at all.
 
+use topcoat::Result;
 use topcoat::context::Cx;
 use topcoat::router::page;
 use topcoat::runtime::{Event, procedure};
 use topcoat::view::{Unescaped, view};
-use topcoat::Result;
 
 use crate::ui::{registry, state};
 
@@ -316,14 +316,9 @@ mod tests {
     fn the_glyphs_are_in_the_nerd_font_private_use_area() {
         // A codepoint that fell outside it is one some unpatched font will
         // happily render as something else entirely.
-        for glyph in [GEAR] {
-            let c = glyph.chars().next().expect("a glyph");
-            assert_eq!(glyph.chars().count(), 1, "one codepoint, not a sequence");
-            assert!(
-                ('\u{e000}'..='\u{f8ff}').contains(&c),
-                "{glyph:?} is outside the private use area"
-            );
-        }
+        let c = GEAR.chars().next().expect("a glyph");
+        assert_eq!(GEAR.chars().count(), 1, "one codepoint, not a sequence");
+        assert!(('\u{e000}'..='\u{f8ff}').contains(&c), "{GEAR:?} is outside the private use area");
     }
 
     /// The placeholder is drawn rather than typed, and the two things that make

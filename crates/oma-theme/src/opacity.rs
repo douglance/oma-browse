@@ -129,11 +129,17 @@ mod tests {
 
     #[test]
     fn background_without_a_hash_still_parses() {
-        assert_eq!(parse_background("background = 1a1b26\n"), Some(crate::Rgb::new(0x1a, 0x1b, 0x26)));
+        assert_eq!(
+            parse_background("background = 1a1b26\n"),
+            Some(crate::Rgb::new(0x1a, 0x1b, 0x26))
+        );
     }
 
     #[test]
     fn last_write_wins() {
-        assert_eq!(parse_opacity("background-opacity = 0.3\nbackground-opacity = 0.9\n"), Some(0.9));
+        assert_eq!(
+            parse_opacity("background-opacity = 0.3\nbackground-opacity = 0.9\n"),
+            Some(0.9)
+        );
     }
 }

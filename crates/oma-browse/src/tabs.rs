@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, WebviewUrl, Wry};
 use tauri::webview::{Webview, WebviewBuilder};
+use tauri::{AppHandle, Manager, WebviewUrl, Wry};
 
 use crate::state::AppState;
 
@@ -55,13 +55,7 @@ impl Default for Tabs {
 
 impl Tabs {
     pub fn with_reopen_depth(reopen_depth: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            active: None,
-            next_id: 0,
-            closed: Vec::new(),
-            reopen_depth,
-        }
+        Self { entries: Vec::new(), active: None, next_id: 0, closed: Vec::new(), reopen_depth }
     }
 }
 
@@ -196,19 +190,14 @@ impl Tabs {
             .collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// The neighbour `delta` steps away, wrapping. Drives Ctrl-Tab.
     pub fn neighbour(&self, delta: i32) -> Option<u32> {
         if self.entries.is_empty() {
             return None;
         }
-        let current = self
-            .active
-            .and_then(|id| self.entries.iter().position(|t| t.id == id))
-            .unwrap_or(0) as i32;
+        let current =
+            self.active.and_then(|id| self.entries.iter().position(|t| t.id == id)).unwrap_or(0)
+                as i32;
         let len = self.entries.len() as i32;
         let next = (current + delta).rem_euclid(len) as usize;
         Some(self.entries[next].id)
@@ -245,6 +234,13 @@ pub fn resolve_input(input: &str, search: &str) -> String {
     if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("file://") {
         return raw.to_string();
     }
+    // The browser's own pages. `start_page` hands this straight back to
+    // `tab open`, and without it a new tab searched the web for the address of
+    // its own start page. A tab that asks for the *palette* still gets nowhere:
+    // `window::may_see` only serves the chrome to the chrome.
+    if raw.starts_with(&format!("{}://", crate::window::CHROME_SCHEME)) {
+        return raw.to_string();
+    }
 
     // Looks like a host if it has no spaces and either a dot with a plausible
     // TLD, or is localhost (with optional port and path).
@@ -253,10 +249,9 @@ pub fn resolve_input(input: &str, search: &str) -> String {
     let looks_like_host = !raw.contains(char::is_whitespace)
         && (hostless_port == "localhost"
             || (hostless_port.contains('.')
-                && hostless_port
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))));
+                && hostless_port.rsplit('.').next().is_some_and(|tld| {
+                    tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+                })));
 
     if looks_like_host {
         return format!("https://{raw}");
@@ -488,12 +483,8 @@ pub enum FindAction {
 /// survives navigation otherwise.
 pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = webview(&app, &label)?;
 
     #[cfg(target_os = "linux")]
@@ -558,6 +549,16 @@ pub async fn devtools(state: &Arc<AppState>, action: Toggle) -> Result<bool> {
             let want = action.resolve(open);
             if want {
                 inspector.show();
+                // Docked, the inspector takes its half out of the *window*,
+                // which includes the strip: the title is cut in half and the
+                // gear ends up underneath the Elements pane. Undocking it costs
+                // nothing on a tiling compositor, which will place the second
+                // window better than WebKit's splitter does anyway, and the
+                // inspector's own dock button puts it back for anyone who
+                // prefers it attached.
+                if inspector.is_attached() {
+                    inspector.detach();
+                }
             } else {
                 inspector.close();
             }
@@ -692,14 +693,12 @@ pub async fn print(
                     op.print();
                 }
                 None => {
-                    // The parent matters, and getting it wrong is not cosmetic.
-                    // A parentless GTK dialog under Wayland never receives
-                    // keyboard focus while GTK's modal grab still holds every
-                    // key away from the browser: the dialog could not be
-                    // dismissed with Escape *or* Alt-F4, Ctrl-T stopped opening
-                    // tabs, and the only way out was killing the process. With
-                    // the browser's own window as `transient-for` the dialog is
-                    // focusable and Escape closes it.
+                    // Passed because a dialog should have a parent, not because
+                    // it fixes anything: it was measured, and the dialog is just
+                    // as unusable with it as without. See this function's doc
+                    // comment for what actually happens and why. Leaving the
+                    // parent out as well would only add a second defect on top
+                    // of the one that matters.
                     let parent =
                         platform.inner().toplevel().and_then(|w| w.downcast::<gtk::Window>().ok());
                     op.run_dialog(parent.as_ref());
@@ -734,12 +733,8 @@ const FILE_PRINTER: &str = "Print to File";
 /// The active tab's webview and label, which four commands here all want first.
 async fn active(state: &Arc<AppState>) -> Result<(tauri::webview::Webview<tauri::Wry>, String)> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = webview(&app, &label)?;
     Ok((view, label))
 }
@@ -776,12 +771,8 @@ impl Toggle {
 
 pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = webview(&app, &label)?;
 
     #[cfg(target_os = "linux")]
@@ -822,12 +813,8 @@ pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
 
 pub async fn history(state: &Arc<AppState>, action: HistoryAction) -> Result<()> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = webview(&app, &label)?;
 
     match action {
@@ -858,12 +845,8 @@ pub async fn history(state: &Arc<AppState>, action: HistoryAction) -> Result<()>
 /// get a value back out of a webview. The result arrives as a JSON string.
 pub async fn eval(state: &Arc<AppState>, js: &str) -> Result<String> {
     let app = state.app_handle().context("the window is not up yet")?;
-    let label = state
-        .tabs
-        .read()
-        .await
-        .active_label()
-        .ok_or_else(|| anyhow!("there is no active tab"))?;
+    let label =
+        state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = webview(&app, &label)?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -913,12 +896,21 @@ mod tests {
             assert_eq!(t.resolve(true), from_true, "{raw} from on");
         }
         assert!(Toggle::parse("").is_none());
-        assert!(Toggle::parse("yes").is_none(), "an unknown spelling must be rejected, not guessed");
+        assert!(
+            Toggle::parse("yes").is_none(),
+            "an unknown spelling must be rejected, not guessed"
+        );
     }
 
     #[test]
     fn bare_hosts_become_https() {
         assert_eq!(resolve_input("github.com", SEARCH), "https://github.com");
+        // Our own chrome is navigable, not searchable: a blank tab is sent to
+        // `oma-chrome://localhost/start` by name.
+        assert_eq!(
+            resolve_input("oma-chrome://localhost/start", SEARCH),
+            "oma-chrome://localhost/start"
+        );
         assert_eq!(resolve_input("github.com/rust-lang", SEARCH), "https://github.com/rust-lang");
         assert_eq!(resolve_input("localhost:3000", SEARCH), "https://localhost:3000");
     }

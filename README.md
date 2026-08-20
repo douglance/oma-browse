@@ -121,32 +121,53 @@ the strip all belong to one window; `Ctrl-Shift-W` closes just the one you are i
 
 ## Driving it
 
-Every command is also an HTTP route on a loopback control plane, which is what a
-script or an agent should talk to. The port is ephemeral and logged at startup
-(`control plane up addr=127.0.0.1:…`); pin it with `[control] port`, or have it
-written to `$XDG_RUNTIME_DIR/oma-browse/port` with `port_file`.
+Type a command and it runs in the browser you were last looking at:
 
 ```sh
-curl "http://127.0.0.1:$PORT/cmd/tab/open?url=example.com"
-curl "http://127.0.0.1:$PORT/cmd/tab/list"
-curl "http://127.0.0.1:$PORT/cmd/page/screenshot?path=/tmp/shot.png"
-curl --get "http://127.0.0.1:$PORT/cmd/page/eval" --data-urlencode 'js=document.title'
+oma-browse tab open example.com    # opens a tab in the window you are using
+oma-browse tab list                # a table in a terminal, an envelope in a pipe
+oma-browse tab list --json | jq .
+oma-browse page screenshot
 ```
 
-> [!WARNING]
-> The control plane is bound to loopback and nothing else. It can read page
-> content and drive the browser, so it must never be reachable off-host.
+Each window listens on its own Unix socket in `$XDG_RUNTIME_DIR/oma-browse`, and
+`current.sock` follows whichever window has focus — so a bare command means "this
+one", and `--window <pid>` means a particular one. Nothing to discover, no port
+to pin: the CLI hands the window its argv, the window runs it, and you get the
+output and the exit code back. With no browser running, `tab open` and
+`window new` start one, and every command that needs no window (`--help`,
+`theme show`, `config init`) answers on the spot.
+
+The same commands are an HTTP API on that socket — the OpenAPI document and an
+MCP endpoint included — which is what a script or an agent should talk to:
+
+```sh
+S="$XDG_RUNTIME_DIR/oma-browse/current.sock"
+curl --unix-socket "$S" http://x/cmd/tab/open/example.com
+curl --unix-socket "$S" http://x/cmd/tab/list
+curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png
+curl --unix-socket "$S" --get http://x/cmd/page/eval --data-urlencode 'js=document.title'
+```
 
 ```sh
 oma-browse --llms          # the whole command graph, machine-readable
 oma-browse mcp add         # register it with an MCP client
-oma-browse theme show      # commands that need no window run in-process
 ```
 
-> [!TIP]
-> `oma-browse <command>` runs the same graph in a second process, which has no
-> browser in it — anything touching a tab answers *the window is not up yet*.
-> Reach a running browser over HTTP.
+For engine-level debugging there is no protocol to reimplement: WebKit ships a
+remote inspector, and it takes an address from the environment.
+
+```sh
+WEBKIT_INSPECTOR_SERVER=127.0.0.1:2999 oma-browse    # then attach a DevTools client
+```
+
+> [!NOTE]
+> A socket rather than a port, because this API drives the browser and reads the
+> pages you are logged in to: a filesystem permission decides who may connect,
+> where a loopback port is open to every process and every account on the
+> machine. The browser binds nothing at all on the network — its own chrome (the
+> palette, the tab strip, the start page) is served to its own webviews over an
+> `oma-chrome://` URI scheme handled inside the process.
 
 ## Theming
 
@@ -191,7 +212,7 @@ search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 [window]                    # width, height, decorations, title
 [engine]                    # javascript, devtools, user_agent, autoplay, webrtc,
                             # webgl, smooth_scrolling, font_size, cookies
-[control]                   # port, port_file
+[control]                   # socket
 [startup]                   # incognito, restore
 [history]                   # enabled, limit
 [downloads]                 # dir, notify

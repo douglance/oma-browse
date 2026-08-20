@@ -52,12 +52,7 @@ fn cache_path(key: &str) -> std::path::PathBuf {
 /// length and the modification time.
 fn stamp(path: &std::path::Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     Some(format!("{} {} {}", path.display(), meta.len(), mtime))
 }
 
@@ -125,8 +120,10 @@ pub fn backdrop_luminance() -> Option<f64> {
             let mut sum = 0.0;
             for jy in 0..SUB {
                 for jx in 0..SUB {
-                    let x = ((cx * SUB + jx) as u64 * (w - 1) as u64 / (cells_x * SUB) as u64) as u32;
-                    let y = ((cy * SUB + jy) as u64 * (h - 1) as u64 / (cells_y * SUB) as u64) as u32;
+                    let x =
+                        ((cx * SUB + jx) as u64 * (w - 1) as u64 / (cells_x * SUB) as u64) as u32;
+                    let y =
+                        ((cy * SUB + jy) as u64 * (h - 1) as u64 / (cells_y * SUB) as u64) as u32;
                     let p = image::GenericImageView::get_pixel(&image, x, y);
                     sum += crate::Rgb::new(p[0], p[1], p[2]).luminance();
                 }

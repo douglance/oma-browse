@@ -73,9 +73,9 @@ fn enable_database(context: &webkit2gtk::WebContext, incognito: bool) {
     let root = if incognito {
         std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
     } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })
     };
     let Some(dir) = root.map(|r| r.join("oma-browse").join("favicons")) else {
         tracing::warn!("no cache directory; favicons are off");
@@ -137,8 +137,7 @@ fn encode(surface: &gtk::cairo::Surface, max_px: i32) -> Option<String> {
 /// the binary, it encodes a few hundred bytes at a time, and a crate for it
 /// would be more lines of `Cargo.toml` churn than of code.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

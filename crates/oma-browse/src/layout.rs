@@ -212,7 +212,8 @@ pub fn install_keys<R: tauri::Runtime>(
                         let args = b.args.clone();
                         let (tool, quiet) = (b.tool.clone(), b.propagate);
                         runtime.spawn(async move {
-                            if let Some(message) = crate::dispatch::run(&catalog, &tool, args).await {
+                            if let Some(message) = crate::dispatch::run(&catalog, &tool, args).await
+                            {
                                 // A propagating chord fires on presses that were
                                 // meant for the page, so its failures are not
                                 // news: Escape on a window with no tab would
@@ -433,9 +434,14 @@ impl When {
 /// and `tab select` does the rest.
 const fn tab_at(keys: &'static [&'static str], args: &'static str) -> Binding {
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys, tool: "tab_select", args,
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys,
+        tool: "tab_select",
+        args,
+        when: When::Always,
+        propagate: false,
     }
 }
 
@@ -443,138 +449,233 @@ const BINDINGS: &[Binding] = &[
     // Ctrl-K, Ctrl-L and Ctrl-P all summon the palette: one is "command", one
     // is URL-bar muscle memory, and here they are the same thing.
     Binding {
-        ctrl: true, alt: false, shift: None,
+        ctrl: true,
+        alt: false,
+        shift: None,
         keys: &["k", "K", "l", "L"],
-        tool: "ui_palette", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        tool: "ui_palette",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     // Ctrl-P is the same summon, but Shift is excluded rather than ignored so
     // that Ctrl-Shift-P can reach `page print` below. Both letter cases stay
     // listed: Caps Lock reports `"P"` with Shift *up*.
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
         keys: &["p", "P"],
-        tool: "ui_palette", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        tool: "ui_palette",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["t", "T"], tool: "tab_open", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["t", "T"],
+        tool: "tab_open",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // A window is a second process, not a second window in this one; see
     // `window::spawn` for why. Shift is excluded so that a future Ctrl-Shift-N
     // -- incognito, everywhere else -- cannot be swallowed by this row.
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["n", "N"], tool: "window_new", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["n", "N"],
+        tool: "window_new",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // Ctrl-Shift-W closes the window; it must come *before* Ctrl-W, which would
     // otherwise close a single tab and swallow the chord.
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
-        keys: &["w", "W"], tool: "window_close", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
+        keys: &["w", "W"],
+        tool: "window_close",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["w", "W"], tool: "tab_close", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["w", "W"],
+        tool: "tab_close",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: None,
-        keys: &["r", "R"], tool: "nav_reload", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: None,
+        keys: &["r", "R"],
+        tool: "nav_reload",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: false, shift: None,
-        keys: &["F5"], tool: "nav_reload", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: false,
+        shift: None,
+        keys: &["F5"],
+        tool: "nav_reload",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // Ctrl-Shift-T reopens; it must come *before* the plain Ctrl-T entry, which
     // does not care about Shift and would otherwise swallow it.
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
-        keys: &["t", "T"], tool: "tab_reopen", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
+        keys: &["t", "T"],
+        tool: "tab_reopen",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // Find. Ctrl-F stages the palette rather than opening a find bar: the
     // palette already knows how to prompt for an argument from the schema, and
     // a second text box on screen would be a second thing to learn.
     Binding {
-        ctrl: true, alt: false, shift: None,
+        ctrl: true,
+        alt: false,
+        shift: None,
         keys: &["f", "F"],
-        tool: "ui_palette", args: r#"{"action":"show","stage":"find_text"}"#,
-        when: When::Always, propagate: false,
+        tool: "ui_palette",
+        args: r#"{"action":"show","stage":"find_text"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["g", "G"], tool: "find_next", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["g", "G"],
+        tool: "find_next",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
-        keys: &["g", "G"], tool: "find_previous", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
+        keys: &["g", "G"],
+        tool: "find_previous",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: false, shift: None,
-        keys: &["F3"], tool: "find_next", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: false,
+        shift: None,
+        keys: &["F3"],
+        tool: "find_next",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: None,
-        keys: &["d", "D"], tool: "bookmark_add", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: None,
+        keys: &["d", "D"],
+        tool: "bookmark_add",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // `equal` is the unshifted key people actually press for "zoom in"; `plus`
     // is what arrives once Shift is held, and the KP_ names are the numeric
     // keypad. Bind all of them, the way every other browser does.
     Binding {
-        ctrl: true, alt: false, shift: None,
+        ctrl: true,
+        alt: false,
+        shift: None,
         keys: &["plus", "equal", "KP_Add"],
-        tool: "page_zoom", args: r#"{"direction":"in"}"#,
-        when: When::Always, propagate: false,
+        tool: "page_zoom",
+        args: r#"{"direction":"in"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: None,
+        ctrl: true,
+        alt: false,
+        shift: None,
         keys: &["minus", "underscore", "KP_Subtract"],
-        tool: "page_zoom", args: r#"{"direction":"out"}"#,
-        when: When::Always, propagate: false,
+        tool: "page_zoom",
+        args: r#"{"direction":"out"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: None,
+        ctrl: true,
+        alt: false,
+        shift: None,
         keys: &["0", "KP_0"],
-        tool: "page_zoom", args: r#"{"direction":"reset"}"#,
-        when: When::Always, propagate: false,
+        tool: "page_zoom",
+        args: r#"{"direction":"reset"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
         keys: &["Tab", "ISO_Left_Tab"],
-        tool: "tab_cycle", args: r#"{"delta":1}"#,
-        when: When::Always, propagate: false,
+        tool: "tab_cycle",
+        args: r#"{"delta":1}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
         keys: &["Tab", "ISO_Left_Tab"],
-        tool: "tab_cycle", args: r#"{"delta":-1}"#,
-        when: When::Always, propagate: false,
+        tool: "tab_cycle",
+        args: r#"{"delta":-1}"#,
+        when: When::Always,
+        propagate: false,
     },
     // The other half of Ctrl-Tab's muscle memory. `Prior`/`Next` are the names
     // GDK reports on some layouts, and the KP_ pair is the keypad with NumLock
     // off, where these keys live for anyone using a compact keyboard.
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
         keys: &["Page_Down", "Next", "KP_Page_Down", "KP_Next"],
-        tool: "tab_cycle", args: r#"{"delta":1}"#,
-        when: When::Always, propagate: false,
+        tool: "tab_cycle",
+        args: r#"{"delta":1}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
         keys: &["Page_Up", "Prior", "KP_Page_Up", "KP_Prior"],
-        tool: "tab_cycle", args: r#"{"delta":-1}"#,
-        when: When::Always, propagate: false,
+        tool: "tab_cycle",
+        args: r#"{"delta":-1}"#,
+        when: When::Always,
+        propagate: false,
     },
     // Ctrl-1..Ctrl-8 count from the left; Ctrl-9 is the last tab however many
     // there are, which is what every other browser does with it. Shift is
@@ -590,24 +691,44 @@ const BINDINGS: &[Binding] = &[
     tab_at(&["8", "KP_8"], r#"{"index":8}"#),
     tab_at(&["9", "KP_9"], r#"{"index":-1}"#),
     Binding {
-        ctrl: false, alt: true, shift: None,
-        keys: &["Left"], tool: "nav_back", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: true,
+        shift: None,
+        keys: &["Left"],
+        tool: "nav_back",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: true, shift: None,
-        keys: &["Right"], tool: "nav_forward", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: true,
+        shift: None,
+        keys: &["Right"],
+        tool: "nav_forward",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: true, shift: None,
-        keys: &["Home", "KP_Home"], tool: "nav_home", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: true,
+        shift: None,
+        keys: &["Home", "KP_Home"],
+        tool: "nav_home",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: false, shift: None,
-        keys: &["F11"], tool: "window_fullscreen", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: false,
+        shift: None,
+        keys: &["F11"],
+        tool: "window_fullscreen",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     // Escape, twice. With the palette up it dismisses it and goes no further --
     // that is what the key was pressed for. With the palette down it stops a
@@ -615,33 +736,57 @@ const BINDINGS: &[Binding] = &[
     // modals, its autocomplete and its fullscreen video, and this handler runs
     // before any of them.
     Binding {
-        ctrl: false, alt: false, shift: None,
+        ctrl: false,
+        alt: false,
+        shift: None,
         keys: &["Escape"],
-        tool: "ui_palette", args: r#"{"action":"hide"}"#,
-        when: When::PaletteOpen, propagate: false,
+        tool: "ui_palette",
+        args: r#"{"action":"hide"}"#,
+        when: When::PaletteOpen,
+        propagate: false,
     },
     Binding {
-        ctrl: false, alt: false, shift: None,
-        keys: &["Escape"], tool: "nav_stop", args: "{}",
-        when: When::PaletteClosed, propagate: true,
+        ctrl: false,
+        alt: false,
+        shift: None,
+        keys: &["Escape"],
+        tool: "nav_stop",
+        args: "{}",
+        when: When::PaletteClosed,
+        propagate: true,
     },
     // Everything below reaches a command that already existed only in the
     // palette. Chrome's chord where Chrome has one, so the muscle memory
     // transfers; the two that Chrome has no answer for are noted.
     Binding {
-        ctrl: false, alt: false, shift: None,
-        keys: &["F12"], tool: "page_devtools", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        ctrl: false,
+        alt: false,
+        shift: None,
+        keys: &["F12"],
+        tool: "page_devtools",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
-        keys: &["i", "I"], tool: "page_devtools", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
+        keys: &["i", "I"],
+        tool: "page_devtools",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["u", "U"], tool: "page_source", args: r#"{"open":true}"#,
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["u", "U"],
+        tool: "page_source",
+        args: r#"{"open":true}"#,
+        when: When::Always,
+        propagate: false,
     },
     // Chrome prints on Ctrl-P. Here Ctrl-P is one of the three palette
     // summons and has been since before printing existed, so taking it would
@@ -651,26 +796,41 @@ const BINDINGS: &[Binding] = &[
     // downloads directory and says where -- deliberately not `--dialog`, which
     // wedges the window under this runtime; see `tabs::print`.
     Binding {
-        ctrl: true, alt: false, shift: Some(true),
-        keys: &["p", "P"], tool: "page_print", args: "{}",
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(true),
+        keys: &["p", "P"],
+        tool: "page_print",
+        args: "{}",
+        when: When::Always,
+        propagate: false,
     },
     // Chrome's Ctrl-J opens a downloads *page*; there is no such page here, and
     // the useful half of that gesture is "give me the thing I just downloaded".
     // Harmless on a fresh browser: `download open` answers `missing_id`, which
     // `dispatch::run` turns into a toast.
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["j", "J"], tool: "download_open", args: r#"{"index":1}"#,
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["j", "J"],
+        tool: "download_open",
+        args: r#"{"index":1}"#,
+        when: When::Always,
+        propagate: false,
     },
     // No Chrome or Firefox equivalent -- both bury muting in a tab context
     // menu. A tab that will not shut up is a daily problem and this is a
     // browser for people who would rather not reach for the mouse.
     Binding {
-        ctrl: true, alt: false, shift: Some(false),
-        keys: &["m", "M"], tool: "tab_mute", args: r#"{"action":"toggle"}"#,
-        when: When::Always, propagate: false,
+        ctrl: true,
+        alt: false,
+        shift: Some(false),
+        keys: &["m", "M"],
+        tool: "tab_mute",
+        args: r#"{"action":"toggle"}"#,
+        when: When::Always,
+        propagate: false,
     },
     // Link hints (`f`, `F`) are deliberately *not* here. A toplevel accelerator
     // on a bare letter fires wherever the caret is, so it would swallow the `f`
@@ -717,7 +877,9 @@ pub fn adopt_strip<R: tauri::Runtime>(strip: &Webview<R>, height: i32) -> Result
             let Some(overlay) =
                 vbox.children().into_iter().find_map(|c| c.downcast::<gtk::Overlay>().ok())
             else {
-                tracing::error!("no overlay; the strip would tile with the page, so leaving it out");
+                tracing::error!(
+                    "no overlay; the strip would tile with the page, so leaving it out"
+                );
                 return;
             };
 
@@ -760,7 +922,9 @@ pub fn adopt_tab<R: tauri::Runtime>(tab: &Webview<R>) -> Result<()> {
             .children()
             .into_iter()
             .filter_map(|c| c.downcast::<gtk::Overlay>().ok())
-            .filter_map(|o| o.children().into_iter().find(|c| c.widget_name() == CONTENT_STACK_NAME))
+            .filter_map(|o| {
+                o.children().into_iter().find(|c| c.widget_name() == CONTENT_STACK_NAME)
+            })
             .find_map(|c| c.downcast::<gtk::Box>().ok());
 
         match stack {
@@ -797,10 +961,7 @@ pub fn adopt_strip<R: tauri::Runtime>(_strip: &Webview<R>, _height: i32) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BINDINGS, When,
-        palette_size,
-    };
+    use super::{BINDINGS, When, palette_size};
 
     /// The card tracks the window between the bounds, and stays inside it
     /// outside them — a card clipped by the overlay loses its right-hand edge
@@ -851,9 +1012,7 @@ mod tests {
 
         let stock = super::bindings(&Config::default(), &catalog, &quiet);
         let bound_to = |list: &[super::Bound], key: &str, ctrl: bool, shift: bool| {
-            list.iter()
-                .find(|b| b.matches(ctrl, false, shift, key))
-                .map(|b| b.tool.clone())
+            list.iter().find(|b| b.matches(ctrl, false, shift, key)).map(|b| b.tool.clone())
         };
         assert_eq!(bound_to(&stock, "t", true, false).as_deref(), Some("tab_open"));
 
@@ -947,13 +1106,15 @@ mod tests {
     /// what the single unconditional binding used to cause.
     #[test]
     fn escape_is_bound_once_per_palette_state() {
-        let escape: Vec<_> =
-            BINDINGS.iter().filter(|b| b.keys.contains(&"Escape")).collect();
+        let escape: Vec<_> = BINDINGS.iter().filter(|b| b.keys.contains(&"Escape")).collect();
         assert_eq!(escape.len(), 2, "Escape needs one binding per palette state");
 
-        let open = escape.iter().find(|b| b.when == When::PaletteOpen).expect("no palette-open Escape");
-        let closed =
-            escape.iter().find(|b| b.when == When::PaletteClosed).expect("no palette-closed Escape");
+        let open =
+            escape.iter().find(|b| b.when == When::PaletteOpen).expect("no palette-open Escape");
+        let closed = escape
+            .iter()
+            .find(|b| b.when == When::PaletteClosed)
+            .expect("no palette-closed Escape");
 
         assert_eq!(open.tool, "ui_palette");
         assert!(!open.propagate, "the palette's own Escape is not the page's business");

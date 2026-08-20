@@ -135,8 +135,7 @@ pub fn primary_arg(def: &ToolDefinition) -> Option<(String, String, Option<Strin
         if ty == "boolean" {
             return None;
         }
-        let description =
-            spec.get("description").and_then(Value::as_str).map(str::to_string);
+        let description = spec.get("description").and_then(Value::as_str).map(str::to_string);
         Some((name.clone(), ty.to_string(), description))
     })
 }

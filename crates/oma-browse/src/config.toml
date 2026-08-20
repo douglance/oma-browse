@@ -105,12 +105,15 @@ cookies = "no-third-party"
 # --- the control plane -----------------------------------------------------
 
 [control]
-# The port the HTTP control plane listens on. 0 takes whatever is free, which
-# means reading the log to find it; a fixed port is what makes the browser
-# reachable by something that did not watch it start. Loopback either way.
-port = 0
-# Write the live port to $XDG_RUNTIME_DIR/oma-browse/port.
-port_file = true
+# Where this window's control socket goes. Empty is $XDG_RUNTIME_DIR/oma-browse,
+# holding one socket per window plus a current.sock pointing at the one you used
+# last -- which is what `oma-browse tab open <url>` talks to, and what
+# `curl --unix-socket` wants.
+socket = ""
+# Also answer commands on this loopback port; 0 is off. The socket above is the
+# way in for anything on this machine -- this is for tooling that cannot open a
+# Unix socket, and it is reachable by every process and every account on the box.
+remote_port = 0
 
 [startup]
 # Start every window incognito, as though --incognito were always passed.
