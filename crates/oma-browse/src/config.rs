@@ -22,11 +22,13 @@ use serde::{Deserialize, Serialize};
 
 /// Where the browser goes when it is not told otherwise.
 ///
-/// Empty, which `home_url` reads as the browser's own start page. That page is
-/// served from this process over loopback -- no DNS, no TLS, no network at all
-/// -- so a bare `oma-browse` paints as fast as the webview can start. A remote
-/// default would put a round trip in front of every launch.
-const DEFAULT_HOME: &str = "";
+/// Where the browser goes when it is not told otherwise.
+///
+/// A remote page does put a round trip in front of a bare launch, and the
+/// browser's own start page (`home = ""`) is served from this process with no
+/// DNS, no TLS and no network at all. This is a product decision rather than a
+/// performance one, and it is one line to change in the file.
+const DEFAULT_HOME: &str = "https://omarchy.org";
 
 /// The search engine a non-URL lands on. `{query}` is the URL-encoded input;
 /// without it the query is appended.
@@ -454,10 +456,44 @@ impl Config {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        match toml::from_str::<Config>(&raw) {
-            Ok(config) => config,
-            Err(e) => {
-                let problem = format!("{}: {}", path.display(), summarize(&e.to_string()));
+
+        // The happy path is strict: `deny_unknown_fields` is what turns a
+        // misspelled key from silence into a message.
+        if let Ok(config) = toml::from_str::<Config>(&raw) {
+            return config;
+        }
+
+        // It did not parse. Salvage what does rather than reverting the file
+        // wholesale -- one key the browser has since renamed should cost the
+        // user that key, not every setting they ever wrote.
+        let strict = toml::from_str::<Config>(&raw).unwrap_err().to_string();
+        let mut notes = Vec::new();
+        let salvaged = toml::from_str::<toml::Value>(&raw)
+            .ok()
+            .map(|mut value| {
+                migrate(&mut value, &mut notes);
+                prune_unknown(&mut value, &known_shape(), "", &mut notes);
+                value
+            })
+            .and_then(|value| value.try_into::<Config>().ok());
+
+        match salvaged {
+            Some(mut config) => {
+                let problem = format!("{}: {}", path.display(), notes.join("; "));
+                tracing::warn!(%problem, "config partially applied");
+                config.problem = Some(problem);
+                config
+            }
+            // Nothing could be recovered -- a syntax error, or a value of the
+            // wrong type. Say what that costs, because "using defaults" is
+            // otherwise indistinguishable from having no config file at all.
+            None => {
+                let problem = format!(
+                    "{}: {} -- every setting in the file was ignored and the browser is \
+                     running on defaults",
+                    path.display(),
+                    summarize(&strict)
+                );
                 tracing::warn!(%problem, "config ignored; using defaults");
                 Self { problem: Some(problem), ..Self::default() }
             }
@@ -515,6 +551,147 @@ impl Config {
         std::fs::write(&path, TEMPLATE)
             .with_context(|| format!("could not write {}", path.display()))?;
         Ok(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Salvaging a file the browser has since outgrown
+// ---------------------------------------------------------------------------
+
+/// Sections and keys that have moved, and where they went.
+///
+/// Renames are the browser's fault, not the user's, so an old spelling is
+/// *applied* and then reported -- the file keeps working while it is out of
+/// date, and the report says what to change. Dotted paths; a table on the left
+/// merges into the table on the right.
+const RENAMES: &[(&str, &str)] = &[
+    // Translucency was one half-wired `[window] opacity` before it became two
+    // deliberate settings; the page is the half it used to almost control.
+    ("window.opacity", "theme.veil"),
+    ("page", "theme"),
+    ("strip", "chrome.strip"),
+];
+
+/// Tables whose keys are the user's own words rather than ours, and so must
+/// never be pruned for being "unknown".
+const FREE_FORM: &[&str] = &["keys"];
+
+/// Move anything written under an old name to its new one.
+fn migrate(value: &mut toml::Value, notes: &mut Vec<String>) {
+    for (from, to) in RENAMES {
+        let Some(moved) = take_path(value, from) else { continue };
+        match merge_at(value, to, moved) {
+            true => notes.push(format!("`{from}` is now `{to}`, and was read as such")),
+            false => notes.push(format!(
+                "`{from}` is now `{to}`, which the file also sets -- `{to}` won"
+            )),
+        }
+    }
+}
+
+/// Remove a dotted path, returning what was there.
+fn take_path(value: &mut toml::Value, path: &str) -> Option<toml::Value> {
+    let (parent, last) = split_parent(value, path)?;
+    parent.remove(last)
+}
+
+/// Put a value at a dotted path, creating tables on the way. Merges when both
+/// sides are tables; refuses to overwrite an existing value, and says so by
+/// returning `false`, because a file that sets both spellings means the new one.
+fn merge_at(value: &mut toml::Value, path: &str, incoming: toml::Value) -> bool {
+    let mut cursor = value;
+    let mut parts = path.split('.').peekable();
+
+    while let Some(part) = parts.next() {
+        let table = match cursor.as_table_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        if parts.peek().is_some() {
+            cursor = table
+                .entry(part.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            continue;
+        }
+
+        return match (table.get_mut(part), incoming) {
+            // Two tables: fill in only the keys the new spelling does not have.
+            (Some(toml::Value::Table(existing)), toml::Value::Table(old)) => {
+                let mut clean = true;
+                for (k, v) in old {
+                    if existing.contains_key(&k) {
+                        clean = false;
+                    } else {
+                        existing.insert(k, v);
+                    }
+                }
+                clean
+            }
+            (Some(_), _) => false,
+            (None, incoming) => {
+                table.insert(part.to_string(), incoming);
+                true
+            }
+        };
+    }
+    false
+}
+
+fn split_parent<'a>(
+    value: &'a mut toml::Value,
+    path: &'a str,
+) -> Option<(&'a mut toml::map::Map<String, toml::Value>, &'a str)> {
+    let (head, last) = match path.rsplit_once('.') {
+        Some((head, last)) => (Some(head), last),
+        None => (None, path),
+    };
+    let mut cursor = value;
+    if let Some(head) = head {
+        for part in head.split('.') {
+            cursor = cursor.as_table_mut()?.get_mut(part)?;
+        }
+    }
+    Some((cursor.as_table_mut()?, last))
+}
+
+/// What a valid config looks like, as a tree of keys: the defaults, serialised.
+///
+/// Derived rather than listed, so it cannot drift from the struct.
+fn known_shape() -> toml::Value {
+    toml::Value::try_from(Config::default()).unwrap_or(toml::Value::Table(toml::map::Map::new()))
+}
+
+/// Drop keys the config does not have, noting each one.
+///
+/// This is what makes an unknown key cost only itself. The strict parse has
+/// already failed by the time this runs, so the choice here is between losing
+/// one key and losing the file.
+fn prune_unknown(
+    value: &mut toml::Value,
+    shape: &toml::Value,
+    path: &str,
+    notes: &mut Vec<String>,
+) {
+    let (Some(table), Some(known)) = (value.as_table_mut(), shape.as_table()) else { return };
+
+    table.retain(|key, _| {
+        if known.contains_key(key) {
+            return true;
+        }
+        let full =
+            if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+        notes.push(format!("`{full}` is not a setting, and was ignored"));
+        false
+    });
+
+    for (key, child) in table.iter_mut() {
+        if FREE_FORM.contains(&key.as_str()) {
+            continue;
+        }
+        let Some(known_child) = known.get(key.as_str()) else { continue };
+        let full =
+            if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+        prune_unknown(child, known_child, &full, notes);
     }
 }
 
@@ -595,6 +772,75 @@ mod tests {
         assert_eq!(over.veil.fixed(), Some(1.0));
 
         assert!(toml::from_str::<Holder>(r#"veil = "mostly""#).is_err());
+    }
+
+    /// Load a file's worth of text the way `load` does, without touching the
+    /// user's real config path.
+    fn salvage(raw: &str) -> Config {
+        if let Ok(config) = toml::from_str::<Config>(raw) {
+            return config;
+        }
+        let mut notes = Vec::new();
+        let mut value = toml::from_str::<toml::Value>(raw).expect("valid TOML syntax");
+        migrate(&mut value, &mut notes);
+        prune_unknown(&mut value, &known_shape(), "", &mut notes);
+        let mut config: Config = value.try_into().expect("salvageable");
+        config.problem = Some(notes.join("; "));
+        config
+    }
+
+    /// A section this browser renamed keeps working, and says it has moved.
+    ///
+    /// The regression this exists for: `[page]` became `[theme]` and every
+    /// setting in every existing config file stopped being read -- silently,
+    /// because the loader fell back to defaults wholesale.
+    #[test]
+    fn a_renamed_section_is_still_read() {
+        let config = salvage("home = \"https://example.com\"\n[page]\nrecolor = false\n");
+
+        assert!(!config.theme.recolor, "the old spelling still sets the setting");
+        assert_eq!(config.home, "https://example.com", "and the rest of the file survives");
+
+        let problem = config.problem.unwrap();
+        assert!(problem.contains("`page` is now `theme`"), "names the move: {problem}");
+    }
+
+    #[test]
+    fn a_renamed_section_that_moved_house_lands_in_the_right_table() {
+        let config = salvage("[strip]\nheight = 44\nenabled = false\n");
+        assert_eq!(config.chrome.strip.height, 44);
+        assert!(!config.chrome.strip.enabled);
+    }
+
+    #[test]
+    fn the_new_spelling_wins_when_a_file_has_both() {
+        let config = salvage("[page]\nrecolor = false\n[theme]\nrecolor = true\n");
+        assert!(config.theme.recolor, "the current spelling is the deliberate one");
+        assert!(config.problem.unwrap().contains("won"));
+    }
+
+    /// One unknown key costs one unknown key.
+    #[test]
+    fn an_unknown_key_does_not_take_the_file_with_it() {
+        let config = salvage("home = \"https://example.com\"\nnonsense = 1\n[theme]\nrecolor = false\n");
+
+        assert_eq!(config.home, "https://example.com");
+        assert!(!config.theme.recolor, "settings after the bad key still apply");
+        assert!(config.problem.unwrap().contains("`nonsense` is not a setting"));
+    }
+
+    #[test]
+    fn an_unknown_key_is_reported_with_its_full_path() {
+        let config = salvage("[chrome.strip]\nheight = 30\nwidth = 9\n");
+        assert_eq!(config.chrome.strip.height, 30);
+        assert!(config.problem.unwrap().contains("`chrome.strip.width`"));
+    }
+
+    /// `[keys]` is the user's own vocabulary, so nothing in it is "unknown".
+    #[test]
+    fn keys_are_never_pruned_for_being_unrecognised() {
+        let config = salvage("nonsense = 1\n[keys]\n\"ctrl+j\" = \"tab_cycle\"\n");
+        assert_eq!(config.keys.get("ctrl+j").map(String::as_str), Some("tab_cycle"));
     }
 
     #[test]

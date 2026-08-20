@@ -461,13 +461,17 @@ async fn start(cx: &Cx) -> Result {
             <head>
                 <meta charset="utf-8">
                 <title>"New tab"</title>
+                // Declared rather than left to `/favicon.ico`, so the tab strip
+                // has an icon for this page the moment it loads instead of the
+                // no-favicon placeholder.
+                <link rel="icon" href="/icon.png">
                 <style>(vars)</style>
                 <style>(mine)</style>
                 <style>(sheet)</style>
             </head>
             <body>
                 <main>
-                    <div class="mark">(MARK)</div>
+                    <img class="mark" src="/mark.png" alt="" width="240" height="201">
                     <h1>"oma-browse"</h1>
                     <p class="sub">"Wearing " <strong>(theme_name)</strong></p>
                     <ul class="swatches">
@@ -485,13 +489,6 @@ async fn start(cx: &Cx) -> Result {
     }
 }
 
-/// The browser's mark: `nf-md-web_box`.
-///
-/// A Nerd Font glyph rather than an SVG or a bundled image, for the same reason
-/// the tab strip uses one -- it inherits the theme's accent colour by being
-/// text, so it re-dresses with everything else and costs no asset.
-const MARK: &str = "\u{f0f94}";
-
 const START_CSS: &str = r#"
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--oma-fg);
@@ -499,11 +496,18 @@ html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--
 main { height: 100%; display: flex; flex-direction: column; align-items: center;
   justify-content: center; gap: var(--oma-space-2); }
 .mark {
-  /* Nerd Font by name, not through `--oma-font-mono`: that token is whatever
-     fontconfig calls `monospace`, which is not guaranteed to be patched -- and
-     an unpatched font renders the mark as tofu. Same chain as the tab strip. */
-  font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", var(--oma-font-mono), monospace;
-  font-size: 4.5rem; line-height: 1; color: var(--oma-accent);
+  /* Half its intrinsic width, so it is sharp on a 2x display without shipping
+     two files. `width`/`height` are on the element as well: the box is then
+     known before the image arrives and the page does not jump when it does. */
+  width: 240px; height: auto; display: block;
+  /* Nothing around it: the file is trimmed tight to the art, and the column's
+     own gap above the wordmark is cancelled so the mark sits on the title
+     rather than floating above it. */
+  margin: 0 0 calc(-1 * var(--oma-space-2));
+  /* Sat *in* the page rather than on top of it. The art is a solid green at
+     full strength and shouts over a themed background; letting the page through
+     it makes it part of the surface, and it still reads at a glance. */
+  opacity: 0.72;
 }
 h1 { margin: 0; font-size: 2.5rem; font-weight: 600; color: var(--oma-accent); letter-spacing: -0.02em; }
 .sub { margin: 0; color: var(--oma-fg); }
@@ -922,21 +926,6 @@ kbd {
 
 #[cfg(test)]
 mod tests {
-    /// The mark has to be a glyph a patched font actually carries, or the start
-    /// page opens on a tofu box. `nf-md-web_box` lives in plane 15, where Nerd
-    /// Fonts put the Material Design set -- not the BMP private use area the
-    /// strip's older glyphs come from.
-    #[test]
-    fn the_mark_is_a_private_use_glyph() {
-        let c = super::MARK.chars().next().expect("a glyph");
-        assert_eq!(super::MARK.chars().count(), 1, "one codepoint, not a sequence");
-        assert!(
-            ('\u{e000}'..='\u{f8ff}').contains(&c) || ('\u{f0000}'..='\u{ffffd}').contains(&c),
-            "{:?} is outside the private use areas",
-            super::MARK
-        );
-    }
-
     /// The palette, the CLI and MCP must all see the same commands.
     ///
     /// This is the test that makes the registry worth having: add a command to

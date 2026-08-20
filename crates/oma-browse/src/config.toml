@@ -8,8 +8,10 @@
 
 # The page a bare `oma-browse` opens, and where Alt-Home goes.
 # Anything the palette accepts works here: a URL, a bare host, or a search.
-# Empty means the browser's own start page.
-home = ""
+# Empty means the browser's own start page, which is served from the browser
+# itself -- no DNS, no TLS, no network -- so it paints as fast as the webview
+# can start.
+home = "https://omarchy.org"
 
 # Where anything that is not a URL gets searched. `{query}` is url-encoded; a
 # template without it gets the terms appended.
