@@ -76,7 +76,6 @@ fn publish(state: &Arc<AppState>, label: &str, loading: bool, fraction: f64) {
     let state = state.clone();
     let label = label.to_string();
     state.runtime().spawn(async move {
-        tracing::info!(loading, fraction, tab = %label, "PROBE");
         if !state.tabs.write().await.set_progress(&label, loading.then_some(fraction)) {
             return;
         }
