@@ -3024,7 +3024,12 @@ fn page_group(state: Arc<AppState>) -> Cli {
          the site's layout is left to fight with; `nav reload` puts the page \
          back.",
     )
-    .mcp(read_only())
+    // Deliberately *not* `read_only()`, despite reading like the other three
+    // commands that extract the article. `page markdown` and `page text` hand
+    // the prose back and leave the page alone; this one rewrites the document
+    // in the tab -- it removes the site's stylesheets and replaces the body,
+    // and only a reload undoes it. An agent restricted to read-only tools must
+    // not be able to change what the person is looking at.
     .done();
 
     Cli::create("page")
