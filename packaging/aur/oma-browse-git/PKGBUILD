@@ -49,7 +49,9 @@ build() {
   # `target/release/assets`, and without it the palette renders blank -- which
   # is a runtime symptom with no build-time signal, so it is checked here.
   cargo install topcoat-cli --locked --root "$srcdir/tools"
-  PATH="$srcdir/tools/bin:$PATH" topcoat asset bundle -p oma-browse
+  # `-r` or it bundles the debug binary into target/debug/assets and package()
+  # finds nothing to install.
+  PATH="$srcdir/tools/bin:$PATH" topcoat asset bundle -p oma-browse -r
   [ -f target/release/assets/manifest.toml ] || {
     echo "topcoat produced no manifest -- the palette would ship blank"; return 1; }
 }

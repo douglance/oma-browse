@@ -43,9 +43,13 @@ jobs:
 
       # Writes `target/release/assets/`: manifest.toml plus the hashed runtime.
       # Without it the palette renders blank, so it is checked, not assumed.
+      #
+      # `-r` is load-bearing: the bundle is extracted from a built binary, and
+      # without it topcoat builds and unpacks the *debug* one into
+      # target/debug/assets, leaving the release tree with no bundle at all.
       - name: Bundle the client runtime
         run: |
-          topcoat asset bundle -p oma-browse
+          topcoat asset bundle -p oma-browse -r
           test -f target/release/assets/manifest.toml || {
             echo "topcoat produced no manifest -- the palette would ship blank"; exit 1; }
 

@@ -74,7 +74,7 @@ git clone https://github.com/douglance/oma-browse
 cd oma-browse
 cargo build --release
 cargo install topcoat-cli               # once
-topcoat asset bundle -p oma-browse      # not optional — see below
+topcoat asset bundle -p oma-browse -r   # not optional — see below
 ```
 
 The bundle is looked for beside the binary first and in
@@ -309,7 +309,7 @@ then `report (1).pdf`. `[downloads] dir` overrides it.
 
 | symptom | cause |
 |---|---|
-| the palette is blank | the asset bundle is missing — run `topcoat asset bundle -p oma-browse` |
+| the palette is blank | the asset bundle is missing — run `topcoat asset bundle -p oma-browse` (add `-r` if you built with `--release`) |
 | media sites load blank | no GStreamer audio sink — install **gst-plugins-good** |
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
