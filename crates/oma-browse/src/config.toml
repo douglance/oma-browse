@@ -101,6 +101,11 @@ smooth_scrolling = true
 font_size = 16
 # "always", "never", or "no-third-party".
 cookies = "no-third-party"
+# Hosts whose certificate is accepted however broken it is -- a self-signed
+# staging box, or mkcert on localhost. This is the whole of the check being
+# turned off for those names, so put nothing here you did not issue the
+# certificate for. Everything else gets an interstitial and `nav trust`.
+trust = []
 
 # --- the control plane -----------------------------------------------------
 

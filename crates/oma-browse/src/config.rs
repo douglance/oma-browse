@@ -232,6 +232,13 @@ pub struct Engine {
     pub font_size: u32,
     /// `always`, `never`, or `no-third-party`.
     pub cookies: String,
+    /// Hosts whose certificate is accepted whatever is wrong with it.
+    ///
+    /// For development, where a self-signed certificate is the point and being
+    /// asked about it every morning is friction with no security in it. Empty
+    /// by default, and it should stay empty for anything you did not issue the
+    /// certificate for yourself.
+    pub trust: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -395,6 +402,9 @@ impl Default for Engine {
             smooth_scrolling: true,
             font_size: 16,
             cookies: "no-third-party".to_string(),
+            // Not a WebKit default: WebKit trusts nothing extra, and so does
+            // this until someone names a host.
+            trust: Vec::new(),
         }
     }
 }

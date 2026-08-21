@@ -76,6 +76,26 @@ pub struct AppState {
     /// callbacks arrive on the GTK main thread with no runtime under them, and
     /// an async lock cannot be taken there.
     pub downloads: std::sync::Mutex<crate::downloads::Downloads>,
+    /// Which sites may use the camera, the microphone, your location.
+    ///
+    /// A `std::sync::Mutex` for the same reason as `downloads`: WebKit asks on
+    /// the GTK main thread, with no runtime under it, and it wants the answer
+    /// there and then.
+    pub permissions: std::sync::Mutex<crate::permissions::Permissions>,
+    /// Requests waiting on a person, oldest first.
+    ///
+    /// Only what a command needs to word the question and name the answer; the
+    /// WebKit request object itself cannot leave the main thread and stays in
+    /// [`crate::policy`].
+    pub asked: std::sync::Mutex<std::collections::VecDeque<crate::permissions::Pending>>,
+    /// The last page refused for its certificate, for the interstitial to
+    /// explain and for `nav trust` to act on.
+    pub tls: std::sync::Mutex<Option<crate::policy::Refused>>,
+    /// The site currently asking for a username and a password.
+    pub login: std::sync::Mutex<Option<crate::policy::Challenge>>,
+    /// Logins given this session, by host and port. Memory only -- see
+    /// [`crate::policy::remember_login`].
+    pub logins: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
     /// Set once, after Tauri's `setup` runs. Everything that touches a webview
     /// goes through here, so commands work identically from the GUI, the CLI
     /// and MCP.
@@ -122,6 +142,11 @@ impl AppState {
             history: RwLock::new(crate::history::History::load_with(config.history.limit)),
             bookmarks: RwLock::new(crate::bookmarks::Bookmarks::load()),
             downloads: std::sync::Mutex::new(crate::downloads::Downloads::load()),
+            permissions: std::sync::Mutex::new(crate::permissions::Permissions::load()),
+            asked: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tls: std::sync::Mutex::new(None),
+            login: std::sync::Mutex::new(None),
+            logins: std::sync::Mutex::new(std::collections::HashMap::new()),
             incognito: std::sync::atomic::AtomicBool::new(false),
             download_hook: std::sync::atomic::AtomicBool::new(false),
             stage: std::sync::Mutex::new(None),
@@ -157,6 +182,7 @@ impl AppState {
         *state.history.get_mut() = crate::history::History::default();
         *state.bookmarks.get_mut() = crate::bookmarks::Bookmarks::default();
         *state.downloads.get_mut().unwrap() = crate::downloads::Downloads::default();
+        *state.permissions.get_mut().unwrap() = crate::permissions::Permissions::default();
         state
     }
 

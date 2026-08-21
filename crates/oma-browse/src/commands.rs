@@ -66,6 +66,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("find", "Find"),
     ("share", "Share"),
     ("download", "Downloads"),
+    ("permission", "Permissions"),
     ("window", "Window"),
 ];
 
@@ -85,6 +86,7 @@ pub fn command_graph(state: Arc<AppState>) -> Cli {
         .group(download_group(state.clone()))
         .group(share_group(state.clone()))
         .group(config_group(state.clone()))
+        .group(permission_group(state.clone()))
         .group(window_group(state))
 }
 
@@ -457,6 +459,307 @@ fn find_group(state: Arc<AppState>) -> Cli {
         group = group.command(name, cmd);
     }
     group
+}
+
+// ---------------------------------------------------------------------------
+// permission
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct Decided {
+    origin: String,
+    kinds: Vec<String>,
+    allowed: bool,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct PermissionForgotten {
+    origin: String,
+    /// How many decisions went. Zero is not an error: forgetting something you
+    /// never decided is the state you asked for.
+    forgotten: usize,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct GrantList {
+    entries: Vec<GrantRow>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct GrantRow {
+    origin: String,
+    kind: String,
+    allowed: bool,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct PermissionArgs {
+    /// The site, as `https://host[:port]`.
+    origin: Option<String>,
+    /// What it may do: camera, microphone, screen-share, geolocation,
+    /// notifications, device-info, protected-media.
+    kind: Option<String>,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct DecideArgs {
+    /// `allow` or `deny`.
+    verdict: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct DecideOptions {
+    /// Answer this once without writing the decision down.
+    once: bool,
+}
+
+/// Turn what someone typed into the origin they meant.
+///
+/// `https://example.com/some/page` is unambiguous: it has a scheme, and the
+/// path is not part of an origin. A bare `example.com` is not, and guessing
+/// `https://` outright is wrong often enough to matter -- a dev server is
+/// `http://localhost:3000`, and `permission forget localhost:3000` that
+/// silently forgets nothing because it went looking for the https one is a
+/// command that lies about having worked.
+///
+/// So a bare host is resolved against what has actually been decided: exactly
+/// one match wins, several are reported rather than picked between, and none
+/// falls back to `https://`, which is right for pre-authorising a site you have
+/// not visited yet.
+fn resolve_origin(known: &[String], raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("which site? Give an origin, like https://example.com".to_string());
+    }
+    if let Some(origin) = crate::permissions::origin_of(raw) {
+        return Ok(origin);
+    }
+
+    // Not a URL, so it is a host and maybe a port. Whose is it?
+    let matches: Vec<&String> = known
+        .iter()
+        .filter(|origin| origin.split_once("//").is_some_and(|(_, rest)| rest == raw))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => crate::permissions::origin_of(&format!("https://{raw}"))
+            .ok_or_else(|| format!("{raw:?} is not a site; try https://{raw}")),
+        several => Err(format!(
+            "{raw} is ambiguous -- did you mean {}?",
+            several.iter().map(|o| o.as_str()).collect::<Vec<_>>().join(" or ")
+        )),
+    }
+}
+
+/// The origins something has already been decided about.
+fn known_origins(state: &Arc<AppState>) -> Vec<String> {
+    state
+        .permissions
+        .lock()
+        .map(|store| store.entries().iter().map(|g| g.origin.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn permission_group(state: Arc<AppState>) -> Cli {
+    /// Both `allow` and `deny` are the same command with the verdict flipped.
+    fn set_one(state: Arc<AppState>, allow: bool) -> CommandDef {
+        let verb = if allow { "allow" } else { "deny" };
+        CommandDef::typed::<PermissionArgs, NoOptions, (), Decided, _, _>(
+            verb,
+            move |ctx: TypedContext<PermissionArgs, NoOptions, ()>| {
+                let state = state.clone();
+                async move {
+                    let known = known_origins(&state);
+                    let origin = match resolve_origin(
+                        &known,
+                        ctx.args.origin.as_deref().unwrap_or_default(),
+                    ) {
+                        Ok(origin) => origin,
+                        Err(e) => return TypedResult::error("usage", e),
+                    };
+                    let Some(kind) =
+                        ctx.args.kind.as_deref().and_then(crate::permissions::Kind::parse)
+                    else {
+                        return TypedResult::error(
+                            "usage",
+                            format!("expected one of {}", kind_names()),
+                        );
+                    };
+                    let Ok(mut store) = state.permissions.lock() else {
+                        return TypedResult::error(
+                            "state",
+                            "the permission store is wedged".to_string(),
+                        );
+                    };
+                    store.set(&origin, kind, allow, crate::history::now());
+                    TypedResult::ok(Decided {
+                        origin,
+                        kinds: vec![kind.as_str().to_string()],
+                        allowed: allow,
+                    })
+                }
+            },
+        )
+        .description(if allow {
+            "Let a site use your camera, microphone, location or screen"
+        } else {
+            "Refuse a site the camera, microphone, location or screen"
+        })
+        .done()
+    }
+
+    let allow = set_one(state.clone(), true);
+    let deny = set_one(state.clone(), false);
+
+    let s = state.clone();
+    let list = CommandDef::typed::<NoArgs, NoOptions, (), GrantList, _, _>(
+        "list",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Ok(store) = state.permissions.lock() else {
+                    return TypedResult::error(
+                        "state",
+                        "the permission store is wedged".to_string(),
+                    );
+                };
+                TypedResult::ok(GrantList {
+                    entries: store
+                        .entries()
+                        .iter()
+                        .map(|g| GrantRow {
+                            origin: g.origin.clone(),
+                            kind: g.kind.as_str().to_string(),
+                            allowed: g.allow,
+                        })
+                        .collect(),
+                })
+            }
+        },
+    )
+    .description("What each site has been allowed or refused")
+    .done();
+
+    let s = state.clone();
+    let forget = CommandDef::typed::<PermissionArgs, NoOptions, (), PermissionForgotten, _, _>(
+        "forget",
+        move |ctx: TypedContext<PermissionArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let known = known_origins(&state);
+                let origin =
+                    match resolve_origin(&known, ctx.args.origin.as_deref().unwrap_or_default()) {
+                        Ok(origin) => origin,
+                        Err(e) => return TypedResult::error("usage", e),
+                    };
+                // No kind means the whole site, which is what "forget about
+                // them" means when you say it out loud.
+                let kind = match ctx.args.kind.as_deref() {
+                    None => None,
+                    Some(raw) => match crate::permissions::Kind::parse(raw) {
+                        Some(kind) => Some(kind),
+                        None => {
+                            return TypedResult::error(
+                                "usage",
+                                format!("expected one of {}", kind_names()),
+                            );
+                        }
+                    },
+                };
+                let Ok(mut store) = state.permissions.lock() else {
+                    return TypedResult::error(
+                        "state",
+                        "the permission store is wedged".to_string(),
+                    );
+                };
+                let forgotten = store.forget(&origin, kind);
+                TypedResult::ok(PermissionForgotten { origin, forgotten })
+            }
+        },
+    )
+    .description("Un-decide: the site will be asked about again")
+    .destructive(true)
+    .done();
+
+    let s = state;
+    let decide =
+        CommandDef::typed::<DecideArgs, DecideOptions, (), Decided, _, _>(
+            "decide",
+            move |ctx: TypedContext<DecideArgs, DecideOptions, ()>| {
+                let state = s.clone();
+                async move {
+                    decide_pending(&state, ctx.args.verdict.as_deref(), ctx.options.once).await
+                }
+            },
+        )
+        .description("Answer the site that is waiting on you")
+        .done();
+
+    Cli::create("permission")
+        .description("What each site may do")
+        .command("allow", allow)
+        .command("deny", deny)
+        .command("list", list)
+        .command("forget", forget)
+        .command("decide", decide)
+}
+
+fn kind_names() -> String {
+    crate::permissions::Kind::ALL.map(|k| k.as_str()).join(", ")
+}
+
+/// Answer whatever is at the head of the queue.
+///
+/// With no verdict this returns a *usage* error rather than a failure, and that
+/// is the whole mechanism behind the prompt: the palette treats a usage error as
+/// "ask for this argument" and shows the message as the question (see
+/// `ui::wants_argument`). So the same command both raises the question and takes
+/// the answer, and there is no second code path for the GUI.
+async fn decide_pending(
+    state: &Arc<AppState>,
+    verdict: Option<&str>,
+    once: bool,
+) -> TypedResult<Decided> {
+    let pending = match state.asked.lock() {
+        Ok(queue) => queue.front().cloned(),
+        Err(_) => return TypedResult::error("state", "the permission queue is wedged".to_string()),
+    };
+    let Some(pending) = pending else {
+        return TypedResult::error("state", "nothing is waiting on a decision".to_string());
+    };
+
+    let allow = match verdict.map(|v| v.trim().to_ascii_lowercase()) {
+        None => return TypedResult::error("usage", pending.question()),
+        Some(v) if ["allow", "yes", "y", "ok"].contains(&v.as_str()) => true,
+        Some(v) if ["deny", "no", "n"].contains(&v.as_str()) => false,
+        // Also a usage error, so a typo re-asks rather than dropping the
+        // question on the floor with the site still waiting.
+        Some(_) => {
+            return TypedResult::error(
+                "usage",
+                format!("{} -- type allow or deny", pending.question()),
+            );
+        }
+    };
+
+    if !once && let Ok(mut store) = state.permissions.lock() {
+        let now = crate::history::now();
+        for kind in &pending.kinds {
+            store.set(&pending.origin, *kind, allow, now);
+        }
+    }
+    if let Ok(mut queue) = state.asked.lock() {
+        queue.retain(|p| p.id != pending.id);
+    }
+    match crate::policy::settle(state, pending.id, allow) {
+        Ok(()) => TypedResult::ok(Decided {
+            origin: pending.origin,
+            kinds: pending.kinds.iter().map(|k| k.as_str().to_string()).collect(),
+            allowed: allow,
+        }),
+        Err(e) => TypedResult::error("webview", format!("{e:#}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1306,84 @@ struct Acted {
     ok: bool,
 }
 
+#[derive(JsonSchema, Serialize)]
+struct Trusted {
+    host: String,
+    /// The page that was refused, now reloading.
+    url: String,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct TrustArgs {
+    /// The host to trust. Defaults to the one that was just refused.
+    host: Option<String>,
+}
+
+/// Trust the certificate of a host that was refused, and go back to the page.
+///
+/// Defaults to the refusal that is on screen, the way `bookmark add` defaults
+/// to the page you are looking at -- typing a hostname you have just been shown
+/// is work the browser can do for you, and mistyping it here would trust the
+/// wrong name.
+async fn trust_certificate(state: &Arc<AppState>, host: Option<String>) -> TypedResult<Trusted> {
+    let refused = state.tls.lock().ok().and_then(|slot| slot.clone());
+    let host = match host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()) {
+        Some(host) => host,
+        None => match refused.as_ref() {
+            Some(refused) => refused.host.clone(),
+            None => {
+                return TypedResult::error(
+                    "usage",
+                    "no certificate has been refused, so there is nothing to trust; \
+                     name a host to trust it anyway"
+                        .to_string(),
+                );
+            }
+        },
+    };
+
+    if let Err(e) = crate::policy::trust_host(state, &host) {
+        return TypedResult::error("webview", format!("{e:#}"));
+    }
+
+    // Only reload if this is the page that was refused; trusting some other
+    // host should not navigate the tab you are looking at.
+    let url = match refused.filter(|r| r.host == host) {
+        Some(refused) => {
+            if let Err(e) = crate::tabs::navigate(state, &refused.uri).await {
+                return TypedResult::error("webview", format!("{e:#}"));
+            }
+            refused.uri
+        }
+        None => String::new(),
+    };
+    TypedResult::ok(Trusted { host, url })
+}
+
+#[derive(JsonSchema, Serialize)]
+struct LoggedIn {
+    host: String,
+    user: String,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct LoginArgs {
+    /// The username.
+    user: Option<String>,
+    /// The password.
+    password: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct LoginOptions {
+    /// The username.
+    user: Option<String>,
+    /// The password. As an option so it can come from a variable rather than
+    /// the shell history.
+    password: Option<String>,
+}
+
 fn nav_group(state: Arc<AppState>) -> Cli {
     let s = state.clone();
     let go = CommandDef::typed::<GoArgs, GoOptions, (), Navigated, _, _>(
@@ -1046,10 +1427,70 @@ fn nav_group(state: Arc<AppState>) -> Cli {
     .description("Send the active tab to the start page")
     .done();
 
+    let s = state.clone();
+    let trust = CommandDef::typed::<TrustArgs, NoOptions, (), Trusted, _, _>(
+        "trust",
+        move |ctx: TypedContext<TrustArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move { trust_certificate(&state, ctx.args.host).await }
+        },
+    )
+    .description("Accept the certificate of the host that was just refused, and reload")
+    // Not destructive -- nothing is lost -- but it is the one command here that
+    // makes the browser less careful, and the flag is what puts it behind
+    // `call_write_tool` for an agent rather than in the read-only set.
+    .destructive(true)
+    .done();
+
+    let s = state.clone();
+    let login = CommandDef::typed::<LoginArgs, LoginOptions, (), LoggedIn, _, _>(
+        "login",
+        move |ctx: TypedContext<LoginArgs, LoginOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let user = ctx.options.user.or(ctx.args.user).unwrap_or_default();
+                let password = ctx.options.password.or(ctx.args.password).unwrap_or_default();
+                if user.is_empty() {
+                    return TypedResult::error("usage", "which user?".to_string());
+                }
+                let Some(challenge) = state.login.lock().ok().and_then(|slot| slot.clone()) else {
+                    return TypedResult::error(
+                        "state",
+                        "nothing is asking for a login".to_string(),
+                    );
+                };
+
+                // Keep it, then load the page again. The credential is *not*
+                // handed to the request that is waiting: that request belongs
+                // to a load this tab already navigated away from to show the
+                // interstitial, so answering it would satisfy a connection
+                // nobody is watching and leave the page where it is. The fresh
+                // load raises its own challenge, and that one is answered from
+                // here without anybody being asked twice.
+                crate::policy::remember_login(&state, &challenge.key(), &user, &password);
+                if let Err(e) = crate::policy::drop_challenge(&state) {
+                    tracing::debug!(error = %e, "the old challenge was already gone");
+                }
+                if let Ok(mut slot) = state.login.lock() {
+                    *slot = None;
+                }
+                if let Err(e) = crate::tabs::navigate(&state, &challenge.uri).await {
+                    return TypedResult::error("webview", format!("{e:#}"));
+                }
+                TypedResult::ok(LoggedIn { host: challenge.host, user })
+            }
+        },
+    )
+    .description("Answer a site asking for a username and a password")
+    .destructive(true)
+    .done();
+
     let mut group = Cli::create("nav")
         .description("Move the active tab around")
         .command("go", go)
-        .command("home", home);
+        .command("home", home)
+        .command("trust", trust)
+        .command("login", login);
 
     for (name, action, blurb) in [
         ("back", crate::tabs::HistoryAction::Back, "Go back in history"),
@@ -1917,4 +2358,48 @@ struct RecolorState {
 #[derive(JsonSchema, Serialize)]
 struct CssDump {
     css: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_url_is_reduced_to_its_origin() {
+        let known: Vec<String> = vec![];
+        assert_eq!(
+            resolve_origin(&known, "https://example.com/some/page?q=1").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn a_bare_host_picks_the_one_you_have_decided_about() {
+        // The bug this exists for: `permission forget localhost:3000` guessing
+        // https and silently forgetting nothing.
+        let known = vec!["http://localhost:3000".to_string()];
+        assert_eq!(resolve_origin(&known, "localhost:3000").unwrap(), "http://localhost:3000");
+    }
+
+    #[test]
+    fn a_bare_host_you_have_never_decided_about_defaults_to_https() {
+        let known: Vec<String> = vec![];
+        assert_eq!(resolve_origin(&known, "example.com").unwrap(), "https://example.com");
+    }
+
+    #[test]
+    fn a_bare_host_that_could_be_two_sites_is_refused_rather_than_guessed() {
+        let known = vec!["http://localhost:3000".to_string(), "https://localhost:3000".to_string()];
+        let e = resolve_origin(&known, "localhost:3000").unwrap_err();
+        assert!(e.contains("ambiguous"), "{e}");
+        assert!(e.contains("http://localhost:3000"), "{e}");
+        assert!(e.contains("https://localhost:3000"), "{e}");
+    }
+
+    #[test]
+    fn nothing_is_not_a_site() {
+        let known: Vec<String> = vec![];
+        assert!(resolve_origin(&known, "").is_err());
+        assert!(resolve_origin(&known, "   ").is_err());
+    }
 }

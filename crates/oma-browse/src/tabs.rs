@@ -314,7 +314,22 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
         .auto_resize()
         .transparent(bg.3 < 255)
         .background_color(bg)
-        .initialization_script(&script);
+        .initialization_script(&script)
+        // Every tab, not just the first one the window was built with.
+        //
+        // Without this an incognito window is private for exactly one tab:
+        // wry gives an `incognito` webview its own ephemeral web context, and
+        // one built without the flag gets the shared, persistent one instead.
+        // Measured before the flag was added here -- a cookie set in the second
+        // tab of an incognito window was still there in an ordinary window
+        // after a restart, which is the opposite of what the word promises.
+        //
+        // The cost is that each incognito tab has its *own* ephemeral context,
+        // so a login does not carry from one to the next the way it does in
+        // Chrome. Tauri offers no way to share one context between webviews,
+        // and of the two failures -- "logged out in the new tab" against
+        // "not actually private" -- only one of them is a lie.
+        .incognito(state.incognito());
 
     let view = win
         .add_child(
@@ -338,6 +353,9 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     }
     if let Err(e) = crate::engine::configure(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab kept WebKit's own settings");
+    }
+    if let Err(e) = crate::policy::install(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab answers pages with WebKit's defaults");
     }
 
     if background {

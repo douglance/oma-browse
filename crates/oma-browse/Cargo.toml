@@ -47,6 +47,11 @@ tauri = { version = "2", features = ["unstable"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", features = ["v3_24"] }
 webkit2gtk = { version = "=2.0", features = ["v2_40"] }
+# For the one call the safe crate does not generate:
+# `webkit_authentication_request_authenticate`. Pinned to the same version as
+# the wrapper above for the same reason -- two copies of these types would not
+# be the same types. See `policy::supply_credentials` for the scoped `unsafe`.
+webkit2gtk-sys = "=2.0"
 # Only for `png`: gtk pulls cairo in without it, so `ImageSurface::write_to_png`
 # is missing and a snapshot has nowhere to go. Naming it here turns the feature
 # on for gtk's copy too, rather than adding a second one.

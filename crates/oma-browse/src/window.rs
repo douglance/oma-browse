@@ -180,6 +180,11 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::engine::configure(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab kept WebKit's own settings");
             }
+            // Likewise: pop-ups, permissions and bad certificates are answered
+            // per webview, and this is the one webview `tabs::open` never sees.
+            if let Err(e) = crate::policy::install(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab answers pages with WebKit's defaults");
+            }
 
             crate::layout::install(&palette, &state.config.chrome)?;
             crate::layout::install_keys(&palette, state.clone(), catalog.clone(), state.runtime())?;
@@ -284,7 +289,9 @@ fn may_see(label: &str, path: &str) -> bool {
     if label == PALETTE_LABEL || label == crate::strip::LABEL {
         return true;
     }
-    matches!(path, "/start" | "/mark.png" | "/icon.png" | "/favicon.ico")
+    // `/tls` is the interstitial a refused certificate lands on, so a content
+    // webview has to be able to see it -- it is shown *instead of* the page.
+    matches!(path, "/start" | "/tls" | "/login" | "/mark.png" | "/icon.png" | "/favicon.ico")
         || path.starts_with("/_topcoat/assets/")
 }
 

@@ -529,6 +529,153 @@ async fn start(cx: &Cx) -> Result {
     }
 }
 
+/// What a refused certificate looks like.
+///
+/// The alternative -- WebKit's own behaviour, which is what this browser did
+/// until now -- is a blank white window with no host, no reason and no way
+/// forward. This says which site, what is wrong with the certificate, and the
+/// one command that gets past it.
+///
+/// It reads the refusal off the state rather than out of the URL: a query
+/// string on a page served to a content webview is a query string a page could
+/// forge by navigating to it, and this one names the host you are about to
+/// trust.
+#[page("/tls")]
+async fn tls(cx: &Cx) -> Result {
+    let theme = state(cx).theme.read().await;
+    let vars = Unescaped::new_unchecked(theme.css.chrome.clone());
+    let mine =
+        Unescaped::new_unchecked(crate::strip::chrome_vars(&state(cx).config, theme.css.opacity));
+    let sheet = Unescaped::new_unchecked(TLS_CSS);
+    drop(theme);
+
+    let refused = state(cx).tls.lock().ok().and_then(|slot| slot.clone());
+    let (host, uri, reasons) = match refused {
+        Some(r) => (r.host, r.uri, r.reasons),
+        None => {
+            (String::new(), String::new(), vec!["the browser has forgotten which one".to_string()])
+        }
+    };
+    let trust = if host.is_empty() { "nav trust".to_string() } else { format!("nav trust {host}") };
+    let named = host.clone();
+
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8">
+                <title>"This connection is not private"</title>
+                <link rel="icon" href="/icon.png">
+                <style>(vars)</style>
+                <style>(mine)</style>
+                <style>(sheet)</style>
+            </head>
+            <body>
+                <main>
+                    <p class="tag">"certificate"</p>
+                    <h1>(host)</h1>
+                    <p class="sub">"did not prove it is who it says it is."</p>
+                    <ul class="why">
+                        for reason in reasons {
+                            <li>(reason)</li>
+                        }
+                    </ul>
+                    <p class="hint">
+                        "If this is your own machine or a staging box you set up, run "
+                        <code>(trust)</code>
+                        " -- from the palette, or from a terminal. If it is not, this is
+                         the warning working: somebody may be between you and "
+                        (named) "."
+                    </p>
+                    <p class="uri">(uri)</p>
+                </main>
+            </body>
+        </html>
+    }
+}
+
+/// What a site behind HTTP authentication looks like.
+///
+/// Same reasoning as the certificate page: WebKit's own answer here is a blank
+/// window, and a blank window is indistinguishable from a broken site. This one
+/// also has to be careful about *what* it echoes -- the realm is a string the
+/// server chose, so it is rendered as text like everything else in this
+/// template, never as markup.
+#[page("/login")]
+async fn login(cx: &Cx) -> Result {
+    let theme = state(cx).theme.read().await;
+    let vars = Unescaped::new_unchecked(theme.css.chrome.clone());
+    let mine =
+        Unescaped::new_unchecked(crate::strip::chrome_vars(&state(cx).config, theme.css.opacity));
+    let sheet = Unescaped::new_unchecked(TLS_CSS);
+    drop(theme);
+
+    let challenge = state(cx).login.lock().ok().and_then(|slot| slot.clone());
+    let (host, realm, retry) = match challenge {
+        // The port is part of which box this is when it is not the default
+        // one, and a staging server is nearly always on a port.
+        Some(c) if matches!(c.port, 0 | 80 | 443) => (c.host, c.realm, c.retry),
+        Some(c) => (format!("{}:{}", c.host, c.port), c.realm, c.retry),
+        None => (String::new(), String::new(), false),
+    };
+    let tag = if retry { "that login was refused" } else { "this site wants a login" };
+
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8">
+                <title>"Sign in"</title>
+                <link rel="icon" href="/icon.png">
+                <style>(vars)</style>
+                <style>(mine)</style>
+                <style>(sheet)</style>
+            </head>
+            <body>
+                <main>
+                    <p class="tag">(tag)</p>
+                    <h1>(host)</h1>
+                    if !realm.is_empty() {
+                        <p class="sub">"for " (realm)</p>
+                    }
+                    <p class="hint">
+                        "Answer it with " <code>"nav login <user> <password>"</code>
+                        " -- from a terminal, or from the palette. It is a command rather
+                         than a field because the palette's box is not a password field,
+                         and it should not look like one."
+                    </p>
+                    <p class="uri">"the password is kept for this session only, and never written to disk"</p>
+                </main>
+            </body>
+        </html>
+    }
+}
+
+const TLS_CSS: &str = r#"
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--oma-fg);
+  font-family: system-ui, sans-serif; }
+main { height: 100%; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: var(--oma-space); padding: var(--oma-space-2);
+  max-width: 46rem; margin: 0 auto; text-align: center; }
+.tag { margin: 0; text-transform: uppercase; letter-spacing: 0.16em;
+  font-size: var(--oma-font-small); color: var(--oma-color-red); }
+h1 { margin: 0; font-size: 2rem; font-weight: 600; color: var(--oma-fg);
+  font-family: var(--oma-font-mono); word-break: break-all; }
+/* Full-strength foreground rather than the muted tone the start page uses for
+   its subtitle: this is the only text explaining why a page did not load, and
+   a warning nobody can read is a blank page with extra steps. */
+.sub { margin: 0; color: var(--oma-fg); }
+.why { list-style: none; padding: 0; margin: var(--oma-space) 0; color: var(--oma-fg); }
+.why li { padding: 2px 0; }
+.hint { margin: var(--oma-space) 0 0; color: var(--oma-fg); line-height: 1.6; }
+code { font-family: var(--oma-font-mono); color: var(--oma-accent);
+  border: 1px solid var(--oma-control-normal-border); padding: 0 6px; }
+.uri { margin: var(--oma-space-2) 0 0; color: var(--oma-muted);
+  font-family: var(--oma-font-mono); font-size: var(--oma-font-small);
+  word-break: break-all; opacity: 0.7; }
+"#;
+
 const START_CSS: &str = r#"
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--oma-fg);
@@ -877,6 +1024,19 @@ async fn results(cx: &Cx, query: String, sel: f64, prompt: String) -> Result {
             }
         </ul>
     }
+}
+
+/// Stage a command *with the question already asked*.
+///
+/// Staging normally carries only a tool name, and the palette explains the
+/// argument from the schema -- "verdict (string): allow or deny". That is
+/// enough when the chord said what it wanted (`Ctrl-F` means find). It is not
+/// enough when the browser is the one asking: "allow or deny" without naming
+/// the site or what it wants is a question nobody should answer. So a caller
+/// that has a question of its own passes it here, and it renders above the
+/// field exactly as a command's own usage error would.
+pub(crate) fn stage_with(tool: &str, question: &str) -> String {
+    format!("{tool}{SEP}{question}")
 }
 
 /// Split the `prompt` signal back into the tool and its hint.

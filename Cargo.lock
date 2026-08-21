@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "oma-browse"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3224,11 +3224,12 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webkit2gtk",
+ "webkit2gtk-sys",
 ]
 
 [[package]]
 name = "oma-theme"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "notify",

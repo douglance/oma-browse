@@ -19,6 +19,8 @@ mod keys;
 mod layout;
 mod mcp;
 mod paths;
+mod permissions;
+mod policy;
 mod server;
 mod session;
 mod shot;
