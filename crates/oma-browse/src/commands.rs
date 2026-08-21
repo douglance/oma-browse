@@ -3211,8 +3211,16 @@ struct ResizeOptions {
 
 #[derive(JsonSchema, Serialize)]
 struct Resized {
+    /// The size the window actually is now, as the compositor reports it --
+    /// not the size that was asked for.
     width: f64,
     height: f64,
+    /// Whether the window is the size that was asked for. A tiled window is
+    /// sized by the layout whatever anyone requests, and answering `true` there
+    /// would be a lie this command used to tell.
+    applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 fn window_group(state: Arc<AppState>) -> Cli {
@@ -3242,7 +3250,12 @@ fn window_group(state: Arc<AppState>) -> Cli {
                     }
                 };
                 match crate::window::resize(&state, size.0, size.1) {
-                    Ok(()) => TypedResult::ok(Resized { width: size.0, height: size.1 }),
+                    Ok(placed) => TypedResult::ok(Resized {
+                        width: placed.width,
+                        height: placed.height,
+                        applied: placed.applied,
+                        note: placed.note,
+                    }),
                     Err(e) => TypedResult::error("window", format!("{e:#}")),
                 }
             }
@@ -3250,8 +3263,10 @@ fn window_group(state: Arc<AppState>) -> Cli {
     )
     .description(
         "Resize the window, for checking a layout at a phone's width without \
-         leaving the keyboard. A tiled Hyprland window is sized by the \
-         compositor and will ignore this; float it first.",
+         leaving the keyboard. On Wayland a client cannot size itself, so this \
+         asks the compositor -- and reads the size back, so `applied: false` \
+         means it did not happen. A tiled window is sized by the layout \
+         whatever anyone asks; float it first.",
     )
     .done();
 

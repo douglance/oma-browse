@@ -556,20 +556,129 @@ pub fn close(state: &Arc<AppState>) -> Result<()> {
 /// window opened by `oma-browse tab open` does not -- that command returns to a
 /// prompt, and a browser writing to the prompt it left behind is noise the user
 /// did not ask for.
-/// Resize the window.
+/// Resize the window, and say whether it actually happened.
 ///
-/// Worth knowing what this does and does not do on Omarchy: a *tiled* Hyprland
-/// window is sized by the compositor, and asking it to be 375 wide is a request
-/// the compositor is entitled to ignore -- and does. Float the window first
-/// (`SUPER + V` in a stock Omarchy) and the size lands. On a floating window,
-/// which is what a second `window new` usually is, it works as written.
-pub fn resize(state: &Arc<AppState>, width: f64, height: f64) -> Result<()> {
+/// The obvious implementation -- `Window::set_size` -- does nothing at all on
+/// Wayland, and it does nothing *silently*. There is no xdg-shell request for a
+/// client to set its own size: a client draws at whatever size the compositor
+/// configures it to, and asking is not part of the protocol. Measured on a
+/// genuinely floating window: `set_size(900, 600)` returned `Ok`, the command
+/// answered "900x600", and Hyprland went on reporting 1400x900.
+///
+/// So under Hyprland the request goes to the compositor, which is the only
+/// thing that can grant it. That makes this the second place in the browser
+/// that knows what compositor it is on, beside [`spawn_on`], and it borrows
+/// that function's helpers rather than growing its own.
+///
+/// A *tiled* window is still sized by the layout whatever anyone asks -- the
+/// dispatcher answers `ok` and the size does not move. That is why this reads
+/// the size back afterwards instead of trusting either call: the honest answer
+/// to `window resize` on a tiled window is "no", and the previous version of
+/// this said "yes".
+pub fn resize(state: &Arc<AppState>, width: f64, height: f64) -> Result<Placed> {
     let app = state.app_handle().context("the window is not up yet")?;
     let window = app.get_window("main").context("the main window has gone away")?;
+
+    // Still asked for, and first: on a backend where a client *can* size itself
+    // -- X11, or a future non-Wayland target -- this is the whole of the job,
+    // and it is harmless where it is not.
     window
         .set_size(LogicalSize::new(width, height))
         .context("the window would not take that size")?;
-    Ok(())
+
+    if !under_hyprland() {
+        // Nothing to read back from, and nothing better to try. Report what was
+        // asked for, and be plain that it was a request.
+        return Ok(Placed {
+            width,
+            height,
+            applied: false,
+            note: Some(
+                "not running under Hyprland; the compositor decides, and this build                  cannot ask it directly"
+                    .to_string(),
+            ),
+        });
+    }
+
+    let pid = std::process::id();
+    let dispatch = resize_lua(pid, width, height);
+    let out = std::process::Command::new("hyprctl")
+        .arg("dispatch")
+        .arg(&dispatch)
+        .output()
+        .context("could not reach hyprctl to resize the window")?;
+    let reply = String::from_utf8_lossy(&out.stdout);
+    // As `spawn_on`: hyprctl exits 0 and prints the complaint, so the body is
+    // the answer and the status is not.
+    if !out.status.success() || !reply.trim().eq_ignore_ascii_case("ok") {
+        anyhow::bail!(
+            "hyprland would not resize the window: {}",
+            reply.trim().lines().next().unwrap_or("no reply")
+        );
+    }
+
+    let Some((actual_w, actual_h, floating)) = geometry(pid) else {
+        return Ok(Placed { width, height, applied: false, note: None });
+    };
+    let landed = (actual_w - width).abs() < 2.0 && (actual_h - height).abs() < 2.0;
+    Ok(Placed {
+        width: actual_w,
+        height: actual_h,
+        applied: landed,
+        note: (!landed).then(|| {
+            if floating {
+                "the compositor chose a different size".to_string()
+            } else {
+                "this window is tiled, so its size is the layout's; float it first                  (SUPER + T in a stock Omarchy)"
+                    .to_string()
+            }
+        }),
+    })
+}
+
+/// What a resize actually produced.
+#[derive(Debug, Clone, Default)]
+pub struct Placed {
+    pub width: f64,
+    pub height: f64,
+    /// Whether the window is now the size that was asked for.
+    pub applied: bool,
+    /// Why not, when it is not.
+    pub note: Option<String>,
+}
+
+/// The dispatch Hyprland wants, addressed at one process rather than at
+/// whatever happens to be focused.
+///
+/// `pid:` and not `address:` because this process knows its own pid and would
+/// otherwise have to go and look its own window up to find out what it is.
+/// Nothing here needs quoting -- a pid is digits and the sizes are integers --
+/// which is the only reason this is a `format!` and not a trip through
+/// [`lua_quote`].
+fn resize_lua(pid: u32, width: f64, height: f64) -> String {
+    format!(
+        "hl.dsp.window.resize({{ window = \"pid:{pid}\", x = {}, y = {}, relative = false }})",
+        width.round() as i64,
+        height.round() as i64
+    )
+}
+
+/// This process's window, as the compositor sees it: width, height, floating.
+fn geometry(pid: u32) -> Option<(f64, f64, bool)> {
+    let out = std::process::Command::new("hyprctl").args(["clients", "-j"]).output().ok()?;
+    let clients: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    for client in clients.as_array()? {
+        if client.get("pid").and_then(serde_json::Value::as_u64) != Some(u64::from(pid)) {
+            continue;
+        }
+        let size = client.get("size")?.as_array()?;
+        return Some((
+            size.first()?.as_f64()?,
+            size.get(1)?.as_f64()?,
+            client.get("floating").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        ));
+    }
+    None
 }
 
 /// `1280x720`, as a pair. `None` for anything that is not two numbers with an
@@ -786,6 +895,18 @@ pub fn set_palette_visible(state: &Arc<AppState>, visible: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resize_is_addressed_at_this_process_and_not_at_whatever_is_focused() {
+        let lua = resize_lua(4242, 900.0, 600.0);
+        assert!(lua.contains(r#"window = "pid:4242""#), "{lua}");
+        // Integers: Hyprland's dispatcher takes pixels, and `900.0` in the Lua
+        // would be a float where it wants a number of them.
+        assert!(lua.contains("x = 900"), "{lua}");
+        assert!(lua.contains("y = 600"), "{lua}");
+        assert!(!lua.contains("900.0"), "sizes must not go over as floats: {lua}");
+        assert!(lua.contains("relative = false"), "{lua}");
+    }
 
     #[test]
     fn a_wm_class_is_something_a_window_rule_can_name() {
