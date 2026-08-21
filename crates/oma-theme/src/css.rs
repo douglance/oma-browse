@@ -75,13 +75,13 @@ impl ThemeCss {
     /// * opt in — walk the document and repaint *neutral* surfaces only, leaving
     ///   brand colour alone. That is the part that breaks sites, so it is off
     ///   unless asked for.
-    pub fn page_script(&self, recolor: bool) -> String {
+    pub fn page_script(&self, recolor: bool, max_rules: usize) -> String {
         // The script is a plain constant, substituted rather than `format!`ed.
         // It is a few hundred lines of JavaScript, and JavaScript is all braces;
         // running it through a format string means doubling every one of them,
         // which is both unreadable and a standing invitation to a compile error
         // three edits from now.
-        PAGE_SCRIPT.replace("__OMA_CONFIG__", &self.page_config(recolor))
+        PAGE_SCRIPT.replace("__OMA_CONFIG__", &self.page_config(recolor, max_rules))
     }
 
     /// The values the page runtime needs in order to map the site's own colours
@@ -90,13 +90,13 @@ impl ThemeCss {
     ///
     /// Hand-rolled JSON: this crate has no `serde_json` at runtime, and the
     /// shape is four strings and a bool.
-    fn page_config(&self, recolor: bool) -> String {
+    fn page_config(&self, recolor: bool, max_rules: usize) -> String {
         let s = &self.semantic;
         // The two ends of the ramp go over as raw channels, not CSS strings: the
         // runtime interpolates between them per colour rather than picking from
         // a handful of pre-baked surfaces, so it needs to do arithmetic on them.
         format!(
-            "{{\"css\":{css},\"recolor\":{recolor},\"tint\":[{tr},{tg},{tb}],\
+            "{{\"css\":{css},\"recolor\":{recolor},\"maxRules\":{max_rules},\"tint\":[{tr},{tg},{tb}],\
              \"fgRgb\":[{fr},{fg},{fb}],\"opacity\":{opacity},\
              \"accent\":{accent},\"selection\":{selection}}}",
             css = js_string(&self.page_css()),

@@ -219,7 +219,8 @@ impl AppState {
     /// accelerator would eat it in every search box on the web. Only the page
     /// knows where the caret is. See [`crate::hints`].
     pub async fn page_script(&self) -> String {
-        let theme = self.theme.read().await.css.page_script(self.recolor());
+        let theme =
+            self.theme.read().await.css.page_script(self.recolor(), self.recolor_max_rules());
         // These ride along with the theme's injection rather than being further
         // `initialization_script`s: all of them have to be re-applied on every
         // navigation, and there is only one hook for that.
@@ -347,6 +348,12 @@ impl AppState {
 
     pub fn recolor(&self) -> bool {
         self.recolor.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The rule count above which a page is left in its own colours; see
+    /// [`crate::config::Theme::recolor_max_rules`].
+    pub fn recolor_max_rules(&self) -> usize {
+        self.config.theme.recolor_max_rules
     }
 
     pub fn set_recolor(&self, on: bool) {

@@ -12,5 +12,5 @@ fn dump() {
     let Ok(path) = std::env::var("OMA_DUMP_SCRIPT") else { return };
     let theme = oma_theme::Theme::load();
     let css = oma_theme::css::ThemeCss::build(&theme);
-    std::fs::write(path, css.page_script(true)).expect("write");
+    std::fs::write(path, css.page_script(true, 0)).expect("write");
 }

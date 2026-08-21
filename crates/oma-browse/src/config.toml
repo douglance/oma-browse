@@ -76,6 +76,13 @@ veil = "auto"
 # are touched, so a site's brand colour survives. Turn it off for a site that
 # does not survive it -- or at runtime, with `oma-browse theme recolor off`.
 recolor = true
+# Give up on repainting a page with more CSS than this and leave it in its own
+# colours. Recolouring derives from every rule in the document, so a site that
+# ships an enormous stylesheet pays for it on every load -- youtube.com is 27,000
+# rules and about two seconds. The default sits between the two ends of what real
+# sites measure: github.com is the heaviest ordinary page at 10,600 rules, and it
+# is light-themed, which is where repainting earns the most. 0 turns it off.
+recolor_max_rules = 15000
 
 # --- the window ------------------------------------------------------------
 

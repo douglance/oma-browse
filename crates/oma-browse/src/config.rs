@@ -226,6 +226,20 @@ pub struct Theme {
     /// Repaint neutral page surfaces onto the theme's ramp. Only greyscale
     /// surfaces are touched, so brand colour survives.
     pub recolor: bool,
+    /// Give up on repainting a page with more CSS than this, and leave it in its
+    /// own colours.
+    ///
+    /// Recolouring derives its overrides from every rule in the document, so
+    /// what it costs is set by how much CSS a site ships -- and a handful of
+    /// sites ship an enormous amount. Measured: youtube.com carries 22,000 to
+    /// 27,000 rules and pays about two seconds a load for them, on a page that
+    /// is already dark and gains very little from being repainted.
+    ///
+    /// The default sits between the two ends of what real sites measure --
+    /// github.com is the heaviest ordinary page found at 10,600 rules, and it is
+    /// a light theme, which is where repainting earns the most. `0` means no
+    /// limit.
+    pub recolor_max_rules: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -428,7 +442,7 @@ impl Default for Strip {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self { veil: Veil::AUTO, recolor: true }
+        Self { veil: Veil::AUTO, recolor: true, recolor_max_rules: 15_000 }
     }
 }
 

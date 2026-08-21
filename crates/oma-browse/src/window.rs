@@ -438,7 +438,11 @@ pub async fn restyle(state: &Arc<AppState>) -> Result<()> {
             // The strip's inset goes back in with it: this is the same
             // injection `AppState::page_script` composes for a fresh tab, and a
             // restyled page has to end up in the same state as a new one.
-            format!("{}\n{}", theme.css.page_script(state.recolor()), state.inset_script()),
+            format!(
+                "{}\n{}",
+                theme.css.page_script(state.recolor(), state.recolor_max_rules()),
+                state.inset_script()
+            ),
             theme.mode.is_dark(),
             tauri::window::Color(bg.r, bg.g, bg.b, alpha),
             tauri::window::Color(bg.r, bg.g, bg.b, 0),

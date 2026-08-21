@@ -883,8 +883,45 @@
     return genId;
   }
 
+  // How much CSS is in the document, cheaply. Touches each sheet once and reads
+  // no declarations, which is a couple of milliseconds against the couple of
+  // hundred a derivation costs.
+  function documentRuleCount() {
+    var sheets = document.styleSheets;
+    var n = 0;
+    for (var i = 0; i < sheets.length; i++) {
+      try {
+        var rs = sheets[i].cssRules;
+        n += rs ? rs.length : 0;
+      } catch (e) {
+        // Cross-origin and not yet recovered; it is not being derived either.
+      }
+    }
+    return n;
+  }
+
   function buildOverrides() {
     var out = [];
+
+    // A page with an enormous amount of CSS is left in its own colours.
+    //
+    // Recolouring derives from every rule in the document, so its cost is set by
+    // how much CSS a site ships, and a few ship a great deal: youtube.com is
+    // 27,000 rules and about two seconds of a load. What that buys there is
+    // small -- the site is already dark -- and what it costs is the browser
+    // being slower than the page it is showing. So above the cap only the canvas
+    // rule below is emitted, which is what the veil needs; everything else keeps
+    // the site's own palette.
+    //
+    // Not a silent giveaway: `[theme] recolor_max_rules = 0` turns the limit
+    // off, and the cap is high enough that an ordinary site never reaches it.
+    if (CFG.maxRules > 0 && documentRuleCount() > CFG.maxRules) {
+      return {
+        css: ":root:root:root,:root:root:root body{background-color:transparent !important;}",
+        base: pageBase(),
+        capped: true
+      };
+    }
 
     // Anything measured before the document finished loading is provisional.
     // Wikipedia is the case that proved it: its dark palette arrives as a
@@ -1287,6 +1324,18 @@
     if (!CFG.recolor) return;
     var built = buildOverrides();
     ensureSheet(OVERRIDE_ID, built.css);
+    if (built.capped) {
+      // Nothing was derived, so the two passes that exist to finish the job have
+      // nothing to finish. `fixElementColours` rewrites inline styles to match
+      // overrides that were not emitted, and `recoverForeign` re-fetches
+      // cross-origin stylesheets in order to derive from them -- a network
+      // request and a parse, for rules this page has already declined to map.
+      // The veil still needs its floats, so those stay.
+      ensureVeil();
+      findFloats();
+      queueBackers();
+      return;
+    }
     fixElementColours(built.base);
     findFloats();
     queueBackers();
