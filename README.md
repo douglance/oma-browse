@@ -4,65 +4,97 @@
 
 # oma-browse
 
-**An Omarchy-themed, agent-drivable browser for Linux.**<br>
+**A keyboard-driven browser for Omarchy.**<br>
 Rust · Tauri · WebKitGTK
 
 </div>
 
-Two ideas, and everything else follows from them:
+oma-browse is a web browser for [Omarchy](https://omarchy.org) desktops. There is no
+toolbar, no tab bar and no menu button — you drive it by typing. Every action has a
+keyboard chord, and all of them are also in a command palette you open with `Ctrl-K`
+and filter by name, which doubles as the URL bar. The only permanent chrome is a
+26-pixel strip of favicons floating over the top of the page.
 
-**There is no toolbar.** The page owns the window. The URL bar, the tab list,
-history, bookmarks and every setting live in a command palette that is summoned
-over the page and dismissed again, the way a TUI does it. The only permanent
-chrome is a 26px strip of favicons at the top, and it floats — the page scrolls
-underneath it.
+It wears whatever Omarchy theme you have set — and so do the sites you visit. A
+stylesheet goes in on top of every page, repainting neutral backgrounds, text and form
+controls onto your theme's palette while leaving brand colour alone. Hacker News stays
+orange; it stops being beige. Pages are translucent to the same degree your terminal
+is, so your wallpaper shows through the web.
 
-**Every capability is one command, reachable four ways.** The palette, the
-keyboard, the CLI and MCP all dispatch through the same command graph — the last
-two over a Unix socket the window opens for itself, so there is no port to pin
-and nothing on the network. Nothing the UI can do is unavailable to a script or
-an agent, and nothing has to be implemented twice to keep it that way.
+Every command is also a CLI, an HTTP API and an MCP server, so a shell script or a
+coding agent drives the same browser you are looking at.
 
 <div align="center">
-<img src="assets/screenshot-palette.png" alt="The command palette, listing open tabs and commands" width="820">
+<img src="assets/themes.jpg" alt="The same page rendered under all 22 stock Omarchy themes" width="960">
 </div>
 
 ---
 
 ## Features
 
-- **Wears your Omarchy theme.** Read from disk, re-read the moment it changes —
-  no restart, no D-Bus, no hook to install. Websites get it too.
-- **One palette for everything.** Tabs, history, bookmarks, settings and every
-  command in one list, filtered as you type, with the URL bar as the same box.
-- **Drivable by anything.** Every command is an HTTP route and an MCP tool, so a
-  script or an agent has exactly the browser's own vocabulary.
-- **Screenshots from the engine.** WebKit paints the page into a surface itself,
-  so captures work with the window on another workspace and can never grab
-  something else on screen.
-- **Link hints.** `f` puts a label on every link and follows the one you type;
-  `F` opens it in a new tab.
-- **Translucent like your terminal.** Window opacity follows Ghostty's
-  `background-opacity`, or a number you pin.
-- **One dotfile.** Every setting in `~/.config/oma-browse/config.toml`, next to
-  the rest of an Omarchy desktop's config, and all of it optional.
+- **Keyboard-first.** Every command has a chord, and the chords are Chrome's wherever
+  Chrome has one. All of them are rebindable in the config file.
+- **One palette for everything.** Tabs, history, bookmarks, downloads, find-on-page,
+  settings and every command in a single list, filtered as you type. It is also the
+  URL bar.
+- **Themed, websites included.** Read from disk and re-read the moment you switch
+  themes — no restart and no hook to install.
+- **Translucent.** Page opacity follows Ghostty's `background-opacity`, or solves for
+  contrast against your wallpaper, or is whatever number you pin.
+- **Quick to open.** The start page is served from inside the process — no DNS, no TLS,
+  no network — so a new window paints as fast as WebKit can start.
+- **Link hints.** `f` labels every link on the page and follows the one you type; `F`
+  opens it in a new tab.
+- **Drivable by agents.** `oma-browse skills add` teaches your coding agent the command
+  vocabulary; `oma-browse mcp add` registers the browser as an MCP server.
+- **Screenshots from the engine.** WebKit paints the page into a surface itself, so
+  captures work with the window on another workspace and can never catch something else
+  on screen.
+- **Hands pages to the desktop.** Install the current page as an Omarchy web app with
+  its own launcher, or open a terminal with its URL on the clipboard.
+- **One dotfile.** Every setting in `~/.config/oma-browse/config.toml`, all of it
+  optional.
 
 > [!NOTE]
-> Linux only, and Omarchy is where it is at home — but it runs on any Wayland or
-> X11 desktop with GTK 3 and WebKitGTK. Without Omarchy it falls back to a
-> built-in palette.
+> Linux only. Built for Omarchy, but it runs on any Wayland or X11 desktop with GTK 3
+> and WebKitGTK; without Omarchy it falls back to a built-in palette.
 
 ## Install
 
 On Omarchy, or any Arch:
 
 ```sh
-yay -S oma-browse-bin      # the release binary — seconds
+yay -S oma-browse-bin      # the release binary
 yay -S oma-browse-git      # or build the tip yourself
 ```
 
-`-bin` is the one to want: building from source compiles the WebKitGTK bindings,
-which is ten minutes and a Rust toolchain you may not have wanted.
+Prefer `-bin`. Building from source compiles the WebKitGTK bindings, which takes about
+ten minutes and a Rust toolchain.
+
+<details>
+<summary>From the release tarball (any distro)</summary>
+
+No package manager involved: the tarball is the binary, the client runtime and a
+desktop entry, and the binary finds the runtime by its own path — so it works from
+`/usr/local` or from `~/.local` with nothing compiled in.
+
+```sh
+v=0.1.0
+curl -LO https://github.com/douglance/oma-browse/releases/download/v$v/oma-browse-$v-x86_64-linux.tar.gz
+curl -LO https://github.com/douglance/oma-browse/releases/download/v$v/oma-browse-$v-x86_64-linux.tar.gz.sha256
+sha256sum -c oma-browse-$v-x86_64-linux.tar.gz.sha256
+tar xzf oma-browse-$v-x86_64-linux.tar.gz && cd oma-browse-$v-x86_64-linux
+
+p=~/.local                                    # or /usr/local, with sudo
+install -Dm755 oma-browse "$p/bin/oma-browse"
+install -Dm644 assets/* -t "$p/share/oma-browse/assets"
+install -Dm644 oma-browse.desktop "$p/share/applications/oma-browse.desktop"
+install -Dm644 oma-browse.png "$p/share/icons/hicolor/128x128/apps/oma-browse.png"
+```
+
+You still need GTK 3 and WebKitGTK 4.1 from your own distro's packages.
+
+</details>
 
 <details>
 <summary>From source</summary>
@@ -74,19 +106,21 @@ git clone https://github.com/douglance/oma-browse
 cd oma-browse
 cargo build --release
 cargo install topcoat-cli               # once
-topcoat asset bundle -p oma-browse -r   # not optional — see below
+topcoat asset bundle -p oma-browse -r   # required — see below
 ```
 
 The bundle is looked for beside the binary first and in
-`$prefix/share/oma-browse/assets` second, so a build tree and an installed
-package both work with no prefix compiled in.
+`$prefix/share/oma-browse/assets` second, so a build tree and an installed package both
+work with no prefix compiled in.
 
 </details>
 
 > [!IMPORTANT]
-> The chrome is [Topcoat](https://crates.io/crates/topcoat), whose client
-> runtime is bundled *out of the compiled binary* rather than shipped as a file.
-> Skip `topcoat asset bundle` and the palette renders blank.
+> The chrome is built with [Topcoat](https://crates.io/crates/topcoat), whose client
+> runtime is unpacked *out of the compiled binary* rather than shipped as a file. Skip
+> `topcoat asset bundle` and the palette renders blank. So does running it without `-r`
+> after a `--release` build: it bundles the debug binary into `target/debug/assets` and
+> leaves the release tree empty.
 
 Two things worth having on the system:
 
@@ -95,135 +129,175 @@ Two things worth having on the system:
 | a **Nerd Font** | the strip's settings gear is `nf-fa-cog` |
 | **gst-plugins-good** | without it WebKit has no audio sink, and media-heavy sites come up blank rather than merely silent |
 
-## Usage
-
-```sh
-oma-browse                          # the home page — your own start page unless configured
-oma-browse https://example.com      # straight to a URL
-oma-browse --incognito              # forgets where it has been
-```
-
-`--private` is accepted as well, so `omarchy-launch-browser` can hand this
-binary a URL and have it do the right thing.
-
-### Keys
+## Keys
 
 | | |
 |---|---|
-| `Ctrl-K` / `Ctrl-L` / `Ctrl-P` | palette — the URL bar, the tab list, everything |
+| `Ctrl-K` / `Ctrl-L` / `Ctrl-P` | the palette — URL bar, tab list, everything |
+| `Esc` | dismiss the palette, or stop loading |
+| **Tabs** | |
 | `Ctrl-T` / `Ctrl-W` | new tab / close tab |
-| `Ctrl-N` | new window |
 | `Ctrl-Shift-T` | reopen the last closed tab |
 | `Ctrl-Tab` / `Ctrl-Shift-Tab` | next / previous tab |
 | `Ctrl-PgDn` / `Ctrl-PgUp` | next / previous tab |
 | `Ctrl-1` … `Ctrl-8` / `Ctrl-9` | jump to that tab / the last tab |
-| `f` / `F` | link hints: follow, or open in a new tab |
-| `Ctrl-F`, then `Ctrl-G` / `Ctrl-Shift-G` | find, next, previous |
-| `Ctrl-D` | bookmark this page |
-| `Alt-←` / `Alt-→` / `Alt-Home` | back, forward, home |
+| `Ctrl-M` | mute this tab |
+| **Navigation** | |
+| `Alt-←` / `Alt-→` / `Alt-Home` | back / forward / home |
 | `Ctrl-R`, `F5` | reload |
-| `Ctrl-+` / `Ctrl--` / `Ctrl-0` | zoom |
-| `F11` / `Ctrl-Shift-W` | fullscreen / close the window |
-| `Esc` | dismiss the palette, or stop loading — and the page still sees it |
+| `f` / `F` | link hints: follow, or open in a new tab |
+| `Ctrl-F`, then `Ctrl-G` / `Ctrl-Shift-G` / `F3` | find on page, next, previous |
+| **The page** | |
+| `Ctrl-+` / `Ctrl--` / `Ctrl-0` | zoom in / out / reset |
+| `Ctrl-D` | bookmark this page |
+| `Ctrl-U` | view source |
+| `Ctrl-Shift-P` | print to PDF |
+| `Ctrl-J` | open the last download |
+| `F12` / `Ctrl-Shift-I` | WebKit inspector |
+| **Windows** | |
+| `Ctrl-N` / `Ctrl-Shift-W` | new window / close window |
+| `F11` | fullscreen |
 
-Keys are bound on the GTK toplevel rather than injected into the page, so they
-work on a site that blocks scripts and on whatever currently holds focus. Link
-hints are the exception, and deliberately: a bare letter has to be bound *in*
-the page, because only the page knows whether you are typing into a search box.
+Keys are bound on the GTK window rather than injected into the page, so they work on a
+site that blocks scripts and whatever currently has focus. Link hints are the one
+exception: a bare letter has to be bound inside the page, because only the page knows
+whether you are typing into a search box.
 
-`Ctrl-T` and `Ctrl-N` both come up with the palette open: a tab or a window with
-nowhere to go is a question, and in a browser with no toolbar the palette is
-where it gets answered. Given a URL — `tab open <url>`, `window new <url>` — both
-stay quiet. A window is a second *process*, since the tab model, the palette and
-the strip all belong to one window; `Ctrl-Shift-W` closes just the one you are in.
+`Ctrl-T` and `Ctrl-N` land on the start page with the palette already up, since a new
+tab needs a destination. Given one — `tab open <url>`, `window new <url>` — they stay
+quiet. Each window is its own process, so `Ctrl-Shift-W` closes only the one you are in.
 
-## Driving it
+Rebind anything by chord in the config file:
+
+```toml
+[keys]
+"ctrl+p" = "page_print"      # Chrome's placement, instead of a palette summon
+"ctrl+j" = ""               # unbind
+```
+
+## The palette
+
+`Ctrl-K` opens one list containing your open tabs and all 49 of the browser's commands,
+filtered as you type. Enter on a tab switches to it. Enter on a command runs it, or opens a prompt for
+its arguments if it needs any. Typing something that is neither runs it as a URL or a
+search.
+
+Commands are grouped by what they touch: `tab`, `nav`, `page`, `find`, `history`,
+`bookmark`, `download`, `share`, `theme`, `window`, `ui`, `config`.
+
+<div align="center">
+<img src="assets/screenshot-palette.png" alt="The command palette, listing open tabs and commands" width="820">
+</div>
+
+## Theming and transparency
+
+The browser reads the current Omarchy theme from
+`~/.local/state/omarchy/current/theme` and re-reads it when it changes. Its own chrome
+uses the theme's tokens directly. Loaded websites get a stylesheet on top of theirs:
+links, form controls, the caret, focus rings, selection and scrollbars always, and
+neutral surfaces repainted onto the theme's ramp by default. Anything with brand colour
+in it is left alone. `theme recolor off` turns the repainting off for a site that does
+not survive it.
+
+Page transparency and palette transparency are set separately. `[theme] veil` controls
+how see-through a *page* is: `"auto"` solves for contrast against your wallpaper and
+follows Ghostty's `background-opacity`, so the browser is as translucent as the terminal
+next to it, and a number pins it instead. `[chrome] veil` controls the palette card,
+which is opaque by default because it holds dense text. `OMA_VEIL` overrides both.
+
+## Driving it from a script or an agent
 
 Type a command and it runs in the browser you were last looking at:
 
 ```sh
-oma-browse tab open example.com    # opens a tab in the window you are using
-oma-browse tab list                # a table in a terminal, an envelope in a pipe
+oma-browse tab open example.com
+oma-browse tab list                # a table in a terminal, structured in a pipe
 oma-browse tab list --json | jq .
 oma-browse page screenshot
 ```
 
 Each window listens on its own Unix socket in `$XDG_RUNTIME_DIR/oma-browse`, and
-`current.sock` follows whichever window has focus — so a bare command means "this
-one", and `--window <pid>` means a particular one. Nothing to discover, no port
-to pin: the CLI hands the window its argv, the window runs it, and you get the
-output and the exit code back. Relative paths are yours, not the browser's:
-`page screenshot --path shot.png` writes beside you, because the CLI sends your
-working directory along with the argv.
+`current.sock` follows whichever window has focus. A bare command means "this one";
+`--window <pid>` names a particular one. The CLI sends the window its argv and your
+working directory, so `page screenshot --path shot.png` writes the file next to you
+rather than next to the browser.
 
-With no browser running, `tab open` and `window new` start one, and every
-command answered by a file rather than a window (`--help`, `history list`,
-`bookmark list`, `config show`) answers on the spot. A question that only a
-window can answer — anything under `tab`, `nav`, `page`, `ui`, `find`, `window`
-or `share` — says so and exits non-zero, rather than answering `tabs[0]:` and
-letting you read it as "no tabs open".
+With no browser running, `tab open` and `window new` start one. Commands answered by a
+file rather than a window — `--help`, `history list`, `bookmark list`, `config show` —
+answer on the spot. Anything under `tab`, `nav`, `page`, `ui`, `find`, `window` or
+`share` needs a window, and exits non-zero saying so rather than returning an empty
+result.
 
-The same commands are an HTTP API on that socket — the OpenAPI document and an
-MCP endpoint included — which is what a script or an agent should talk to:
+The same commands are an HTTP API on that socket, with an OpenAPI document and an MCP
+endpoint alongside:
 
 ```sh
 S="$XDG_RUNTIME_DIR/oma-browse/current.sock"
 curl --unix-socket "$S" http://x/cmd/tab/open/example.com
 curl --unix-socket "$S" http://x/cmd/tab/list
-curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png  # absolute
+curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png
 curl --unix-socket "$S" --get http://x/cmd/page/eval --data-urlencode 'js=document.title'
 ```
 
-An HTTP or MCP request carries no working directory, so a relative `path` there
-is refused rather than resolved against the browser's own — give an absolute one.
+An HTTP or MCP request carries no working directory, so a relative `path` is refused
+there rather than resolved against the browser's own. Give an absolute one.
 
-For an agent, the same graph is an MCP server. `oma-browse --mcp` speaks MCP on
-stdin and stdout the way an MCP client expects, and relays it to the window you
-were last looking at, so a tool call opens a tab in the browser you can see. An
-MCP client has no way to say "start your browser first", so with none running it
-starts one and relays to that:
+### For coding agents
+
+Install the skill files so your agent knows the command vocabulary without being told:
 
 ```sh
-oma-browse mcp add         # register it with an MCP client
+oma-browse skills add      # sync skills to Claude Code and friends
+oma-browse skills list     # what is installed where
+```
+
+Then register the browser as an MCP server. `oma-browse --mcp` speaks MCP on stdin and
+stdout and relays to the window you were last looking at, so a tool call opens a tab in
+the browser you can see. With no browser running it starts one, since an MCP client has
+no way to ask you to launch it first.
+
+```sh
+oma-browse mcp add         # register with an MCP client
 oma-browse --llms          # or the whole command graph, machine-readable
 ```
 
-Tooling that cannot open a Unix socket — something in a container, or on another
-machine through a tunnel — can ask for a port instead. It is off by default:
+### Over a port
+
+Tooling that cannot open a Unix socket — something in a container, or on another machine
+through a tunnel — can ask for a loopback port instead. It is off by default:
 
 ```toml
 [control]
-remote_port = 7788     # loopback, and every process on the box can use it
+remote_port = 7788
 ```
 
 ```sh
 curl http://127.0.0.1:7788/json/list                    # the live windows
 curl http://127.0.0.1:7788/cmd/tab/list                 # this one
-curl "http://127.0.0.1:7788/cmd/tab/list?window=<pid>"  # another one, via its socket
+curl "http://127.0.0.1:7788/cmd/tab/list?window=<pid>"  # another one
 ```
 
-That port carries the command graph and its MCP endpoint, and nothing else — the
-palette is not on it.
+That port carries the command graph and its MCP endpoint and nothing else; the palette
+is not on it.
 
-For engine-level debugging there is no protocol to reimplement: WebKit ships a
-remote inspector, and it takes an address from the environment.
+> [!NOTE]
+> The default is a socket rather than a port because this API drives the browser and
+> reads the pages you are logged in to. A filesystem permission decides who may connect,
+> where a loopback port is open to every process and every account on the machine. The
+> browser binds nothing on the network by default: its own chrome is served to its own
+> webviews over an `oma-chrome://` URI scheme handled inside the process.
+
+For engine-level debugging, WebKit's remote inspector takes an address from the
+environment:
 
 ```sh
 WEBKIT_INSPECTOR_SERVER=127.0.0.1:2999 oma-browse    # then attach a DevTools client
 ```
 
-> [!NOTE]
-> A socket rather than a port, because this API drives the browser and reads the
-> pages you are logged in to: a filesystem permission decides who may connect,
-> where a loopback port is open to every process and every account on the
-> machine. The browser binds nothing at all on the network — its own chrome (the
-> palette, the tab strip, the start page) is served to its own webviews over an
-> `oma-chrome://` URI scheme handled inside the process.
+## Making it your default browser
 
-## Making it your browser
-
-`xdg-open`, link handlers and application launchers all resolve a browser
-through a `.desktop` file, so being the default browser means installing one.
+`xdg-open`, link handlers and application launchers resolve a browser through a
+`.desktop` file:
 
 ```sh
 cargo build --release
@@ -234,33 +308,22 @@ update-desktop-database ~/.local/share/applications
 xdg-settings set default-web-browser oma-browse.desktop
 ```
 
-A URL opened that way lands in the window you already have, as a new tab — the
-`.desktop` file's *New Window* and *New Incognito Window* actions are how you ask
-for a second one, and so is `Ctrl-N`.
+A URL opened that way lands in the window you already have, as a new tab. The `.desktop`
+file's *New Window* and *New Incognito Window* actions are how you ask for a second one,
+as is `Ctrl-N`.
 
-## Theming
+```sh
+oma-browse                          # your home page
+oma-browse https://example.com      # straight to a URL
+oma-browse --incognito              # forgets where it has been
+```
 
-The browser dresses itself in the current [Omarchy](https://omarchy.org) theme,
-read from `~/.local/state/omarchy/current/theme` and re-read when it changes.
-Its own chrome takes the theme's tokens directly. Loaded websites get a
-stylesheet injected on top of theirs: links, form controls, the caret, the focus
-ring, selection and scrollbars always, and — on by default, `theme recolor off`
-to stop it — neutral surfaces repainted onto the theme's ramp, leaving anything
-with brand colour in it alone.
-
-**Translucency is two settings, not one.** `[theme] veil` is how see-through a
-*page* is: `"auto"` solves for contrast against your wallpaper and follows
-Ghostty's `background-opacity`, so the browser is as translucent as the terminal
-beside it; a number pins it whatever the wallpaper does. `[chrome] veil` is the
-palette card, opaque by default because it is a card you read dense text off.
-They are independent — a solid page under a glass palette is a valid answer, and
-so is the reverse. `OMA_VEIL` overrules both, as the bisecting hatch.
+`--private` is accepted too, so `omarchy-launch-browser` can hand this binary a URL.
 
 ## Configuration
 
-Every setting lives in one dotfile, `~/.config/oma-browse/config.toml`, beside
-the rest of an Omarchy desktop's config. It is entirely optional: everything has
-a default, and a file with one line in it overrides one thing.
+Every setting lives in `~/.config/oma-browse/config.toml`. It is entirely optional:
+everything has a default, and a file with one line in it overrides one thing.
 
 ```sh
 oma-browse config init    # write a commented file with every setting at its default
@@ -271,7 +334,7 @@ Sections are named for the surface they affect — `[chrome]` is the browser's o
 interface, `[theme]` is what loaded websites get, `[engine]` is WebKit itself:
 
 ```toml
-home = ""                                       # empty = the browser's own start page
+home = "https://omarchy.org"                    # "" for the browser's own start page
 search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 
 [chrome]                    # veil, font, plain_layout
@@ -281,7 +344,7 @@ search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 [window]                    # width, height, decorations, title
 [engine]                    # javascript, devtools, user_agent, autoplay, webrtc,
                             # webgl, smooth_scrolling, font_size, cookies
-[control]                   # socket
+[control]                   # socket, remote_port
 [startup]                   # incognito, restore
 [history]                   # enabled, limit
 [downloads]                 # dir, notify
@@ -290,20 +353,13 @@ search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 [keys]                      # "ctrl+k" = "ui_palette --action toggle"
 ```
 
-**Keys** are remapped by chord: `"ctrl+shift+t" = "tab_reopen"`, with flags
-spelled as they are on the command line (`"tab_cycle --delta -1"`), and an empty
-command to unbind. Anything not named keeps its built-in binding.
+A misspelled setting or key is reported rather than ignored: the browser names the key
+and the line in the log and in `config show`, drops that one line, and starts on its
+defaults for it. `$OMA_BROWSE_CONFIG` overrides the path, for a second profile.
 
-A misspelled key is an error rather than silence — but not a fatal one. The
-browser says which key and which line, on the log and in `config show`, and
-starts on its defaults: a browser that will not open because of a typo is a
-browser you cannot open the config file with. A chord that will not parse or a
-command that does not exist loses that one binding and is reported the same way.
-`$OMA_BROWSE_CONFIG` overrides the path, for a second profile.
-
-Downloads land in your XDG download directory (`~/Downloads` unless
-`user-dirs.dirs` says otherwise), named the way Chrome names them — `report.pdf`,
-then `report (1).pdf`. `[downloads] dir` overrides it.
+Downloads land in your XDG download directory (`~/Downloads` unless `user-dirs.dirs`
+says otherwise), named the way Chrome names them — `report.pdf`, then `report (1).pdf`.
+`[downloads] dir` overrides it.
 
 ## Troubleshooting
 
@@ -313,57 +369,50 @@ then `report (1).pdf`. `[downloads] dir` overrides it.
 | media sites load blank | no GStreamer audio sink — install **gst-plugins-good** |
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
-| tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — that is the escape hatch for bisecting render problems |
+| tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
 
 Logs go to stderr and are filtered with `RUST_LOG`, e.g.
 `RUST_LOG=oma_browse=debug oma-browse`.
 
 ## Layout
 
-- `crates/oma-browse` — the browser: window and GTK surgery, the tab model, the
-  palette and strip, the command graph, the control plane.
-- `crates/oma-theme` — reads an Omarchy theme and renders it as CSS: the token
-  block for our own chrome, and the runtime injected into loaded pages.
+- `crates/oma-browse` — the browser: window and GTK surgery, the tab model, the palette
+  and strip, the command graph, the control plane.
+- `crates/oma-theme` — reads an Omarchy theme and renders it as CSS: the token block for
+  the browser's own chrome, and the runtime injected into loaded pages.
 
 ## Development
 
-Hooks live in `.githooks/` and are opt-in per clone, because git will not let a
-repository point itself at its own hooks — that would be a remote handing you
-code to run on checkout. One line, once:
+Hooks live in `.githooks/` and are opt-in per clone. One line, once:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-**pre-commit** checks that `assets/mark.png` and `assets/icon.png` are still
-tracked — `server.rs` embeds them with `include_bytes!`, and they were lost to
-`.gitignore` once already — then runs `cargo fmt --all --check`. It skips
-rustfmt entirely when nothing Rust-shaped is staged, so a README commit costs
-nothing. Measured at 0.2s.
+**pre-commit** checks that `assets/mark.png` and `assets/icon.png` are still tracked —
+`server.rs` embeds them with `include_bytes!` — then runs `cargo fmt --all --check`. It
+skips rustfmt when nothing Rust-shaped is staged, so a README commit costs nothing.
+Around 0.2s.
 
-**pre-push** runs the slow half of CI: `cargo clippy --workspace --all-targets
--- -D warnings`, the test suite, and `node --check` on the two JavaScript
-runtimes the binary injects. Those are `include_str!` strings to Rust, so a
-syntax error in one compiles, ships, and silently never runs — the only symptom
-is a page that stays unthemed, or `f` that stops drawing link hints. Measured at
-17s warm.
+**pre-push** runs the slow half of CI: `cargo clippy --workspace --all-targets -- -D
+warnings`, the test suite, and `node --check` on the two JavaScript runtimes the binary
+injects. Those are `include_str!` strings to Rust, so a syntax error in one compiles,
+ships and silently never runs; the only symptom is a page that stays unthemed, or `f`
+that stops drawing link hints. Around 17s warm.
 
-The split is measured rather than aesthetic: clippy over the workspace takes
-minutes from cold, and a commit-time hook that costs minutes is a hook people
-learn to `--no-verify` past. Both hooks honour `--no-verify`, and
-`OMA_SKIP_HOOKS=1` does the same for a script that cannot pass the flag.
+Both hooks honour `--no-verify`, and `OMA_SKIP_HOOKS=1` does the same for a script that
+cannot pass the flag.
 
 ## Status
 
-Early, and moving. It is the browser I use, which is a different bar from *it is
-finished*: expect the command graph to grow and the occasional rough edge on a
+Early, and moving. Expect the command graph to grow and the occasional rough edge on a
 site that does something unusual with its own styling.
 
 ## Acknowledgements
 
-[Omarchy](https://omarchy.org) by DHH, whose theme format this reads and whose
-taste the chrome is trying to match. Built on [Tauri](https://tauri.app),
-WebKitGTK, and [Topcoat](https://crates.io/crates/topcoat) for the chrome.
+[Omarchy](https://omarchy.org) by DHH, whose theme format this reads and whose taste the
+chrome is trying to match. Built on [Tauri](https://tauri.app), WebKitGTK, and
+[Topcoat](https://crates.io/crates/topcoat).
 
 ## Licence
 
