@@ -1169,4 +1169,60 @@ mod tests {
             assert!(!shadowed, "{} is unreachable behind an earlier binding", b.tool);
         }
     }
+
+    /// Every built-in chord must name a command that exists.
+    ///
+    /// The config-file chords are checked against the catalog at startup and
+    /// skipped with a complaint when they miss (see `bindings`), but the
+    /// built-in table is mapped straight through without ever being looked up.
+    /// A command renamed in `commands.rs` therefore leaves a key that presses
+    /// fine, dispatches into nothing, and says nothing about it -- the one
+    /// failure a keyboard-driven browser cannot afford, because the only
+    /// symptom is a key that stopped working.
+    #[tokio::test]
+    async fn every_builtin_chord_names_a_real_command() {
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog =
+            crate::commands::command_graph(state).try_tool_catalog().expect("unique tool names");
+
+        let mut dead = Vec::new();
+        for b in BINDINGS {
+            if catalog.get(b.tool).is_none() {
+                dead.push(b.tool);
+            }
+        }
+        assert!(dead.is_empty(), "chords bound to commands that do not exist: {dead:?}");
+    }
+
+    /// And the arguments a chord carries must be ones that command accepts.
+    ///
+    /// A chord whose command exists but whose arguments are wrong fails at the
+    /// far end of the dispatch, where nobody is looking. `page_zoom` taking a
+    /// direction and `tab_cycle` taking a delta are the two that would break
+    /// quietly if either grew a required field.
+    #[tokio::test]
+    async fn every_builtin_chord_carries_arguments_that_command_accepts() {
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog =
+            crate::commands::command_graph(state).try_tool_catalog().expect("unique tool names");
+
+        for b in BINDINGS {
+            let Some(def) = catalog.get(b.tool) else { continue };
+            let known: Vec<String> = def
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default();
+
+            for (name, _) in crate::dispatch::args_from_json(b.args) {
+                assert!(
+                    known.contains(&name),
+                    "{}'s chord passes {name:?}, which {} does not take (it takes {known:?})",
+                    b.tool,
+                    b.tool
+                );
+            }
+        }
+    }
 }

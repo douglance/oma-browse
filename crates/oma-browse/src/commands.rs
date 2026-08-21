@@ -209,6 +209,7 @@ fn content_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("What is blocking, and what could not be read")
+    .mcp(read_only())
     .done();
 
     Cli::create("content")
@@ -467,6 +468,7 @@ fn download_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("List downloaded files, newest first")
+    .mcp(read_only())
     .done();
 
     let s = state.clone();
@@ -830,6 +832,7 @@ fn permission_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("What each site has been allowed or refused")
+    .mcp(read_only())
     .done();
 
     let s = state.clone();
@@ -1064,6 +1067,7 @@ fn bookmark_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("List kept pages, newest first")
+    .mcp(read_only())
     .done();
 
     Cli::create("bookmark")
@@ -1126,6 +1130,7 @@ fn history_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("List recently visited pages, newest first")
+    .mcp(read_only())
     .done();
 
     let s = state;
@@ -1282,6 +1287,7 @@ fn tab_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("List open tabs")
+    .mcp(read_only())
     .done();
 
     let s = state.clone();
@@ -2291,6 +2297,32 @@ async fn idle(state: &Arc<AppState>, budget: std::time::Duration) -> Result<(), 
     }
 }
 
+/// A command that only looks.
+///
+/// MCP's `readOnlyHint` is what lets an agent -- or the policy wrapped around
+/// one -- tell "show me the tabs" apart from "close them", and `call_read_tool`
+/// refuses anything without it. Unset, every command here was writable, so an
+/// agent held to read-only tools could not so much as list a tab.
+///
+/// The bar is the spec's: the tool does not modify its environment. That is
+/// stricter than "feels harmless", and it is why several obvious candidates are
+/// not marked. `page screenshot` and `page print` write a file. `page network
+/// --har` writes one too, and `page source --open` opens a tab, so both are
+/// read-only only until someone passes a flag -- and the hint is per tool, not
+/// per invocation. `page eval` runs whatever it is handed. When in doubt the
+/// answer is to leave it unmarked: the cost of that is an agent using
+/// `call_write_tool` for a read, and the cost of the other mistake is a policy
+/// that believed us.
+fn read_only() -> incurs::command::McpCommandOptions {
+    incurs::command::McpCommandOptions {
+        annotations: Some(incurs::command::McpAnnotations {
+            read_only_hint: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn page_group(state: Arc<AppState>) -> Cli {
     let s = state.clone();
     let eval = CommandDef::typed::<EvalArgs, EvalOptions, (), Evaluated, _, _>(
@@ -2992,6 +3024,7 @@ fn page_group(state: Arc<AppState>) -> Cli {
          the site's layout is left to fight with; `nav reload` puts the page \
          back.",
     )
+    .mcp(read_only())
     .done();
 
     Cli::create("page")
@@ -3218,6 +3251,7 @@ fn config_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("Show the config file's path and every setting as resolved")
+    .mcp(read_only())
     .done();
 
     let init = CommandDef::typed::<NoArgs, ConfigInitOptions, (), ConfigWritten, _, _>(
@@ -3520,6 +3554,7 @@ fn theme_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("Show the Omarchy theme the browser is currently wearing")
+    .mcp(read_only())
     .done();
 
     let reload_state = state.clone();
@@ -3564,6 +3599,7 @@ fn theme_group(state: Arc<AppState>) -> Cli {
         },
     )
     .description("Print the CSS custom properties derived from the current theme")
+    .mcp(read_only())
     .done();
 
     let s = state.clone();
@@ -3661,5 +3697,32 @@ mod tests {
         let known: Vec<String> = vec![];
         assert!(resolve_origin(&known, "").is_err());
         assert!(resolve_origin(&known, "   ").is_err());
+    }
+
+    /// The read-only hint has to reach the catalog, not just the builder.
+    ///
+    /// MCP's `call_read_tool` refuses anything whose `readOnlyHint` is not
+    /// `true`, so an unannotated `tab_list` is a tab list an agent held to
+    /// read-only tools cannot ask for. This asserts the annotation survives
+    /// `.mcp()` -> `.done()` -> `try_tool_catalog`, which is the whole path
+    /// between writing it down and anything acting on it.
+    #[tokio::test]
+    async fn read_only_commands_say_so_in_the_catalog() {
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog = command_graph(state).try_tool_catalog().expect("unique tool names");
+
+        for name in ["tab_list", "history_list", "theme_show", "config_show", "content_list"] {
+            let def = catalog.get(name).unwrap_or_else(|| panic!("{name} is not in the catalog"));
+            let hint = def.annotations.as_ref().and_then(|a| a.read_only_hint);
+            assert_eq!(hint, Some(true), "{name} is not marked read-only");
+        }
+
+        // And the other direction, which is the half that matters for safety:
+        // anything that changes something must not claim to be read-only.
+        for name in ["tab_close", "nav_go", "history_clear", "window_close", "page_eval"] {
+            let def = catalog.get(name).unwrap_or_else(|| panic!("{name} is not in the catalog"));
+            let hint = def.annotations.as_ref().and_then(|a| a.read_only_hint);
+            assert_ne!(hint, Some(true), "{name} claims to be read-only and is not");
+        }
     }
 }
