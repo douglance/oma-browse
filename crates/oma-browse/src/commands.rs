@@ -3704,6 +3704,38 @@ mod tests {
         assert!(resolve_origin(&known, "   ").is_err());
     }
 
+    /// The README says how many commands there are. It has to be right.
+    ///
+    /// Two sessions reconciled this number by hand today, having counted 70 and
+    /// 73 -- the 73 was a miscount off a paged terminal, and it reached a commit
+    /// message before anyone checked. The catalog knows the answer, so the
+    /// README's claim is checked against it rather than maintained beside it.
+    ///
+    /// A new command fails this. That is the point: the sentence in the README
+    /// is part of what shipping a command means, and the failure names the
+    /// number to write.
+    #[tokio::test]
+    async fn the_readme_counts_the_commands_correctly() {
+        let state = std::sync::Arc::new(crate::state::AppState::detached());
+        let catalog = command_graph(state).try_tool_catalog().expect("unique tool names");
+        let actual = catalog.definitions().len();
+
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+        let claim = readme
+            .split("all ")
+            .find_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                let n: usize = digits.parse().ok()?;
+                rest[digits.len()..].starts_with(" of the browser's commands").then_some(n)
+            })
+            .expect("the README no longer says how many commands there are");
+
+        assert_eq!(
+            claim, actual,
+            "the README says {claim} commands and the catalog has {actual}; update README.md"
+        );
+    }
+
     /// The read-only hint has to reach the catalog, and land on the right
     /// command.
     ///
