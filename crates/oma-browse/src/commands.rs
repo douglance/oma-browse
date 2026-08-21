@@ -3704,27 +3704,62 @@ mod tests {
         assert!(resolve_origin(&known, "   ").is_err());
     }
 
-    /// The read-only hint has to reach the catalog, not just the builder.
+    /// The read-only hint has to reach the catalog, and land on the right
+    /// command.
     ///
-    /// MCP's `call_read_tool` refuses anything whose `readOnlyHint` is not
-    /// `true`, so an unannotated `tab_list` is a tab list an agent held to
-    /// read-only tools cannot ask for. This asserts the annotation survives
-    /// `.mcp()` -> `.done()` -> `try_tool_catalog`, which is the whole path
-    /// between writing it down and anything acting on it.
+    /// Pinned as a set rather than a spot-check, because the failure this is
+    /// really guarding is a hint on the wrong tool. The first version of this
+    /// annotation was applied by anchoring on each command's description, and
+    /// `page text`'s description is an argument to the shared `reader` helper
+    /// rather than a link in its own builder chain -- so the hint landed on
+    /// `page reader`, which rewrites the document in the tab. A five-name
+    /// spot-check saw nothing wrong. An exact set fails loudly instead.
+    ///
+    /// Adding a command here is a deliberate act: it says the tool cannot
+    /// modify its environment through any flag it accepts.
     #[tokio::test]
-    async fn read_only_commands_say_so_in_the_catalog() {
+    async fn exactly_these_commands_are_read_only() {
         let state = std::sync::Arc::new(crate::state::AppState::detached());
         let catalog = command_graph(state).try_tool_catalog().expect("unique tool names");
 
-        for name in ["tab_list", "history_list", "theme_show", "config_show", "content_list"] {
-            let def = catalog.get(name).unwrap_or_else(|| panic!("{name} is not in the catalog"));
-            let hint = def.annotations.as_ref().and_then(|a| a.read_only_hint);
-            assert_eq!(hint, Some(true), "{name} is not marked read-only");
-        }
+        let mut marked: Vec<String> = catalog
+            .definitions()
+            .into_iter()
+            .filter(|d| d.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))
+            .map(|d| d.name)
+            .collect();
+        marked.sort();
 
-        // And the other direction, which is the half that matters for safety:
-        // anything that changes something must not claim to be read-only.
-        for name in ["tab_close", "nav_go", "history_clear", "window_close", "page_eval"] {
+        let expected = [
+            "bookmark_list",
+            "config_show",
+            "content_list",
+            "download_list",
+            "history_list",
+            "permission_list",
+            "tab_list",
+            "theme_css",
+            "theme_show",
+        ];
+        assert_eq!(marked, expected, "the read-only set changed");
+
+        // Named individually because each is a specific trap rather than just
+        // an absence: `page_reader` replaces the document, `page_text` and
+        // `page_markdown` write a file under `--path` and open a tab under
+        // `--open`, `page_screenshot` and `page_print` write one always, and
+        // `page_eval` runs whatever it is handed.
+        for name in [
+            "page_reader",
+            "page_text",
+            "page_markdown",
+            "page_source",
+            "page_network",
+            "page_screenshot",
+            "page_print",
+            "page_eval",
+            "tab_close",
+            "history_clear",
+        ] {
             let def = catalog.get(name).unwrap_or_else(|| panic!("{name} is not in the catalog"));
             let hint = def.annotations.as_ref().and_then(|a| a.read_only_hint);
             assert_ne!(hint, Some(true), "{name} claims to be read-only and is not");
