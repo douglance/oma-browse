@@ -18,7 +18,8 @@ pkgbase = oma-browse-bin
 	conflicts = oma-browse
 	conflicts = oma-browse-git
 	options = !strip
+	options = !debug
 	source = oma-browse-0.1.0.tar.gz::https://github.com/douglance/oma-browse/releases/download/v0.1.0/oma-browse-0.1.0-x86_64-linux.tar.gz
-	sha256sums = SKIP
+	sha256sums = e948ca86f37ed45eac7d6574d946c3447ba3d62080f70ca29b7f4e2d91235837
 
 pkgname = oma-browse-bin

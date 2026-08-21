@@ -36,10 +36,13 @@ optdepends=(
 # this rather than being told nothing provides it.
 provides=("oma-browse=$pkgver")
 conflicts=('oma-browse' 'oma-browse-git')
-options=('!strip')  # already stripped by the release build
+# `!strip` because the release build already did it; `!debug` because a
+# prebuilt binary has no sources to split out, and without it makepkg leaves
+# an empty /usr/src/debug/oma-browse-bin in the package.
+options=('!strip' '!debug')
 
 source=("oma-browse-$pkgver.tar.gz::$url/releases/download/v$pkgver/oma-browse-$pkgver-x86_64-linux.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('e948ca86f37ed45eac7d6574d946c3447ba3d62080f70ca29b7f4e2d91235837')
 
 package() {
   cd "$srcdir/oma-browse-$pkgver-x86_64-linux"
