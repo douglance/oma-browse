@@ -27,6 +27,13 @@ optdepends=(
   'ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes'
 )
 
+# `!lto` because of `ring`, which topcoat-cli pulls in for TLS: makepkg enables
+# LTO by default, `-flto=auto` reaches the flags ring's build script compiles its
+# assembly with, and the resulting objects link with every `ring_core_*` symbol
+# undefined. Nothing in this package benefits from LTO enough to be worth
+# carrying a workaround instead.
+options=('!lto')
+
 provides=("oma-browse=$pkgver")
 conflicts=('oma-browse' 'oma-browse-bin')
 source=("$pkgname::git+$url.git")

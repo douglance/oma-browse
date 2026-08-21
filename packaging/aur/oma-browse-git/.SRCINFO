@@ -20,6 +20,7 @@ pkgbase = oma-browse-git
 	provides = oma-browse=r1.0000000
 	conflicts = oma-browse
 	conflicts = oma-browse-bin
+	options = !lto
 	source = oma-browse-git::git+https://github.com/douglance/oma-browse.git
 	sha256sums = SKIP
 
