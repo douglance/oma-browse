@@ -629,8 +629,12 @@ pub fn resize(state: &Arc<AppState>, width: f64, height: f64) -> Result<Placed> 
             if floating {
                 "the compositor chose a different size".to_string()
             } else {
-                "this window is tiled, so its size is the layout's; float it first                  (SUPER + T in a stock Omarchy)"
-                    .to_string()
+                // `SUPER + T` read out of Omarchy's own bindings rather than
+                // guessed: `hl.dsp.window.float({ action = "toggle" })`.
+                let float = "SUPER + T in a stock Omarchy";
+                format!(
+                    "this window is tiled, so its size is the layout's; float it first ({float})"
+                )
             }
         }),
     })

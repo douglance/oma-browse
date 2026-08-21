@@ -539,7 +539,7 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
 | a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |
 | `spellcheck = true` underlines nothing | no dictionary installed — WebKit checks through enchant, which needs a **hunspell** language pack |
-| `window resize` changes nothing | the compositor is tiling that window; float it first (`SUPER + V` in a stock Omarchy) |
+| `window resize` answers `applied: false` | the window is tiled, and a tiled window's size is the layout's — float it first (`SUPER + T` in a stock Omarchy). On Wayland a client cannot size itself at all, so this asks Hyprland and reads the size back; off Hyprland it can only ask |
 | an incognito tab is logged out of a site the previous incognito tab was signed into | each incognito tab gets its own ephemeral WebKit context; Tauri offers no way to share one between webviews |
 
 Logs go to stderr and are filtered with `RUST_LOG`, e.g.
