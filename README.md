@@ -225,7 +225,17 @@ uses the theme's tokens directly. Loaded websites get a stylesheet on top of the
 links, form controls, the caret, focus rings, selection and scrollbars always, and
 neutral surfaces repainted onto the theme's ramp by default. Anything with brand colour
 in it is left alone. `theme recolor off` turns the repainting off for a site that does
-not survive it.
+not survive it — and it takes effect on the page you are already looking at, per window,
+rather than only on the next load.
+
+It is also the lever to reach for on a site that feels sluggish. The repaint works by
+deriving an override for every neutral colour the document declares, which means the
+sheet it adds mirrors the page's own selectors. On a page with flat selectors that costs
+nothing measurable; on a component framework with deep descendant selectors it inherits
+their matching cost and roughly doubles it — measured at **58% added to a full style
+recalculation** on a page of 4,000 such rules, and 40–55% on youtube.com. A single-page
+application recalculates style constantly, so that is a tax on every interaction, not
+just on load. Turning it off for that one site removes the sheet outright.
 
 Page transparency and palette transparency are set separately. `[theme] veil` controls
 how see-through a *page* is: `"auto"` solves for contrast against your wallpaper and
@@ -536,6 +546,7 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
 | tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
+| a site feels sluggish, especially a single-page app | page recolouring adds an override rule per neutral colour the page declares, and on deep selectors that is ~40–58% on every style recalculation — `theme recolor off` drops it for that window, live |
 | `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
 | a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |
 | `spellcheck = true` underlines nothing | no dictionary installed — WebKit checks through enchant, which needs a **hunspell** language pack |
