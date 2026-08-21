@@ -72,6 +72,19 @@ pub fn run(launch: Launch) -> Result<()> {
     // `AppState::background_color`.
     state.set_incognito(incognito);
 
+    // Before GTK builds anything: on Wayland a GTK3 window's `app_id` -- which
+    // is what Hyprland calls `class` -- comes from the program name, and the
+    // program name is read when the surface is created. Setting it afterwards
+    // renames nothing.
+    //
+    // This is the whole of what makes a `--app` window targetable by a window
+    // rule: `windowrule = float, class:oma-browse-app-github-com` cannot be
+    // written against a browser that calls every window `oma-browse`.
+    if let Some(class) = wm_class(&state, &start_url) {
+        tracing::info!(%class, "this window has its own WM class");
+        gtk::glib::set_prgname(Some(&class));
+    }
+
     // Either surface wanting translucency is enough to need it from the window:
     // the page's veil is an element, but chrome's alpha has nothing behind it
     // except whatever the compositor shows through an RGBA window.
@@ -150,17 +163,17 @@ pub fn run(launch: Launch) -> Result<()> {
                 .context("could not create the palette webview")?;
 
             let label = first_tab.clone();
+            let first = crate::profile::in_profile(
+                WebviewBuilder::new(&label, WebviewUrl::External(start_url.clone()))
+                    .auto_resize()
+                    .transparent(translucent)
+                    .background_color(bg)
+                    .initialization_script(&page_script)
+                    .incognito(incognito),
+            );
             let content = window
                 .add_child(
-                    instrument(
-                        WebviewBuilder::new(&label, WebviewUrl::External(start_url.clone()))
-                            .auto_resize()
-                            .transparent(translucent)
-                            .background_color(bg)
-                            .initialization_script(&page_script)
-                            .incognito(incognito),
-                        state.clone(),
-                    ),
+                    instrument(first, state.clone()),
                     LogicalPosition::new(0.0, 0.0),
                     LogicalSize::new(state.config.window.width, state.config.window.height),
                 )
@@ -175,6 +188,9 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::favicon::watch(&content, state.clone()) {
                 tracing::warn!(error = %e, "not watching the first tab's favicon");
             }
+            if let Err(e) = crate::progress::watch(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab loads without a progress bar");
+            }
             // `[engine]`, which is per webview like the two above -- and this is
             // the one webview `tabs::open` never sees.
             if let Err(e) = crate::engine::configure(&content, state.clone()) {
@@ -185,6 +201,18 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::policy::install(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab answers pages with WebKit's defaults");
             }
+            if let Err(e) = crate::inspect::install(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab keeps no console or network log");
+            }
+            if let Err(e) = crate::blocker::install(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab blocks nothing");
+            }
+            // On the main thread, which is where the filter store lives, and
+            // after the first webview so that anything already cached is applied
+            // to it rather than only to the second tab.
+            for problem in crate::blocker::reload(&state) {
+                state.note_config_problem(format!("content.rules: {problem}"));
+            }
 
             crate::layout::install(&palette, &state.config.chrome)?;
             crate::layout::install_keys(&palette, state.clone(), catalog.clone(), state.runtime())?;
@@ -194,7 +222,7 @@ pub fn run(launch: Launch) -> Result<()> {
             // created earlier would be swept in with it and become a tab-shaped
             // hole in the page. It also needs the overlay to exist, since that
             // is what it floats in.
-            if state.config.chrome.strip.enabled {
+            if state.strip_enabled() {
                 let height = state.config.chrome.strip.height;
                 let strip = window
                     .add_child(
@@ -347,6 +375,30 @@ pub fn instrument(
                 state.notify_tabs();
             });
         })
+}
+
+/// What this window should call itself to the compositor.
+///
+/// `None` for an ordinary browser window, which keeps the name the binary was
+/// launched under -- renaming those would break every window rule anybody has
+/// already written.
+fn wm_class(state: &Arc<AppState>, url: &url::Url) -> Option<String> {
+    if !state.app_mode() {
+        return None;
+    }
+    Some(format!("oma-browse-app-{}", class_slug(url.host_str().unwrap_or("app"))))
+}
+
+/// A host, as something a Hyprland rule can be written against.
+fn class_slug(host: &str) -> String {
+    let slug: String = host
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() { "app".to_string() } else { trimmed }
 }
 
 /// Re-dress every surface for the current theme, without a restart.
@@ -504,6 +556,36 @@ pub fn close(state: &Arc<AppState>) -> Result<()> {
 /// window opened by `oma-browse tab open` does not -- that command returns to a
 /// prompt, and a browser writing to the prompt it left behind is noise the user
 /// did not ask for.
+/// Resize the window.
+///
+/// Worth knowing what this does and does not do on Omarchy: a *tiled* Hyprland
+/// window is sized by the compositor, and asking it to be 375 wide is a request
+/// the compositor is entitled to ignore -- and does. Float the window first
+/// (`SUPER + V` in a stock Omarchy) and the size lands. On a floating window,
+/// which is what a second `window new` usually is, it works as written.
+pub fn resize(state: &Arc<AppState>, width: f64, height: f64) -> Result<()> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let window = app.get_window("main").context("the main window has gone away")?;
+    window
+        .set_size(LogicalSize::new(width, height))
+        .context("the window would not take that size")?;
+    Ok(())
+}
+
+/// `1280x720`, as a pair. `None` for anything that is not two numbers with an
+/// `x` between them.
+pub fn parse_size(raw: &str) -> Option<(f64, f64)> {
+    let cleaned = raw.trim().to_ascii_lowercase();
+    let (w, h) = cleaned.split_once('x')?;
+    let width: f64 = w.trim().parse().ok()?;
+    let height: f64 = h.trim().parse().ok()?;
+    // A window with no area is not a window, and neither is one the size of a
+    // billboard: both are typos, and both are better refused here than sent to
+    // a compositor that will do something surprising with them.
+    (width >= 100.0 && height >= 100.0 && width <= 16_384.0 && height <= 16_384.0)
+        .then_some((width, height))
+}
+
 pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -> Result<u32> {
     let exe = std::env::current_exe().context("could not find the running browser binary")?;
     let mut command = std::process::Command::new(exe);
@@ -512,6 +594,12 @@ pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -
     // that quietly drops you back into a session that records history.
     if incognito {
         command.arg("--incognito");
+    }
+    // A window opened from a profile belongs to that profile. The flag is
+    // stripped from argv on the way in (see `crate::profile::take_flag`), so it
+    // has to be put back on the way out.
+    if let Some(profile) = crate::profile::name() {
+        command.arg("--profile").arg(profile);
     }
     // `--new` on both paths: this is Ctrl-N, and a new window is the whole
     // point. Without it the URL would be handed to the window we are standing
@@ -574,4 +662,37 @@ pub fn set_palette_visible(state: &Arc<AppState>, visible: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wm_class_is_something_a_window_rule_can_name() {
+        assert_eq!(class_slug("github.com"), "github-com");
+        assert_eq!(class_slug("app.slack.com"), "app-slack-com");
+        assert_eq!(class_slug("127.0.0.1:8911"), "127-0-0-1-8911");
+        assert_eq!(class_slug("EXAMPLE.COM"), "example-com");
+        assert_eq!(class_slug(""), "app");
+        assert_eq!(class_slug("..."), "app");
+    }
+
+    #[test]
+    fn a_size_is_two_numbers_with_an_x_between_them() {
+        assert_eq!(parse_size("1280x720"), Some((1280.0, 720.0)));
+        assert_eq!(parse_size(" 375 X 812 "), Some((375.0, 812.0)));
+        assert_eq!(parse_size("1280"), None);
+        assert_eq!(parse_size("wide x tall"), None);
+        assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn a_window_with_no_area_is_refused() {
+        assert_eq!(parse_size("0x0"), None);
+        assert_eq!(parse_size("10x10"), None);
+        assert_eq!(parse_size("99999x99999"), None);
+        // The smallest phone anybody tests against still works.
+        assert_eq!(parse_size("320x568"), Some((320.0, 568.0)));
+    }
 }

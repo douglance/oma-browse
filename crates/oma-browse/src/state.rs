@@ -82,6 +82,12 @@ pub struct AppState {
     /// the GTK main thread, with no runtime under it, and it wants the answer
     /// there and then.
     pub permissions: std::sync::Mutex<crate::permissions::Permissions>,
+    /// What every tab has logged and fetched.
+    ///
+    /// A `std::sync::Mutex` for the same reason as `downloads` and
+    /// `permissions`: both taps fire on the GTK main thread, one from a script
+    /// message and one from a WebKit signal, and neither has a runtime under it.
+    pub inspector: std::sync::Mutex<crate::inspect::Inspector>,
     /// Requests waiting on a person, oldest first.
     ///
     /// Only what a command needs to word the question and name the answer; the
@@ -115,6 +121,8 @@ pub struct AppState {
     stage: std::sync::Mutex<Option<String>>,
     /// Whether this window forgets where it has been.
     incognito: std::sync::atomic::AtomicBool,
+    /// Whether this window is one site's window rather than a browser.
+    app_mode: std::sync::atomic::AtomicBool,
     /// Whether WebKit's shared download signal has been hooked yet.
     download_hook: std::sync::atomic::AtomicBool,
     /// Whether to repaint neutral page surfaces.
@@ -143,11 +151,13 @@ impl AppState {
             bookmarks: RwLock::new(crate::bookmarks::Bookmarks::load()),
             downloads: std::sync::Mutex::new(crate::downloads::Downloads::load()),
             permissions: std::sync::Mutex::new(crate::permissions::Permissions::load()),
+            inspector: std::sync::Mutex::new(crate::inspect::Inspector::default()),
             asked: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tls: std::sync::Mutex::new(None),
             login: std::sync::Mutex::new(None),
             logins: std::sync::Mutex::new(std::collections::HashMap::new()),
             incognito: std::sync::atomic::AtomicBool::new(false),
+            app_mode: std::sync::atomic::AtomicBool::new(false),
             download_hook: std::sync::atomic::AtomicBool::new(false),
             stage: std::sync::Mutex::new(None),
             app: OnceLock::new(),
@@ -213,13 +223,21 @@ impl AppState {
         // These ride along with the theme's injection rather than being further
         // `initialization_script`s: all of them have to be re-applied on every
         // navigation, and there is only one hook for that.
-        format!("{theme}\n{}\n{}", self.inset_script(), crate::hints::script())
+        format!(
+            "{theme}\n{}\n{}\n{}",
+            self.inset_script(),
+            crate::hints::script(),
+            crate::inspect::script()
+        )
     }
 
-    /// Take the right to set the cookie policy, once. Same reason as the
-    /// download hook below: the policy is the shared `WebContext`'s, not a
-    /// tab's.
-    pub fn claim_cookie_policy(&self) -> bool {
+    /// Take the right to configure the shared web context, once.
+    ///
+    /// Same reason as the download hook below: the cookie policy, the proxy and
+    /// the spell checker all belong to the `WebContext` every tab shares, not to
+    /// a tab. Doing them per tab would be repeated work at best and, for the
+    /// proxy, a settings object rebuilt under a live connection at worst.
+    pub fn claim_shared_context(&self) -> bool {
         !self.cookie_policy.swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -288,6 +306,29 @@ impl AppState {
         self.incognito.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether this window is a single site's window rather than a browser.
+    ///
+    /// `--app <url>` is the Omarchy web-app case: one page, no strip, no
+    /// palette in your face when it opens, and a WM class of its own so a
+    /// Hyprland rule can target it. The keys still work -- a window you cannot
+    /// reload or close from the keyboard is not chromeless, it is crippled.
+    pub fn app_mode(&self) -> bool {
+        self.app_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_app_mode(&self, on: bool) {
+        self.app_mode.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the tab strip should exist at all.
+    ///
+    /// Two ways to answer no, and they are different questions: the config file
+    /// turned it off, or this window is one site's window and a tab strip would
+    /// be a browser sitting on top of an app.
+    pub fn strip_enabled(&self) -> bool {
+        self.config.chrome.strip.enabled && !self.app_mode()
+    }
+
     /// Set once, from the launch flags. Checked before anything is written to
     /// history, so an incognito window leaves no trace on disk.
     pub fn set_incognito(&self, on: bool) {
@@ -297,7 +338,7 @@ impl AppState {
     /// The strip's top inset, or nothing at all when the strip is off -- the
     /// room is only worth taking for something that is going to be there.
     pub fn inset_script(&self) -> String {
-        if self.config.chrome.strip.enabled {
+        if self.strip_enabled() {
             crate::strip::inset_script(self.config.chrome.strip.height)
         } else {
             String::new()

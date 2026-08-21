@@ -60,6 +60,10 @@ title = true
 # How long to coalesce redraws for. One page load fires a URL change, a title
 # change and a favicon within milliseconds.
 debounce_ms = 80
+# A line along the bottom of the strip while a page loads, in the theme's accent.
+# WebKit's own estimate, pushed in as it moves rather than polled, and drawn by
+# transform alone -- an idle browser runs nothing at all for it.
+progress = true
 
 # --- what loaded websites get ----------------------------------------------
 
@@ -106,6 +110,16 @@ cookies = "no-third-party"
 # turned off for those names, so put nothing here you did not issue the
 # certificate for. Everything else gets an interstitial and `nav trust`.
 trust = []
+# Send everything through a proxy, e.g. "http://127.0.0.1:8080". Empty follows
+# the system setting. This is the line that puts mitmproxy or Burp in front of
+# the browser without touching the environment it was launched from.
+proxy = ""
+# Underline misspelt words in text boxes. Off rather than WebKit's on: a red
+# squiggle under every identifier in every code review is not what this browser
+# should do unasked.
+spellcheck = false
+# Which dictionaries, e.g. ["en_GB"]. Empty follows $LANG.
+spellcheck_languages = []
 
 # --- the control plane -----------------------------------------------------
 
@@ -173,3 +187,21 @@ favicon_size = 32
 # "ctrl+k" = "ui_palette --action toggle"
 # "ctrl+shift+p" = "page_hints"
 # "ctrl+d" = ""
+
+# --- content blocking -------------------------------------------------------
+
+[content]
+# Block, using the rule lists below. WebKitGTK ships Safari's content-blocker
+# compiler, so this happens in C++ before a socket is opened -- pages get
+# faster, not slower.
+block = false
+# Rule lists, as paths to Safari-format JSON on disk. No list ships with the
+# browser. To install one:
+#
+#   curl -Lo ~/.config/oma-browse/easylist.json \
+#     https://easylist-downloads.adblockplus.org/easylist_min_content_blocker.json
+#
+# Paths, not URLs: fetching one would mean a TLS stack in this binary to do a
+# job curl already does, once, before the browser starts. Compiling takes a few
+# seconds the first time and is cached in $XDG_CACHE_HOME/oma-browse/filters.
+rules = []

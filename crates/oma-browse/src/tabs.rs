@@ -68,6 +68,14 @@ struct TabEntry {
     /// See [`Tab::icon`]. Kept per tab rather than per origin: WebKit already
     /// has the origin-keyed cache, and this is only what to paint right now.
     icon: String,
+    /// How far WebKit says this tab's load has got, or `None` when it is not
+    /// loading -- which is the resting state and the great majority of the time.
+    ///
+    /// WebKit's own estimate rather than anything we count: it is the only
+    /// number that knows how many subresources are still outstanding, and
+    /// counting them ourselves would mean a second resource-load listener
+    /// arriving at a worse answer. See [`crate::progress`].
+    progress: Option<f64>,
 }
 
 impl Tabs {
@@ -81,6 +89,7 @@ impl Tabs {
             url,
             title: String::new(),
             icon: String::new(),
+            progress: None,
         });
         (id, label)
     }
@@ -176,6 +185,41 @@ impl Tabs {
         }
     }
 
+    /// Record how far a tab's load has got, reporting whether the strip's bar
+    /// has to be repainted for it.
+    ///
+    /// Two filters, because this is called from a GObject notification that
+    /// fires freely and the answer costs a webview `eval` every time it is yes:
+    /// only the active tab is drawn, and only movement of a whole percent
+    /// counts. A 2px bar across a 1600px window cannot show anything finer, so
+    /// the ones dropped here are repaints nobody could have seen.
+    pub fn set_progress(&mut self, label: &str, value: Option<f64>) -> bool {
+        let active = self.active_label().as_deref() == Some(label);
+        let Some(entry) = self.entries.iter_mut().find(|t| t.label == label) else {
+            return false;
+        };
+
+        let value = match (entry.progress, value) {
+            (None, Some(fraction)) => Some(fraction.min(OPENING)),
+            (_, other) => other,
+        };
+        let moved = match (entry.progress, value) {
+            (Some(was), Some(now)) => percent(was) != percent(now),
+            (was, now) => was.is_some() != now.is_some(),
+        };
+        entry.progress = value;
+        moved && active
+    }
+
+    /// What the strip's load bar should be showing: the active tab's progress,
+    /// or `None` when nothing is loading. Background tabs are deliberately not
+    /// in it -- one bar cannot answer for several loads at once, and the load
+    /// worth watching is the one whose page is on screen.
+    pub fn active_progress(&self) -> Option<f64> {
+        let id = self.active?;
+        self.entries.iter().find(|t| t.id == id).and_then(|t| t.progress)
+    }
+
     pub fn list(&self) -> Vec<Tab> {
         self.entries
             .iter()
@@ -242,6 +286,19 @@ pub fn resolve_input(input: &str, search: &str) -> String {
         return raw.to_string();
     }
 
+    // `:3000` is the dev server. Nobody has ever typed a bare colon-and-port
+    // into an address bar meaning to search the web for it, and everybody who
+    // runs a dev server types it several times a day.
+    //
+    // `http`, not `https`: a dev server that speaks TLS is the exception, and
+    // guessing `https` here would turn the shortcut into an error page.
+    if let Some(rest) = raw.strip_prefix(':') {
+        let port = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return format!("http://localhost:{rest}");
+        }
+    }
+
     // Looks like a host if it has no spaces and either a dot with a plausible
     // TLD, or is localhost (with optional port and path).
     let host = raw.split(['/', '?', '#']).next().unwrap_or(raw);
@@ -267,6 +324,22 @@ pub fn resolve_input(input: &str, search: &str) -> String {
     } else {
         format!("{search}{encoded}")
     }
+}
+
+/// The most a load may claim on its first reading.
+///
+/// WebKit does not clear `estimated-load-progress` at the moment a load
+/// *starts*; it clears it a beat later. So the first notification of a new load
+/// still carries the last one's number, which is 1.0 -- and taken at face value
+/// that is a full bar flashed across the window at the instant a page begins to
+/// load, saying the opposite of what it means. Nothing has arrived yet whatever
+/// the property still holds, so the opening reading is capped rather than
+/// trusted.
+const OPENING: f64 = 0.1;
+
+/// A load fraction rounded to what a progress bar can actually draw.
+fn percent(fraction: f64) -> i32 {
+    (fraction.clamp(0.0, 1.0) * 100.0).round() as i32
 }
 
 fn urlencode(s: &str) -> String {
@@ -330,6 +403,7 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
         // and of the two failures -- "logged out in the new tab" against
         // "not actually private" -- only one of them is a lie.
         .incognito(state.incognito());
+    let builder = crate::profile::in_profile(builder);
 
     let view = win
         .add_child(
@@ -351,11 +425,20 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     if let Err(e) = crate::favicon::watch(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "not watching this tab's favicon");
     }
+    if let Err(e) = crate::progress::watch(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab loads without a progress bar");
+    }
     if let Err(e) = crate::engine::configure(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab kept WebKit's own settings");
     }
     if let Err(e) = crate::policy::install(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab answers pages with WebKit's defaults");
+    }
+    if let Err(e) = crate::inspect::install(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab keeps no console or network log");
+    }
+    if let Err(e) = crate::blocker::install(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab blocks nothing");
     }
 
     if background {
@@ -403,6 +486,11 @@ pub async fn close(state: &Arc<AppState>, id: Option<u32>) -> Result<Option<u32>
 
     if let Ok(view) = webview(&app, &label) {
         let _ = view.close();
+    }
+    // The tab's console and network log go with it. Keeping them would mean a
+    // browser open for a day remembered every page it had ever closed.
+    if let Ok(mut inspector) = state.inspector.lock() {
+        inspector.clear(Some(&label));
     }
     if let Some(next) = next {
         select(state, next).await?;
@@ -499,7 +587,13 @@ pub enum FindAction {
 /// is why "next" needs no argument: the controller still holds the term from
 /// the last `search`. That also means stopping matters -- the highlight
 /// survives navigation otherwise.
-pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
+/// Search the active page, and say how many matches there were.
+///
+/// `None` when the number is not knowable: a `next`/`previous`/`clear`, a
+/// platform without WebKit, or a page that did not answer in time. A counter
+/// that guesses zero when it simply has not heard back is worse than one that
+/// says nothing.
+pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<Option<u32>> {
     let app = state.app_handle().context("the window is not up yet")?;
     let label =
         state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
@@ -507,8 +601,14 @@ pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let counting = matches!(action, FindAction::Search(_));
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let tx = std::sync::Mutex::new(Some(tx));
+
         view.with_webview(move |platform| {
+            use gtk::glib::prelude::*;
             use webkit2gtk::{FindController, FindControllerExt, FindOptions, WebViewExt};
+
             let Some(finder): Option<FindController> = platform.inner().find_controller() else {
                 tracing::warn!("this webview has no find controller");
                 return;
@@ -518,6 +618,29 @@ pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
                     // Case-insensitive and wrapping, which is what every
                     // browser's Ctrl-F does and what anyone expects.
                     let options = FindOptions::CASE_INSENSITIVE | FindOptions::WRAP_AROUND;
+
+                    // The count arrives on a signal rather than from the call,
+                    // so the handler is connected for exactly one answer and
+                    // then taken off again. Connecting once per webview instead
+                    // would leave a handler firing into a channel nobody is
+                    // listening on for the rest of the tab's life.
+                    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+                    let mine = slot.clone();
+                    let id = finder.connect_counted_matches(move |finder, count| {
+                        if let Ok(mut held) = tx.lock()
+                            && let Some(tx) = held.take()
+                        {
+                            let _ = tx.send(count);
+                        }
+                        if let Some(id) = mine.borrow_mut().take() {
+                            finder.disconnect(id);
+                        }
+                    });
+                    // Cannot fire before this line: the signal is emitted from
+                    // the same main loop this closure is running on.
+                    *slot.borrow_mut() = Some(id);
+
+                    finder.count_matches(&text, options.bits(), u32::MAX);
                     finder.search(&text, options.bits(), u32::MAX);
                 }
                 FindAction::Next => finder.search_next(),
@@ -526,7 +649,17 @@ pub async fn find(state: &Arc<AppState>, action: FindAction) -> Result<()> {
             }
         })
         .context("could not reach the webview")?;
-        Ok(())
+
+        if !counting {
+            return Ok(None);
+        }
+        // A page that never answers is a page with a find controller that did
+        // not emit -- reported as "no number", not as a failed search, because
+        // the highlighting has happened either way.
+        Ok(tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .ok()
+            .and_then(Result::ok))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -857,6 +990,7 @@ pub async fn history(state: &Arc<AppState>, action: HistoryAction) -> Result<()>
                     HistoryAction::Back => w.go_back(),
                     HistoryAction::Forward => w.go_forward(),
                     HistoryAction::Stop => w.stop_loading(),
+                    HistoryAction::HardReload => w.reload_bypass_cache(),
                     HistoryAction::Reload => w.reload(),
                 }
             })
@@ -901,6 +1035,12 @@ pub enum HistoryAction {
     Back,
     Forward,
     Reload,
+    /// Reload, ignoring everything already cached.
+    ///
+    /// The one an engineer actually wants: a plain reload happily serves the
+    /// bundle the dev server built four minutes ago, and no amount of saving the
+    /// file changes that.
+    HardReload,
     Stop,
 }
 
@@ -910,6 +1050,78 @@ mod tests {
 
     /// The stock template, so a test reads as what it is testing.
     const SEARCH: &str = "https://duckduckgo.com/?q={query}";
+
+    /// Two tabs, the first of them active.
+    fn pair() -> Tabs {
+        let mut tabs = Tabs::default();
+        let (id, _) = tabs.allocate("https://one.example".into());
+        tabs.allocate("https://two.example".into());
+        tabs.set_active(id);
+        tabs
+    }
+
+    /// A tab with a load already under way, past the capped opening reading —
+    /// which is the state every assertion about *movement* wants to start from.
+    fn loading(tabs: &mut Tabs, label: &str, fraction: f64) {
+        tabs.set_progress(label, Some(0.0));
+        tabs.set_progress(label, Some(fraction));
+    }
+
+    #[test]
+    fn only_the_active_tab_repaints_the_load_bar() {
+        let mut tabs = pair();
+        loading(&mut tabs, "tab-0", 0.4);
+        assert!(tabs.set_progress("tab-0", Some(0.6)), "the active tab is the one drawn");
+        loading(&mut tabs, "tab-1", 0.4);
+        assert!(!tabs.set_progress("tab-1", Some(0.6)), "a background load has nowhere to go");
+        // Recorded either way: it is only the *painting* that is skipped, so
+        // switching to that tab still finds its bar where it should be.
+        tabs.set_active(1);
+        assert_eq!(tabs.active_progress(), Some(0.6));
+    }
+
+    #[test]
+    fn movement_under_a_percent_is_not_worth_an_eval() {
+        let mut tabs = pair();
+        loading(&mut tabs, "tab-0", 0.40);
+        assert!(!tabs.set_progress("tab-0", Some(0.402)), "invisible on a 2px bar");
+        assert!(tabs.set_progress("tab-0", Some(0.41)), "a whole percent shows");
+    }
+
+    #[test]
+    fn starting_and_finishing_always_repaint() {
+        let mut tabs = pair();
+        // Both edges matter however still the number is either side of them:
+        // these are the frames the bar appears and disappears on.
+        assert!(tabs.set_progress("tab-0", Some(0.0)), "a load beginning at nothing");
+        assert!(tabs.set_progress("tab-0", None), "and the same load ending");
+        assert_eq!(tabs.active_progress(), None, "a tab at rest has no bar");
+        assert!(!tabs.set_progress("tab-0", None), "but not twice");
+    }
+
+    #[test]
+    fn a_load_does_not_open_on_the_last_ones_number() {
+        // WebKit hands over the *previous* load's 1.0 on the first
+        // notification of the next one; see `OPENING`. Uncapped, that is a full
+        // bar flashed across the window every time a page starts loading.
+        let mut tabs = pair();
+        tabs.set_progress("tab-0", Some(1.0));
+        assert_eq!(tabs.active_progress(), Some(OPENING));
+        // Only the opening reading. Once a load is under way its numbers are
+        // its own, and 1.0 then means what it says.
+        tabs.set_progress("tab-0", Some(0.5));
+        tabs.set_progress("tab-0", Some(1.0));
+        assert_eq!(tabs.active_progress(), Some(1.0));
+    }
+
+    #[test]
+    fn a_tab_that_is_gone_reports_nothing() {
+        // The notification is asynchronous, so a tab can be closed between
+        // WebKit reading the value and the runtime getting to it.
+        let mut tabs = pair();
+        assert!(!tabs.set_progress("tab-9", Some(0.5)));
+        assert_eq!(tabs.active_progress(), None);
+    }
 
     #[test]
     fn a_toggle_reads_every_spelling_and_nothing_else() {
@@ -929,6 +1141,15 @@ mod tests {
             Toggle::parse("yes").is_none(),
             "an unknown spelling must be rejected, not guessed"
         );
+    }
+
+    #[test]
+    fn a_bare_port_is_the_dev_server() {
+        assert_eq!(resolve_input(":3000", SEARCH), "http://localhost:3000");
+        assert_eq!(resolve_input(":8080/health", SEARCH), "http://localhost:8080/health");
+        // Not a port, so not a shortcut: this is a search, and it must stay one.
+        assert!(resolve_input(":not-a-port", SEARCH).starts_with("https://duckduckgo.com/"));
+        assert!(resolve_input(":", SEARCH).starts_with("https://duckduckgo.com/"));
     }
 
     #[test]

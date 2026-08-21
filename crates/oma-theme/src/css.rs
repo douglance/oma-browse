@@ -119,6 +119,13 @@ impl ThemeCss {
         let s = &self.semantic;
         // `!important` throughout: we are competing with the site's own rules,
         // and losing silently is worse than not styling at all.
+        //
+        // `a:any-link` is (0,1,1) on purpose: it has to outrank a site's own
+        // `a { color: ... }` so links stay findable, including on the many
+        // sites that paint them a neutral grey. The one thing that legitimately
+        // beats it is a colour `page.js` measured against a background we chose
+        // not to touch -- see `brandBg` there, which raises just those rules
+        // above this one rather than lowering this one for everybody.
         format!(
             ":root {{ color-scheme: {mode} !important;\n{vars}}}\n\
              a:any-link {{ color: {accent} !important; }}\n\
@@ -432,3 +439,27 @@ fn js_string(s: &str) -> String {
 /// Injected as a WebKitGTK user script, so it runs at document-start on every
 /// navigation, and re-running it tears the previous instance down first.
 const PAGE_SCRIPT: &str = include_str!("page.js");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The link accent must keep its specificity.
+    ///
+    /// It is `a:any-link` at (0,1,1) so that it outranks a site's own
+    /// `a { color: ... }` -- links on sites that paint them neutral grey stay
+    /// findable only because of that. Wrapping it in `:where()` fixes a button
+    /// contrast bug at the cost of this, which is the wrong trade: `page.js`
+    /// raises the handful of rules that should win instead.
+    #[test]
+    fn the_link_accent_keeps_its_specificity() {
+        // `load` cannot fail -- it falls back to the built-in palette -- and the
+        // assertion is on static rule text, so it holds under any theme.
+        let css = ThemeCss::build(&crate::Theme::load()).page_css();
+        assert!(css.contains("a:any-link {"), "the link rule went missing");
+        assert!(
+            !css.contains(":where(a:any-link)"),
+            "zeroing this rule's specificity makes neutral-coloured links render as body text"
+        );
+    }
+}

@@ -2,7 +2,10 @@
 //
 // Vimium's interaction, because a decade of muscle memory already knows it:
 // `f` labels every clickable element in the viewport, typing the label
-// activates it, `F` does the same but opens links in a new tab.
+// activates it, `F` does the same but opens links in a new tab. The same file
+// carries the scroll keys -- `j`, `k`, `d`, `u`, `gg`, `G` -- which belong here
+// for exactly the same reason: they are bare letters, and only the page knows
+// whether the caret is in a text field.
 //
 // This runs as a *page* script rather than a GTK accelerator, which is the
 // opposite of every other shortcut in this browser (see
@@ -320,8 +323,42 @@
       return;
     }
 
+    // No Ctrl-d / Ctrl-u here, deliberately. Both are already the browser's --
+    // `bookmark add` and `page source` -- and both are bound on the GTK
+    // toplevel with `propagate: false` (see `layout::BINDINGS`), so a page
+    // handler for them can never fire. Measured: Ctrl-U opened the source in a
+    // new tab and the page never saw the keystroke. Vimium's own half-page keys
+    // are the bare `d` and `u` below anyway.
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     if (typing()) return;
+
+    // `gg` is two keystrokes, and the first one has to be remembered without
+    // swallowing a `g` that turns out to be the start of something else. Half a
+    // second is Vim's own feel for this.
+    if (pendingG && e.key !== "g") pendingG = false;
+
+    switch (e.key) {
+      case "j": scroll(STEP, false); stop(e); return;
+      case "k": scroll(-STEP, false); stop(e); return;
+      case "d": scroll(page() / 2, false); stop(e); return;
+      case "u": scroll(-page() / 2, false); stop(e); return;
+      case "G": toEnd(true); stop(e); return;
+      case "g":
+        if (pendingG) {
+          pendingG = false;
+          clearTimeout(gTimer);
+          toEnd(false);
+          stop(e);
+          return;
+        }
+        pendingG = true;
+        gTimer = setTimeout(function () { pendingG = false; }, 500);
+        stop(e);
+        return;
+      default:
+        break;
+    }
+
     if (e.key === "f") {
       show("click");
       stop(e);
@@ -329,6 +366,56 @@
       show("newtab");
       stop(e);
     }
+  }
+
+  // --------------------------------------------------------------------
+  // Scrolling
+  // --------------------------------------------------------------------
+  //
+  // Here rather than on the GTK toplevel for the same reason `f` is: these are
+  // bare letters, and a toplevel accelerator would eat them in every search box
+  // on the web. Only the page knows where the caret is, and `typing()` above is
+  // already the thing that knows.
+
+  var STEP = 64;
+  var pendingG = false;
+  var gTimer = null;
+
+  // What actually scrolls. The document, when the document can -- but a great
+  // many applications scroll an inner pane and leave `body` fixed, and on those
+  // `window.scrollBy` is a no-op that looks like a broken key.
+  function scroller() {
+    var root = document.scrollingElement || document.documentElement;
+    if (root && root.scrollHeight > root.clientHeight + 1) return root;
+    var best = null;
+    var boxes = document.querySelectorAll("div,main,section,article,ul,ol,pre,tbody");
+    for (var i = 0; i < boxes.length && i < 2000; i++) {
+      var el = boxes[i];
+      if (el.scrollHeight <= el.clientHeight + 1) continue;
+      var how = getComputedStyle(el).overflowY;
+      if (how !== "auto" && how !== "scroll") continue;
+      var area = el.clientWidth * el.clientHeight;
+      if (!best || area > best.clientWidth * best.clientHeight) best = el;
+    }
+    return best || root;
+  }
+
+  function page() {
+    var el = scroller();
+    return Math.max(el.clientHeight || window.innerHeight, 1);
+  }
+
+  function scroll(by, smooth) {
+    var el = scroller();
+    // `scrollBy` on the scrolling element and on an inner pane are the same
+    // call, which is the whole reason for picking an element rather than
+    // branching on `window`.
+    el.scrollBy({ top: by, left: 0, behavior: smooth ? "smooth" : "instant" });
+  }
+
+  function toEnd(bottom) {
+    var el = scroller();
+    el.scrollTo({ top: bottom ? el.scrollHeight : 0, left: 0, behavior: "smooth" });
   }
 
   // Capture, and installed at document-start, so a site's own key handling

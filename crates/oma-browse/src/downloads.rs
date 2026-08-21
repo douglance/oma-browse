@@ -19,9 +19,25 @@ pub struct Download {
     pub started: u64,
     /// `None` while the transfer is still running.
     pub ok: Option<bool>,
+    /// How far along, 0.0 to 1.0. WebKit's own estimate, which is a guess
+    /// wherever the server sent no `Content-Length`.
+    ///
+    /// In memory only, and deliberately: a progress figure is meaningless the
+    /// moment the process that was making it exits, and writing it to the
+    /// downloads file would mean reading back "47%" for a transfer nothing is
+    /// working on.
+    pub progress: f64,
+    /// Bytes written so far.
+    pub bytes: u64,
 }
 
 impl Download {
+    /// How far along, as a whole percent, or `None` for a transfer that has
+    /// ended -- where the honest answer is its outcome, not a number.
+    pub fn percent(&self) -> Option<u8> {
+        self.ok.is_none().then(|| (self.progress.clamp(0.0, 1.0) * 100.0).round() as u8)
+    }
+
     /// The bit a human recognises: the file's own name.
     pub fn name(&self) -> String {
         self.path
@@ -75,6 +91,8 @@ impl Downloads {
                     "done" => Some(true),
                     _ => Some(false),
                 },
+                progress: 0.0,
+                bytes: 0,
             });
         }
         out
@@ -84,7 +102,14 @@ impl Downloads {
     pub fn start(&mut self, url: &str, path: &Path, now: u64) {
         self.entries.insert(
             0,
-            Download { url: url.to_string(), path: path.to_path_buf(), started: now, ok: None },
+            Download {
+                url: url.to_string(),
+                path: path.to_path_buf(),
+                started: now,
+                ok: None,
+                progress: 0.0,
+                bytes: 0,
+            },
         );
         self.entries.truncate(CAP);
         self.save();
@@ -110,6 +135,17 @@ impl Downloads {
         let done = entry.clone();
         self.save();
         Some(done)
+    }
+
+    /// How far along the transfer headed for this path is.
+    ///
+    /// Not saved: see [`Download::progress`]. That also makes this cheap enough
+    /// to call on every chunk, which is what WebKit's signal does.
+    pub fn progress(&mut self, path: &Path, progress: f64, bytes: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|d| d.path == path && d.ok.is_none()) {
+            entry.progress = progress;
+            entry.bytes = bytes;
+        }
     }
 
     /// Move a running entry to a different destination.
@@ -328,6 +364,25 @@ pub fn watch<R: tauri::Runtime>(
                 download.set_destination(&better.to_string_lossy());
                 if let Ok(mut list) = rename_state.downloads.lock() {
                     list.rename(&chosen, &better);
+                }
+            });
+
+            // Progress, on every chunk. Cheap by construction: nothing is
+            // written to disk (see `Downloads::progress`) and the destination is
+            // read from the download rather than captured, so a rename part-way
+            // through -- which is exactly what the response hook above does --
+            // does not leave this updating an entry that no longer exists.
+            let moving = state.clone();
+            let received = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let counted = received.clone();
+            download.connect_received_data(move |_download, chunk| {
+                counted.set(counted.get().saturating_add(chunk));
+            });
+            download.connect_estimated_progress_notify(move |download| {
+                let Some(destination) = download.destination() else { return };
+                let path = PathBuf::from(destination.as_str());
+                if let Ok(mut list) = moving.downloads.lock() {
+                    list.progress(&path, download.estimated_progress(), received.get());
                 }
             });
 

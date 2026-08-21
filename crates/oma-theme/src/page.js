@@ -455,6 +455,45 @@
   // Follow `var(--a, fallback)` through root-level declarations. Bounded to a
   // few hops: design systems chain aliases, but not deeply, and a cycle must not
   // hang the page.
+  // A `background` shorthand, taken apart into the longhand we actually map.
+  //
+  // This is not a nicety. CSSOM leaves every longhand of a shorthand that
+  // contains `var()` serializing as the empty string -- "pending-substitution"
+  // -- so `background: var(--surface)` reports no `background-color` at all.
+  // Reading only the longhand therefore skipped the background of every site
+  // that states it through a token, which is most design systems now:
+  // omarchy.org's own buttons kept their brand fill not because `isNeutral`
+  // spared them but because nothing here ever saw them.
+  //
+  // The engine's parser does the work rather than a regex, because the
+  // shorthand is a real grammar -- `#fff url(x) no-repeat` is a colour and an
+  // image and three keywords -- and getting that wrong quietly repaints the
+  // wrong half of it. The probe is detached and never inserted, so setting a
+  // property on it parses and normalises without touching layout.
+  var probe = null;
+
+  function fromShorthand(value, longhand) {
+    if (!value || value.indexOf("var(") !== -1) return "";
+    if (!probe) probe = document.createElement("div");
+    probe.style.cssText = "";
+    try {
+      probe.style.background = value;
+    } catch (e) {
+      return "";
+    }
+    return probe.style.getPropertyValue(longhand);
+  }
+
+  // The background colour a rule paints, whichever way it says it.
+  function backgroundOf(rule, vars, longhand) {
+    var direct = rule.style.getPropertyValue(longhand);
+    if (direct) return resolveVars(direct, vars);
+    // Resolved first: the probe cannot parse a `var()` any more than the rule
+    // could, so substitution has to happen before the engine sees it.
+    var short = resolveVars(rule.style.getPropertyValue("background"), vars);
+    return fromShorthand(short, longhand);
+  }
+
   function resolveVars(value, vars) {
     var v = value;
     for (var hop = 0; hop < 4; hop++) {
@@ -536,6 +575,54 @@
     var l = lightness(value);
     if (!p || l === null) return null;
     return ramp(FG_FLOOR + (1 - FG_FLOOR) * depth(l, base), p[3]);
+  }
+
+  // WCAG relative luminance, which is not the same thing as `lightness` above.
+  // That one is a cheap weighted average and is all the ramp needs; picking a
+  // readable foreground is a contrast question, and contrast is only defined on
+  // linearised channels. Using the cheap one here picks the wrong colour on
+  // mid-tone brand fills, which is precisely the case this is for.
+  function relativeLuminance(p) {
+    var c = [];
+    for (var i = 0; i < 3; i++) {
+      var v = p[i] / 255;
+      c.push(v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+    }
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  }
+
+  function contrastRatio(a, b) {
+    return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+  }
+
+  // WCAG's large-text threshold. Button and chip labels are the thing this
+  // guards, and they are bold or uppercase far more often than not.
+  var LEGIBLE_MIN = 3;
+
+  // The better of the theme's two ends against a background we are not touching.
+  //
+  // Only ever the theme's own foreground or its canvas, so this stays correct
+  // under every Omarchy theme without knowing anything about which one is on:
+  // a light brand fill gets the canvas, a dark one gets the foreground, and a
+  // theme whose ends are unusually close still gets whichever is further away.
+  function readableOn(value) {
+    var p = channels(value);
+    if (!p) return null;
+    var bg = relativeLuminance(p);
+    var toFg = contrastRatio(bg, relativeLuminance(CFG.fgRgb));
+    var toCanvas = contrastRatio(bg, relativeLuminance(CFG.tint));
+    var best = Math.max(toFg, toCanvas);
+    // A floor, not a preference. Some theme-and-brand pairings have no legible
+    // answer inside the palette at all -- Everforest's foreground on Stripe's
+    // indigo is 2.78:1, Latte's on Hacker News orange is 2.72:1 -- and a label
+    // nobody can read is a worse outcome than one pixel of the page not being
+    // Omarchy-tinted. Only reached when both theme ends fail, which across the
+    // stock themes is a handful of cases out of sixty.
+    if (best < LEGIBLE_MIN) {
+      return contrastRatio(bg, 1) >= contrastRatio(bg, 0) ? "#fff" : "#000";
+    }
+    var pick = toFg >= toCanvas ? CFG.fgRgb : CFG.tint;
+    return "rgb(" + pick[0] + "," + pick[1] + "," + pick[2] + ")";
   }
 
   // A variable whose name gives no clue how it will be used. Treat it as a
@@ -689,6 +776,13 @@
 
     eachStyleRule(function (rule, wrap) {
       var decls = "";
+      // Set when the background below turns out to be the site's own brand
+      // colour, which we leave alone; the foreground pass then leaves its
+      // partner alone too.
+      var brandBg = null;
+      // That partner is emitted separately, because it is the one declaration
+      // here that has to outrank `a:any-link`. See the push below.
+      var pairDecl = "";
 
       // Custom properties first. Retinting the variable retints every rule that
       // reads it, which on a site like Wikipedia is nearly all of them -- its
@@ -722,7 +816,7 @@
         decls += prop + ":" + mapped + " !important;";
       }
 
-      var bg = resolveVars(rule.style.getPropertyValue("background-color"), varMap);
+      var bg = backgroundOf(rule, varMap, "background-color");
       if (bg && isNeutral(bg)) {
         // The page canvas is the veil's job, always. Whatever neutral a site
         // paints on `html`/`body` is by definition its base, and letting it
@@ -736,18 +830,55 @@
       } else if (bg) {
         var mt = mapTintedBackground(bg, base);
         if (mt) decls += "background-color:" + mt + " !important;";
+        // Nothing mapped means we are keeping the site's own fill: brand colour,
+        // by the rule `isNeutral` states. That decision reaches past the
+        // background -- see `brandBg` below.
+        else if (lightness(bg) !== null) brandBg = bg;
       }
-      var img = rule.style.getPropertyValue("background-image");
+      var img = backgroundOf(rule, varMap, "background-image");
       var mg = mapGradient(img, base);
       if (mg) decls += "background-image:" + mg + " !important;";
       var fg = resolveVars(rule.style.getPropertyValue("color"), varMap);
-      if (fg && isNeutral(fg)) {
+      // A foreground declared alongside a background we are keeping is half of a
+      // pair, not an independent colour. The site picked those two to read
+      // against each other, and mapping one end of a pair onto the theme ramp
+      // while the other end keeps its brand value is what turns a legible button
+      // into two colours of the same weight -- omarchy.org's own call-to-action
+      // buttons came back accent-on-brand-blue, at about 1.1:1.
+      //
+      // So: keep the pair. The literal is emitted rather than the `var()` the
+      // site wrote, because the custom-property pass above has already retinted
+      // that variable for its use as a background elsewhere.
+      if (brandBg) {
+        var pair = fg || readableOn(brandBg);
+        // A translucent fill is mostly the page underneath it, so the site's
+        // pairing was never against this colour alone and `readableOn` would be
+        // answering the wrong question. Only a declared colour is trustworthy
+        // there; with none, fall through and leave the cascade alone.
+        var solid = (channels(brandBg) || [0, 0, 0, 1])[3] >= 0.9;
+        if (pair && (fg || solid)) pairDecl = "color:" + pair + " !important;";
+      } else if (fg && isNeutral(fg)) {
         var mf = mapForeground(fg, base);
         if (mf) decls += "color:" + mf + " !important;";
       }
-      if (!decls) return;
-      var text = rule.selectorText + "{" + decls + "}";
-      out.push(wrap ? wrap + "{" + text + "}" : text);
+      if (decls) {
+        var text = rule.selectorText + "{" + decls + "}";
+        out.push(wrap ? wrap + "{" + text + "}" : text);
+      }
+      // The brand pair, raised above `css.rs`'s `a:any-link { !important }`.
+      //
+      // That rule is (0,1,1) and has to stay there, or a site's neutral-grey
+      // links stop reading as links. But a link styled as a button is exactly
+      // the case where it is wrong, and the site's own selector is usually
+      // below it -- `.button` is (0,1,0). Two `:root`s buy (0,2,0) and `:is()`
+      // carries the original selector at its own weight without needing the
+      // selector list split, so `.button` lands at (0,3,0) and wins. The same
+      // device, for the same reason, as the canvas rule at the end of this
+      // function.
+      if (pairDecl) {
+        var lifted = ":root:root :is(" + rule.selectorText + "){" + pairDecl + "}";
+        out.push(wrap ? wrap + "{" + lifted + "}" : lifted);
+      }
     });
     // Unconditionally, last, so it wins on document order: the canvas belongs to
     // the veil. The per-rule pass above only fires on a neutral literal, and a
@@ -783,6 +914,7 @@
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
       if (ours(el)) continue;
+      var brandInline = null;
       var bg = el.style.backgroundColor;
       if (bg && isNeutral(bg)) {
         // Same rule as the stylesheet pass: the canvas belongs to the veil. X
@@ -794,11 +926,20 @@
       } else if (bg) {
         var mt = mapTintedBackground(bg, base);
         if (mt) el.style.setProperty("background-color", mt, "important");
+        else if (lightness(bg) !== null) brandInline = bg;
       }
       var mg = mapGradient(el.style.backgroundImage, base);
       if (mg) el.style.setProperty("background-image", mg, "important");
       var fg = el.style.color;
-      if (fg && isNeutral(fg)) {
+      // The same pair rule the stylesheet pass applies, for the sites that write
+      // their colours onto the element instead of into a sheet.
+      if (brandInline) {
+        var inlinePair = fg || readableOn(brandInline);
+        var inlineSolid = (channels(brandInline) || [0, 0, 0, 1])[3] >= 0.9;
+        if (inlinePair && (fg || inlineSolid)) {
+          el.style.setProperty("color", inlinePair, "important");
+        }
+      } else if (fg && isNeutral(fg)) {
         var mf = mapForeground(fg, base);
         if (mf) el.style.setProperty("color", mf, "important");
       }

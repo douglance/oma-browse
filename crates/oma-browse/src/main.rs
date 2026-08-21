@@ -4,6 +4,7 @@
 // fire on every test in the tree; the non-test build still checks the real code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod blocker;
 mod bookmarks;
 mod commands;
 mod config;
@@ -12,15 +13,19 @@ mod dispatch;
 mod downloads;
 mod engine;
 mod favicon;
+mod follow;
 mod fuzzy;
 mod hints;
 mod history;
+mod inspect;
 mod keys;
 mod layout;
 mod mcp;
 mod paths;
 mod permissions;
 mod policy;
+mod profile;
+mod progress;
 mod server;
 mod session;
 mod shot;
@@ -28,6 +33,7 @@ mod state;
 mod strip;
 mod tabs;
 mod ui;
+mod vault;
 mod window;
 
 use std::sync::Arc;
@@ -43,7 +49,7 @@ use crate::state::AppState;
 /// rewrites its own `--private` to `--incognito` for non-Firefox, non-Edge
 /// browsers, so both of those have to land in GUI mode.
 enum Invocation {
-    Gui { url: Option<String>, incognito: bool, palette: bool, fresh: bool },
+    Gui { url: Option<String>, incognito: bool, palette: bool, fresh: bool, app: bool },
     Command,
 }
 
@@ -52,10 +58,21 @@ fn classify(args: &[String]) -> Invocation {
     let mut incognito = false;
     let mut palette = false;
     let mut fresh = false;
+    let mut app = false;
 
     for arg in args {
         match arg.as_str() {
             "--incognito" | "--private" => incognito = true,
+            // One site's window: no strip, no palette on open, and a WM class of
+            // its own. Both spellings, because Chrome's is `--app=<url>` and
+            // that is the one people's fingers already know.
+            "--app" => app = true,
+            a if a.starts_with("--app=") => {
+                app = true;
+                if let Some(rest) = a.strip_prefix("--app=").filter(|r| !r.is_empty()) {
+                    url = Some(normalize_url(rest));
+                }
+            }
             // Ours, and only ours: `window new` passes it when it has no URL to
             // send the new window to, so Ctrl-N comes up asking where to go
             // rather than sitting on the start page. See `window::spawn`.
@@ -69,7 +86,7 @@ fn classify(args: &[String]) -> Invocation {
             _ => return Invocation::Command,
         }
     }
-    Invocation::Gui { url, incognito, palette, fresh }
+    Invocation::Gui { url, incognito, palette, fresh, app }
 }
 
 fn looks_like_url(s: &str) -> bool {
@@ -93,10 +110,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Before anything asks where the config file, the history or the control
+    // socket lives: `--profile` moves all three, and a process that read one of
+    // them first would be half in one profile and half in another.
+    let (args, profile) = profile::take_flag(std::env::args().skip(1).collect());
+    profile::set(profile);
+
     match classify(&args) {
         Invocation::Command => command(args).await,
-        Invocation::Gui { url, incognito, palette, fresh } => {
+        Invocation::Gui { url, incognito, palette, fresh, app } => {
             // A URL from a launcher, a link handler or `xdg-open` belongs in the
             // browser you already have -- opening a second whole browser for a
             // clicked link is not what any other browser does. `--new` and
@@ -104,11 +126,12 @@ async fn main() -> Result<()> {
             if let Some(url) = url.as_deref()
                 && !fresh
                 && !incognito
+                && !app
                 && join(url).await
             {
                 return Ok(());
             }
-            gui(url, incognito, palette).await
+            gui(url, incognito, palette, app).await
         }
     }
 }
@@ -176,6 +199,13 @@ async fn command(argv: Vec<String>) -> Result<()> {
         if mcp::relay(&dir, target).await? {
             return Ok(());
         }
+    }
+
+    // `--follow` is a conversation, not a command: it asks the same question
+    // over and over and prints what is new. That loop belongs on this side of
+    // the socket -- see `crate::follow`.
+    if let Some(following) = follow::wanted(&argv) {
+        return follow::run(&dir, target, following).await;
     }
 
     if !control::runs_locally(&argv) {
@@ -274,10 +304,13 @@ async fn open_a_window(config: &config::Config, dir: &std::path::Path) -> Result
 }
 
 /// Be the browser.
-async fn gui(url: Option<String>, incognito: bool, palette: bool) -> Result<()> {
+async fn gui(url: Option<String>, incognito: bool, palette: bool, app: bool) -> Result<()> {
     // Before anything else: the window's size, the home page and the search
     // engine all come out of it, and Tauri owns the main thread from `run` on.
     let state = Arc::new(AppState::new(config::Config::load()));
+    // Before the command graph and before the window: `strip_enabled` and the
+    // page injection both read it, and both are consulted below.
+    state.set_app_mode(app);
     // Shared rather than owned: the `/argv` route runs commands through this
     // same graph, so the router needs a handle on it that outlives `build`.
     let cli = Arc::new(commands::command_graph(state.clone()));
@@ -374,7 +407,9 @@ async fn gui(url: Option<String>, incognito: bool, palette: bool) -> Result<()> 
         first_tab,
         catalog,
         chrome,
-        open_palette: palette,
+        // Never in app mode: a web app that opens with a command palette over
+        // it is not a web app.
+        open_palette: palette && !app,
     })
 }
 
@@ -454,6 +489,30 @@ mod tests {
         match classify(&args(&["https://example.com"])) {
             Invocation::Gui { fresh, .. } => assert!(!fresh),
             _ => panic!("a bare URL must open the GUI"),
+        }
+    }
+
+    #[test]
+    fn app_mode_is_gui_and_never_joins_a_window() {
+        // `--app` opens *this* site's window. Handing the URL to whatever
+        // browser window happened to be focused would be the opposite.
+        match classify(&["--app".into(), "https://github.com".into()]) {
+            Invocation::Gui { app, url, .. } => {
+                assert!(app);
+                assert_eq!(url.as_deref(), Some("https://github.com"));
+            }
+            Invocation::Command => panic!("--app is a window, not a subcommand"),
+        }
+    }
+
+    #[test]
+    fn chromes_spelling_of_the_flag_carries_the_url() {
+        match classify(&["--app=https://github.com".into()]) {
+            Invocation::Gui { app, url, .. } => {
+                assert!(app);
+                assert_eq!(url.as_deref(), Some("https://github.com"));
+            }
+            Invocation::Command => panic!("--app= is a window, not a subcommand"),
         }
     }
 

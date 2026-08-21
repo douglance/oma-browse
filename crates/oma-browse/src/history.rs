@@ -188,7 +188,7 @@ pub fn state_dir() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
         });
-    state.join("oma-browse")
+    crate::profile::within(state.join("oma-browse"))
 }
 
 fn path() -> PathBuf {

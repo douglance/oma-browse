@@ -138,13 +138,17 @@ pub fn dir_for(control: &crate::config::Control) -> PathBuf {
 
 /// The default home for every window's socket.
 pub fn runtime_dir() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
+    let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir).join("oma-browse"),
         None => {
             let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
             std::env::temp_dir().join(format!("oma-browse-{uid}"))
         }
-    }
+    };
+    // Per profile, so that `current.sock` -- "the window I am looking at" --
+    // means the window of the profile that was asked, and two profiles do not
+    // take turns overwriting each other's answer to that question.
+    crate::profile::within(base)
 }
 
 /// This window's socket.

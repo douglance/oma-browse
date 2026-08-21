@@ -67,6 +67,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("share", "Share"),
     ("download", "Downloads"),
     ("permission", "Permissions"),
+    ("content", "Content blocking"),
     ("window", "Window"),
 ];
 
@@ -87,7 +88,145 @@ pub fn command_graph(state: Arc<AppState>) -> Cli {
         .group(share_group(state.clone()))
         .group(config_group(state.clone()))
         .group(permission_group(state.clone()))
+        .group(content_group(state.clone()))
         .group(window_group(state))
+}
+
+// ---------------------------------------------------------------------------
+// content
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct Blocking {
+    /// Whether blocking is switched on at all.
+    on: bool,
+    /// The lists compiled and applied right now. Empty while a first compile is
+    /// still running, which takes a few seconds for a real blocklist.
+    lists: Vec<String>,
+    /// Rule files that could not be used, and why.
+    problems: Vec<String>,
+    /// Whether the active tab is blocking. `content off` turns this off for one
+    /// tab without turning anything else off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    here: Option<bool>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Excused {
+    /// The tab this was about.
+    url: String,
+    /// Whether that tab is blocking now.
+    blocking: bool,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ReloadListsOptions {
+    /// Compile again even if a compiled copy is already loaded.
+    force: bool,
+}
+
+/// `content off` and `content on` are the same command with the switch the
+/// other way up.
+fn excuse_tab(
+    state: Arc<AppState>,
+    name: &'static str,
+    off: bool,
+    description: &'static str,
+) -> CommandDef {
+    CommandDef::typed::<NoArgs, NoOptions, (), Excused, _, _>(
+        name,
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = state.clone();
+            async move {
+                let Some(app) = state.app_handle() else {
+                    return TypedResult::error("no_window", "the window is not up yet".to_string());
+                };
+                let Some(label) = state.tabs.read().await.active_label() else {
+                    return TypedResult::error("no_tab", "there is no active tab".to_string());
+                };
+                use tauri::Manager as _;
+                let Some(view) = app.get_webview(&label) else {
+                    return TypedResult::error("no_tab", format!("no webview labelled {label}"));
+                };
+                if let Err(e) = crate::blocker::excuse(&view, off) {
+                    return TypedResult::error("webview", format!("{e:#}"));
+                }
+                let url = here(&state).await.map(|(u, _)| u).unwrap_or_default();
+                TypedResult::ok(Excused { url, blocking: !off })
+            }
+        },
+    )
+    .description(description)
+    .done()
+}
+
+fn content_group(state: Arc<AppState>) -> Cli {
+    let s = state.clone();
+    let reload = CommandDef::typed::<NoArgs, ReloadListsOptions, (), Blocking, _, _>(
+        "reload",
+        move |ctx: TypedContext<NoArgs, ReloadListsOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let _ = ctx.options.force;
+                let tab = state.tabs.read().await.active_label();
+                match crate::blocker::ask(&state, true, tab).await {
+                    Ok(report) => TypedResult::ok(Blocking {
+                        on: state.config.content.block,
+                        lists: report.lists,
+                        problems: report.problems,
+                        here: report.here,
+                    }),
+                    Err(e) => TypedResult::error("blocker", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Read the rule lists again and apply them. Compiling a real blocklist \
+         takes a few seconds and happens in the background, so `content list` \
+         is how you find out it finished.",
+    )
+    .done();
+
+    let s = state.clone();
+    let list = CommandDef::typed::<NoArgs, NoOptions, (), Blocking, _, _>(
+        "list",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let tab = state.tabs.read().await.active_label();
+                match crate::blocker::ask(&state, false, tab).await {
+                    Ok(report) => TypedResult::ok(Blocking {
+                        on: state.config.content.block,
+                        lists: report.lists,
+                        problems: report.problems,
+                        here: report.here,
+                    }),
+                    Err(e) => TypedResult::error("blocker", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description("What is blocking, and what could not be read")
+    .done();
+
+    Cli::create("content")
+        .description("Block what a page tries to fetch")
+        .command("list", list)
+        .command("reload", reload)
+        .command(
+            "off",
+            excuse_tab(
+                state.clone(),
+                "off",
+                true,
+                "Stop blocking in this tab. Per tab and not written down: WebKit \
+                 keeps filters on the webview, so this is exactly taking this \
+                 tab's filters off. Reload the page to see the difference.",
+            ),
+        )
+        .command("on", excuse_tab(state, "on", false, "Block in this tab again"))
 }
 
 // ---------------------------------------------------------------------------
@@ -160,9 +299,28 @@ fn share_group(state: Arc<AppState>) -> Cli {
                     .and_then(|host| host.split('.').rev().nth(1))
                     .unwrap_or("web")
                     .to_string();
+                // The fourth positional is `omarchy-webapp-install`'s
+                // `custom-exec`, and without it the launcher it writes runs
+                // `omarchy-launch-webapp`, whose browser allowlist is
+                // Chromium-family only -- so "install this page as an app" from
+                // *this* browser installed a launcher that opened Chrome.
+                //
+                // The absolute path, not the bare name: a `.desktop` file is
+                // run by whatever has no idea what this shell's PATH was.
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "oma-browse".to_string());
+                let exec = format!("{exe} --app {url}");
                 match handoff(
                     "omarchy",
-                    &["webapp", "install", title.as_str(), url.as_str(), icon.as_str()],
+                    &[
+                        "webapp",
+                        "install",
+                        title.as_str(),
+                        url.as_str(),
+                        icon.as_str(),
+                        exec.as_str(),
+                    ],
                 )
                 .await
                 {
@@ -172,7 +330,12 @@ fn share_group(state: Arc<AppState>) -> Cli {
             }
         },
     )
-    .description("Install the current page as an Omarchy web app with its own launcher")
+    .description(
+        "Install the current page as an Omarchy web app with its own launcher, \
+         opening in this browser rather than in Chrome. The window it opens has \
+         no tab strip and a WM class of its own, so a Hyprland rule can target \
+         it: `class:oma-browse-app-<host>`.",
+    )
     .done();
 
     let s = state;
@@ -217,6 +380,18 @@ struct Saved {
     url: String,
     /// `running`, `done` or `failed`.
     state: String,
+    /// How far along, as a whole percent. Only while it is still running --
+    /// for anything that has ended, `state` is the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<u8>,
+    /// Bytes written so far. Zero for anything from a previous session.
+    #[serde(skip_serializing_if = "is_zero")]
+    bytes: u64,
+}
+
+/// `serde` wants a path, not a closure, and `u64::eq(&0)` is not one.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -253,6 +428,8 @@ fn saved(d: &crate::downloads::Download) -> Saved {
         path: d.path.display().to_string(),
         url: d.url.clone(),
         state: d.state().to_string(),
+        percent: d.percent(),
+        bytes: d.bytes,
     }
 }
 
@@ -412,9 +589,19 @@ struct FindOptionsArg {
     text: Option<String>,
 }
 
+#[derive(JsonSchema, Serialize)]
+struct Found {
+    /// What was searched for.
+    text: String,
+    /// How many matches. Omitted when WebKit did not answer in time, which is
+    /// not the same as none -- the highlighting happened either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matches: Option<u32>,
+}
+
 fn find_group(state: Arc<AppState>) -> Cli {
     let s = state.clone();
-    let search = CommandDef::typed::<FindArgs, FindOptionsArg, (), Acted, _, _>(
+    let search = CommandDef::typed::<FindArgs, FindOptionsArg, (), Found, _, _>(
         "text",
         move |ctx: TypedContext<FindArgs, FindOptionsArg, ()>| {
             let state = s.clone();
@@ -422,14 +609,18 @@ fn find_group(state: Arc<AppState>) -> Cli {
                 let Some(text) = ctx.options.text.or(ctx.args.text) else {
                     return TypedResult::error("usage", "text to find is required".to_string());
                 };
-                match crate::tabs::find(&state, crate::tabs::FindAction::Search(text)).await {
-                    Ok(()) => TypedResult::ok(Acted { ok: true }),
+                match crate::tabs::find(&state, crate::tabs::FindAction::Search(text.clone())).await
+                {
+                    Ok(matches) => TypedResult::ok(Found { text, matches }),
                     Err(e) => TypedResult::error("webview", format!("{e:#}")),
                 }
             }
         },
     )
-    .description("Find text on the page, highlighting every match")
+    .description(
+        "Find text on the page, highlighting every match and saying how many \
+         there were.",
+    )
     .done();
 
     let mut group =
@@ -448,7 +639,7 @@ fn find_group(state: Arc<AppState>) -> Cli {
                 let (state, action) = (s.clone(), action.clone());
                 async move {
                     match crate::tabs::find(&state, action).await {
-                        Ok(()) => TypedResult::ok(Acted { ok: true }),
+                        Ok(_) => TypedResult::ok(Acted { ok: true }),
                         Err(e) => TypedResult::error("webview", format!("{e:#}")),
                     }
                 }
@@ -1384,6 +1575,13 @@ struct LoginOptions {
     password: Option<String>,
 }
 
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ReloadOptions {
+    /// Ignore everything already cached.
+    hard: bool,
+}
+
 fn nav_group(state: Arc<AppState>) -> Cli {
     let s = state.clone();
     let go = CommandDef::typed::<GoArgs, GoOptions, (), Navigated, _, _>(
@@ -1492,10 +1690,35 @@ fn nav_group(state: Arc<AppState>) -> Cli {
         .command("trust", trust)
         .command("login", login);
 
+    let s = state.clone();
+    let reload = CommandDef::typed::<NoArgs, ReloadOptions, (), Acted, _, _>(
+        "reload",
+        move |ctx: TypedContext<NoArgs, ReloadOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let action = if ctx.options.hard {
+                    crate::tabs::HistoryAction::HardReload
+                } else {
+                    crate::tabs::HistoryAction::Reload
+                };
+                match crate::tabs::history(&state, action).await {
+                    Ok(()) => TypedResult::ok(Acted { ok: true }),
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Reload the active tab. `--hard` throws the cache away first, which is \
+         the difference between seeing the bundle you just built and seeing the \
+         one from four minutes ago.",
+    )
+    .done();
+    group = group.command("reload", reload);
+
     for (name, action, blurb) in [
         ("back", crate::tabs::HistoryAction::Back, "Go back in history"),
         ("forward", crate::tabs::HistoryAction::Forward, "Go forward in history"),
-        ("reload", crate::tabs::HistoryAction::Reload, "Reload the active tab"),
         ("stop", crate::tabs::HistoryAction::Stop, "Stop loading"),
     ] {
         let s = state.clone();
@@ -1681,6 +1904,352 @@ struct HintsOptions {
 struct Hinted {
     /// How many hints were drawn. Zero means nothing clickable is on screen.
     shown: u32,
+}
+
+// ---------------------------------------------------------------------------
+// page console / page network
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ConsoleOptions {
+    /// Only lines this loud or louder: `debug`, `log`, `info`, `warn`, `error`.
+    level: Option<String>,
+    /// At most this many, most recent last.
+    limit: Option<usize>,
+    /// Only what is newer than this sequence number; pass back the `next` from
+    /// the previous answer.
+    since: Option<u64>,
+    /// Forget what this tab has logged.
+    clear: bool,
+    /// Keep printing lines as the page logs them, until interrupted.
+    ///
+    /// Read by the CLI before the command is forwarded -- a command answers
+    /// once, and following is a conversation. See `crate::follow`.
+    follow: bool,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Console {
+    /// The tab that was asked.
+    url: String,
+    /// Give this back as `--since` to get only what has happened since.
+    next: u64,
+    lines: Vec<crate::inspect::Line>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct NetworkOptions {
+    /// At most this many, most recent last.
+    limit: Option<usize>,
+    /// Only what is newer than this sequence number.
+    since: Option<u64>,
+    /// Only requests that failed or answered 400 and up.
+    failed: bool,
+    /// Answer with a HAR 1.2 log instead of a list.
+    har: bool,
+    /// Write the HAR here rather than returning it.
+    path: Option<String>,
+    /// Forget what this tab has fetched.
+    clear: bool,
+    /// Keep printing requests as the page makes them, until interrupted.
+    follow: bool,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Network {
+    url: String,
+    next: u64,
+    /// Omitted when `--har` asked for a HAR instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requests: Option<Vec<crate::inspect::Exchange>>,
+    /// The HAR itself, when `--har` was given without a path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    har: Option<serde_json::Value>,
+    /// Where the HAR was written, when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Which tab a console or network question is about: the active one, by the
+/// label the taps file their entries under.
+async fn active_label(state: &Arc<AppState>) -> Option<String> {
+    state.tabs.read().await.active_label()
+}
+
+// ---------------------------------------------------------------------------
+// page markdown / page text
+// ---------------------------------------------------------------------------
+
+/// The reader, evaluated in place rather than injected into every page.
+const EXTRACT: &str = include_str!("extract.js");
+/// The other half of reader mode: what to do with what the reader found.
+const READER: &str = include_str!("reader.js");
+
+#[derive(Deserialize, serde::Serialize)]
+struct Extracted {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    markdown: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    html: String,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Reading {
+    url: String,
+    title: String,
+    /// How many characters of prose. Zero means the reader found nothing, which
+    /// on a page that is all script is the honest answer.
+    chars: usize,
+    /// The prose itself, omitted when it was written to a file instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Run the reader and hand back what it found.
+async fn read_page(state: &Arc<AppState>) -> Result<Extracted, String> {
+    let raw = crate::tabs::eval(state, EXTRACT).await.map_err(|e| format!("{e:#}"))?;
+    // `eval` answers with JSON, and the script's own answer is a JSON string --
+    // so what arrives is a quoted, escaped document that has to come out of its
+    // wrapper before it parses.
+    let inner = serde_json::from_str::<String>(&raw).unwrap_or(raw);
+    serde_json::from_str::<Extracted>(&inner)
+        .map_err(|e| format!("the reader answered with something unreadable: {e}"))
+}
+
+/// `page markdown` and `page text` differ in one field, so they are one
+/// function with a flag rather than two that drift.
+fn reader(
+    state: Arc<AppState>,
+    name: &'static str,
+    markdown: bool,
+    description: &'static str,
+) -> CommandDef {
+    CommandDef::typed::<NoArgs, SourceOptions, (), Reading, _, _>(
+        name,
+        move |ctx: TypedContext<NoArgs, SourceOptions, ()>| {
+            let state = state.clone();
+            async move {
+                let found = match read_page(&state).await {
+                    Ok(found) => found,
+                    Err(e) => return TypedResult::error("webview", e),
+                };
+                let content = if markdown { found.markdown } else { found.text };
+                let chars = content.chars().count();
+
+                let wants_file = ctx.options.open || ctx.options.path.is_some();
+                if !wants_file {
+                    return TypedResult::ok(Reading {
+                        url: found.url,
+                        title: found.title,
+                        chars,
+                        content: Some(content),
+                        path: None,
+                    });
+                }
+
+                let extension = if markdown { "md" } else { "txt" };
+                let path = match crate::shot::scratch_file(ctx.options.path, name, extension) {
+                    Ok(path) => path,
+                    Err(e) => return TypedResult::error("path", format!("{e:#}")),
+                };
+                if let Err(e) = std::fs::write(&path, &content) {
+                    return TypedResult::error(
+                        "io",
+                        format!("could not write {}: {e}", path.display()),
+                    );
+                }
+                if ctx.options.open {
+                    let target = format!("file://{}", path.display());
+                    if let Err(e) = crate::tabs::open(&state, &target, false).await {
+                        return TypedResult::error("webview", format!("{e:#}"));
+                    }
+                }
+                TypedResult::ok(Reading {
+                    url: found.url,
+                    title: found.title,
+                    chars,
+                    content: None,
+                    path: Some(path.display().to_string()),
+                })
+            }
+        },
+    )
+    .description(description)
+    .done()
+}
+
+// ---------------------------------------------------------------------------
+// page click / fill / wait
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, incurs::Args)]
+struct SelectorArgs {
+    /// A CSS selector for the element to act on.
+    selector: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct SelectorOptions {
+    /// Same as the positional, for callers whose transport cannot carry one.
+    selector: Option<String>,
+    /// Which match, when the selector finds several. Zero-based.
+    nth: Option<usize>,
+    /// How long to wait for the element to turn up, in milliseconds.
+    timeout: Option<u64>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Interacted {
+    selector: String,
+    /// How many elements the selector matched.
+    matched: usize,
+    /// How long the element took to turn up, in milliseconds.
+    waited: u64,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct FillArgs {
+    /// A CSS selector for the field to fill.
+    selector: Option<String>,
+    /// What to type into it.
+    text: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct FillOptions {
+    selector: Option<String>,
+    /// What to type into it.
+    text: Option<String>,
+    nth: Option<usize>,
+    timeout: Option<u64>,
+    /// Add to what is already there instead of replacing it.
+    append: bool,
+    /// Take the text from a password manager instead: `rbw`, `op` or `pass`.
+    ///
+    /// The entry is this page's host unless `--entry` says otherwise, and the
+    /// secret never appears in the answer, in a log, or on a command line.
+    from: Option<String>,
+    /// Which entry to read, when it is not the page's host.
+    entry: Option<String>,
+    /// `password`, the default, or `username`.
+    field: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct WaitOptions {
+    /// Wait for an element matching this selector to exist.
+    selector: Option<String>,
+    /// Wait for this text to appear anywhere on the page.
+    text: Option<String>,
+    /// Wait for the page to finish loading and stop fetching. The default when
+    /// nothing else is asked for.
+    idle: bool,
+    /// Give up after this many milliseconds. Ten seconds by default.
+    timeout: Option<u64>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Waited {
+    /// What was waited for, in words.
+    r#for: String,
+    /// How long it took, in milliseconds.
+    ms: u64,
+}
+
+/// How long a scripting verb waits for its element by default.
+const WAIT_MS: u64 = 10_000;
+/// How often it looks again while waiting. Short enough to feel immediate,
+/// long enough not to be a spin loop against a webview.
+const POLL_MS: u64 = 50;
+
+/// Poll the page until `js` answers with something other than `null`.
+///
+/// The verbs are `page eval` underneath, which is what the plan said they would
+/// be -- the value here is not the evaluation, it is the waiting, the retrying
+/// and the one error message when it never happens.
+async fn until(
+    state: &Arc<AppState>,
+    js: &str,
+    timeout: std::time::Duration,
+) -> Result<(String, u64), String> {
+    let began = std::time::Instant::now();
+    let mut last = String::new();
+    loop {
+        match crate::tabs::eval(state, js).await {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed != "null" && !trimmed.is_empty() {
+                    return Ok((raw, began.elapsed().as_millis() as u64));
+                }
+                last.clear();
+            }
+            // A navigation in flight tears the old document down mid-question.
+            // That is a reason to look again, not a reason to give up.
+            Err(e) => last = format!("{e:#}"),
+        }
+        if began.elapsed() >= timeout {
+            return Err(if last.is_empty() {
+                format!("still not there after {}ms", timeout.as_millis())
+            } else {
+                format!("still not there after {}ms; last answer was {last}", timeout.as_millis())
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+    }
+}
+
+/// A JS string literal for a value that came from a person's shell.
+fn js_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Wait until the page has stopped fetching.
+///
+/// "Stopped" is two conditions, not one: nothing still in flight, and nothing
+/// newly started for half a second. The second is what makes this useful on a
+/// single-page application, where the document finished loading long ago and the
+/// thing worth waiting for is the burst of `fetch` calls that follows a click.
+///
+/// A page holding a connection open forever -- an `EventSource`, a long poll --
+/// never goes idle by this definition, which is why the timeout is not optional.
+async fn idle(state: &Arc<AppState>, budget: std::time::Duration) -> Result<(), String> {
+    const QUIET_MS: u64 = 500;
+    let label = active_label(state).await.ok_or("there is no active tab")?;
+    let began = std::time::Instant::now();
+    loop {
+        let (in_flight, newest) = {
+            let Ok(inspector) = state.inspector.lock() else {
+                return Err("the network log is wedged".to_string());
+            };
+            let requests = inspector.network_of(&label);
+            let in_flight = requests.iter().filter(|e| e.status == 0 && e.failed.is_none()).count();
+            let newest = requests.iter().map(|e| e.at).max().unwrap_or(0);
+            (in_flight, newest)
+        };
+        if in_flight == 0 && crate::inspect::now_ms().saturating_sub(newest) >= QUIET_MS {
+            return Ok(());
+        }
+        if began.elapsed() >= budget {
+            return Err(format!(
+                "{in_flight} request(s) still in flight after {}ms",
+                budget.as_millis()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+    }
 }
 
 fn page_group(state: Arc<AppState>) -> Cli {
@@ -1944,6 +2513,448 @@ fn page_group(state: Arc<AppState>) -> Cli {
     )
     .done();
 
+    let s = state.clone();
+    let console = CommandDef::typed::<NoArgs, ConsoleOptions, (), Console, _, _>(
+        "console",
+        move |ctx: TypedContext<NoArgs, ConsoleOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Some(label) = active_label(&state).await else {
+                    return TypedResult::error("no_tab", "there is no active tab".to_string());
+                };
+                let floor = match ctx.options.level.as_deref() {
+                    None => crate::inspect::Level::Debug,
+                    Some(raw) => match crate::inspect::Level::parse(raw) {
+                        Some(level) => level,
+                        None => {
+                            let known: Vec<&str> =
+                                crate::inspect::Level::ALL.iter().map(|l| l.as_str()).collect();
+                            return TypedResult::error(
+                                "usage",
+                                format!("unknown level {raw:?}; use {}", known.join(", ")),
+                            );
+                        }
+                    },
+                };
+                let url = here(&state).await.map(|(u, _)| u).unwrap_or_default();
+                // Collect whatever the page has piled up since the last time
+                // anybody asked. `--clear` drains first too, so that clearing
+                // empties what is waiting in the page rather than letting it
+                // arrive a moment later.
+                crate::inspect::drain(&state, &label).await;
+
+                let Ok(mut inspector) = state.inspector.lock() else {
+                    return TypedResult::error("state", "the console log is wedged".to_string());
+                };
+                if ctx.options.clear {
+                    inspector.clear_console(&label);
+                    return TypedResult::ok(Console { url, next: 0, lines: Vec::new() });
+                }
+                let since = ctx.options.since.unwrap_or(0);
+                let mut lines: Vec<_> = inspector
+                    .console_of(&label)
+                    .into_iter()
+                    .filter(|line| line.seq >= since && line.level >= floor)
+                    .collect();
+                drop(inspector);
+
+                if let Some(limit) = ctx.options.limit
+                    && lines.len() > limit
+                {
+                    lines.drain(..lines.len() - limit);
+                }
+                let next = lines.last().map_or(since, |line| line.seq + 1);
+                TypedResult::ok(Console { url, next, lines })
+            }
+        },
+    )
+    .description(
+        "What the active tab has logged. Every `console.*` call, every uncaught \
+         error and every unhandled rejection, from the moment the tab opened -- \
+         so `oma-browse page console --level error` is the whole of what F12 was \
+         for. `--follow` keeps printing as the page logs.",
+    )
+    .done();
+
+    let s = state.clone();
+    let network = CommandDef::typed::<NoArgs, NetworkOptions, (), Network, _, _>(
+        "network",
+        move |ctx: TypedContext<NoArgs, NetworkOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Some(label) = active_label(&state).await else {
+                    return TypedResult::error("no_tab", "there is no active tab".to_string());
+                };
+                let url = here(&state).await.map(|(u, _)| u).unwrap_or_default();
+
+                let Ok(mut inspector) = state.inspector.lock() else {
+                    return TypedResult::error("state", "the network log is wedged".to_string());
+                };
+                if ctx.options.clear {
+                    inspector.clear_network(&label);
+                    return TypedResult::ok(Network {
+                        url,
+                        next: 0,
+                        requests: Some(Vec::new()),
+                        har: None,
+                        path: None,
+                    });
+                }
+                let since = ctx.options.since.unwrap_or(0);
+                let mut requests: Vec<_> = inspector
+                    .network_of(&label)
+                    .into_iter()
+                    .filter(|e| e.seq >= since)
+                    .filter(|e| !ctx.options.failed || e.failed.is_some() || e.status >= 400)
+                    .collect();
+                drop(inspector);
+
+                if let Some(limit) = ctx.options.limit
+                    && requests.len() > limit
+                {
+                    requests.drain(..requests.len() - limit);
+                }
+                let next = requests.last().map_or(since, |e| e.seq + 1);
+
+                if !ctx.options.har {
+                    return TypedResult::ok(Network {
+                        url,
+                        next,
+                        requests: Some(requests),
+                        har: None,
+                        path: None,
+                    });
+                }
+
+                let har = crate::inspect::har(&url, &requests);
+                let Some(asked) = ctx.options.path else {
+                    return TypedResult::ok(Network {
+                        url,
+                        next,
+                        requests: None,
+                        har: Some(har),
+                        path: None,
+                    });
+                };
+                let path = match crate::shot::scratch_file(Some(asked), "network", "har") {
+                    Ok(path) => path,
+                    Err(e) => return TypedResult::error("path", format!("{e:#}")),
+                };
+                let body = serde_json::to_string_pretty(&har).unwrap_or_default();
+                if let Err(e) = std::fs::write(&path, body) {
+                    return TypedResult::error(
+                        "io",
+                        format!("could not write {}: {e}", path.display()),
+                    );
+                }
+                TypedResult::ok(Network {
+                    url,
+                    next,
+                    requests: None,
+                    har: None,
+                    path: Some(path.display().to_string()),
+                })
+            }
+        },
+    )
+    .description(
+        "Every request the active tab has made -- WebKit's own view, so it \
+         includes the document, the stylesheets and the images, not only what \
+         `fetch` was involved in. `--failed` narrows it to what went wrong; \
+         `--har` writes a HAR 1.2 log for anything that reads one.",
+    )
+    .done();
+
+    let s = state.clone();
+    let click = CommandDef::typed::<SelectorArgs, SelectorOptions, (), Interacted, _, _>(
+        "click",
+        move |ctx: TypedContext<SelectorArgs, SelectorOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Some(selector) = ctx.options.selector.or(ctx.args.selector) else {
+                    return TypedResult::error("usage", "a CSS selector is required".to_string());
+                };
+                let nth = ctx.options.nth.unwrap_or(0);
+                // The mouse events around `click()` are not ceremony: plenty of
+                // menus and dropdowns open on `mousedown` and never see a
+                // `click` at all, and an automation that only clicks cannot open
+                // them.
+                let js = format!(
+                    r#"(function(){{
+                        var found = document.querySelectorAll({selector});
+                        if (found.length <= {nth}) return null;
+                        var el = found[{nth}];
+                        el.scrollIntoView({{block: "center", inline: "center"}});
+                        var box = el.getBoundingClientRect();
+                        var where = {{
+                            bubbles: true, cancelable: true, view: window,
+                            clientX: box.left + box.width / 2,
+                            clientY: box.top + box.height / 2
+                        }};
+                        el.dispatchEvent(new MouseEvent("mousedown", where));
+                        el.dispatchEvent(new MouseEvent("mouseup", where));
+                        if (typeof el.click === "function") el.click();
+                        else el.dispatchEvent(new MouseEvent("click", where));
+                        return found.length;
+                    }})()"#,
+                    selector = js_string(&selector)
+                );
+                let timeout =
+                    std::time::Duration::from_millis(ctx.options.timeout.unwrap_or(WAIT_MS).max(1));
+                match until(&state, &js, timeout).await {
+                    Ok((raw, waited)) => TypedResult::ok(Interacted {
+                        selector,
+                        matched: raw.trim().parse().unwrap_or(1),
+                        waited,
+                    }),
+                    Err(e) => TypedResult::error("no_match", format!("{selector}: {e}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Click what a CSS selector names, waiting up to ten seconds for it to \
+         turn up. `--nth` picks among several matches.",
+    )
+    .done();
+
+    let s = state.clone();
+    let fill = CommandDef::typed::<FillArgs, FillOptions, (), Interacted, _, _>(
+        "fill",
+        move |ctx: TypedContext<FillArgs, FillOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let Some(selector) = ctx.options.selector.or(ctx.args.selector) else {
+                    return TypedResult::error("usage", "a CSS selector is required".to_string());
+                };
+                // Either the caller typed it or a password manager knows it.
+                // Never both: a command that silently preferred one over the
+                // other would be a command that types the wrong secret.
+                let typed = ctx.options.text.or(ctx.args.text);
+                let text = match (typed, ctx.options.from.as_deref()) {
+                    (Some(_), Some(_)) => {
+                        return TypedResult::error(
+                            "usage",
+                            "give text or --from, not both".to_string(),
+                        );
+                    }
+                    (Some(text), None) => text,
+                    (None, Some(raw)) => {
+                        let Some(vault) = crate::vault::Vault::parse(raw) else {
+                            let known: Vec<&str> =
+                                crate::vault::Vault::ALL.iter().map(|v| v.as_str()).collect();
+                            return TypedResult::error(
+                                "usage",
+                                format!(
+                                    "unknown password manager {raw:?}; use {}",
+                                    known.join(", ")
+                                ),
+                            );
+                        };
+                        let field = match ctx.options.field.as_deref() {
+                            None => crate::vault::Field::Password,
+                            Some(raw) => match crate::vault::Field::parse(raw) {
+                                Some(field) => field,
+                                None => {
+                                    return TypedResult::error(
+                                        "usage",
+                                        format!("unknown field {raw:?}; use password or username"),
+                                    );
+                                }
+                            },
+                        };
+                        let entry = match ctx.options.entry {
+                            Some(entry) => entry,
+                            None => {
+                                let url = here(&state).await.map(|(u, _)| u).unwrap_or_default();
+                                match crate::vault::entry_for(&url) {
+                                    Some(entry) => entry,
+                                    None => {
+                                        return TypedResult::error(
+                                            "usage",
+                                            "this page has no host to look up; name one with \
+                                             --entry"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        };
+                        match crate::vault::get(vault, &entry, field).await {
+                            Ok(secret) => secret,
+                            Err(e) => return TypedResult::error("vault", format!("{e:#}")),
+                        }
+                    }
+                    (None, None) => {
+                        return TypedResult::error(
+                            "usage",
+                            format!("what should go in {selector}?"),
+                        );
+                    }
+                };
+                let nth = ctx.options.nth.unwrap_or(0);
+                // Assigning `el.value` directly is invisible to React, which
+                // tracks the property on the prototype and treats a value it did
+                // not see set as a value that did not change. Going through the
+                // native setter is what makes the framework believe it.
+                let js = format!(
+                    r#"(function(){{
+                        var found = document.querySelectorAll({selector});
+                        if (found.length <= {nth}) return null;
+                        var el = found[{nth}];
+                        el.focus();
+                        if (el.isContentEditable) {{
+                            el.textContent = {append} ? (el.textContent || "") + {text} : {text};
+                        }} else {{
+                            var proto = (typeof HTMLTextAreaElement !== "undefined"
+                                && el instanceof HTMLTextAreaElement)
+                                ? HTMLTextAreaElement.prototype
+                                : HTMLInputElement.prototype;
+                            var slot = Object.getOwnPropertyDescriptor(proto, "value");
+                            var next = {append} ? (el.value || "") + {text} : {text};
+                            if (slot && slot.set) slot.set.call(el, next);
+                            else el.value = next;
+                        }}
+                        el.dispatchEvent(new Event("input", {{bubbles: true}}));
+                        el.dispatchEvent(new Event("change", {{bubbles: true}}));
+                        return found.length;
+                    }})()"#,
+                    selector = js_string(&selector),
+                    text = js_string(&text),
+                    append = ctx.options.append
+                );
+                let timeout =
+                    std::time::Duration::from_millis(ctx.options.timeout.unwrap_or(WAIT_MS).max(1));
+                match until(&state, &js, timeout).await {
+                    Ok((raw, waited)) => TypedResult::ok(Interacted {
+                        selector,
+                        matched: raw.trim().parse().unwrap_or(1),
+                        waited,
+                    }),
+                    Err(e) => TypedResult::error("no_match", format!("{selector}: {e}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Type into what a CSS selector names -- an input, a textarea, or \
+         anything `contenteditable` -- and tell the page it changed the way a \
+         real keystroke would.",
+    )
+    .done();
+
+    let s = state.clone();
+    let wait = CommandDef::typed::<NoArgs, WaitOptions, (), Waited, _, _>(
+        "wait",
+        move |ctx: TypedContext<NoArgs, WaitOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let timeout =
+                    std::time::Duration::from_millis(ctx.options.timeout.unwrap_or(WAIT_MS).max(1));
+                let began = std::time::Instant::now();
+
+                if let Some(selector) = ctx.options.selector {
+                    let js = format!("document.querySelector({}) ? 1 : null", js_string(&selector));
+                    return match until(&state, &js, timeout).await {
+                        Ok((_, ms)) => TypedResult::ok(Waited { r#for: selector, ms }),
+                        Err(e) => TypedResult::error("timeout", format!("{selector}: {e}")),
+                    };
+                }
+                if let Some(text) = ctx.options.text {
+                    let js = format!(
+                        "(document.body && document.body.innerText.indexOf({}) >= 0) ? 1 : null",
+                        js_string(&text)
+                    );
+                    return match until(&state, &js, timeout).await {
+                        Ok((_, ms)) => TypedResult::ok(Waited { r#for: text, ms }),
+                        Err(e) => TypedResult::error("timeout", format!("{text:?}: {e}")),
+                    };
+                }
+
+                // Nothing named: wait for the load to finish and the requests to
+                // stop, which is what `--idle` asks for and what somebody who
+                // asked for none of the three meant.
+                let js = "document.readyState === \"complete\" ? 1 : null";
+                if let Err(e) = until(&state, js, timeout).await {
+                    return TypedResult::error("timeout", format!("still loading: {e}"));
+                }
+                match idle(&state, timeout.saturating_sub(began.elapsed())).await {
+                    Ok(()) => TypedResult::ok(Waited {
+                        r#for: "idle".to_string(),
+                        ms: began.elapsed().as_millis() as u64,
+                    }),
+                    Err(e) => TypedResult::error("timeout", e),
+                }
+            }
+        },
+    )
+    .description(
+        "Wait for the page to be ready: for `--selector` to exist, for `--text` \
+         to appear, or -- given neither -- for it to finish loading and stop \
+         fetching.",
+    )
+    .done();
+
+    let markdown = reader(
+        state.clone(),
+        "markdown",
+        true,
+        "The article on the active page, as Markdown. Pipe it into `glow`, into \
+         a file, or into a model -- it is the page without the navigation, the \
+         cookie banner and the script tags.",
+    );
+
+    let text =
+        reader(state.clone(), "text", false, "The article on the active page, as plain text.");
+
+    let s = state.clone();
+    let read = CommandDef::typed::<NoArgs, NoOptions, (), Reading, _, _>(
+        "reader",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let found = match read_page(&state).await {
+                    Ok(found) => found,
+                    Err(e) => return TypedResult::error("webview", e),
+                };
+                if found.html.trim().is_empty() {
+                    return TypedResult::error(
+                        "no_article",
+                        "there is no article on this page to read".to_string(),
+                    );
+                }
+                let chars = found.text.chars().count();
+                // The markup goes in as a JSON argument rather than being
+                // spliced into the script: it is somebody else's HTML, it is
+                // routinely tens of kilobytes of it, and `page eval` builds a
+                // JavaScript source string.
+                let payload = serde_json::json!({
+                    "html": found.html,
+                    "title": found.title,
+                    "base": found.url,
+                });
+                let js = format!("({READER})({payload})");
+                if let Err(e) = crate::tabs::eval(&state, &js).await {
+                    return TypedResult::error("webview", format!("{e:#}"));
+                }
+                TypedResult::ok(Reading {
+                    url: found.url,
+                    title: found.title,
+                    chars,
+                    content: None,
+                    path: None,
+                })
+            }
+        },
+    )
+    .description(
+        "Strip the page down to its article and read it in the theme's own \
+         colours. The document is replaced rather than restyled, so nothing of \
+         the site's layout is left to fight with; `nav reload` puts the page \
+         back.",
+    )
+    .done();
+
     Cli::create("page")
         .description("Inspect the active page")
         .command("source", source)
@@ -1953,6 +2964,14 @@ fn page_group(state: Arc<AppState>) -> Cli {
         .command("screenshot", screenshot)
         .command("zoom", zoom)
         .command("hints", hints)
+        .command("console", console)
+        .command("network", network)
+        .command("markdown", markdown)
+        .command("text", text)
+        .command("reader", read)
+        .command("click", click)
+        .command("fill", fill)
+        .command("wait", wait)
 }
 
 // ---------------------------------------------------------------------------
@@ -2166,7 +3185,67 @@ fn config_group(state: Arc<AppState>) -> Cli {
         .command("init", init)
 }
 
+#[derive(Deserialize, incurs::Args)]
+struct ResizeArgs {
+    /// `1280x720`.
+    size: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct ResizeOptions {
+    /// Same as the positional.
+    size: Option<String>,
+    width: Option<f64>,
+    height: Option<f64>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Resized {
+    width: f64,
+    height: f64,
+}
+
 fn window_group(state: Arc<AppState>) -> Cli {
+    let s = state.clone();
+    let resize = CommandDef::typed::<ResizeArgs, ResizeOptions, (), Resized, _, _>(
+        "resize",
+        move |ctx: TypedContext<ResizeArgs, ResizeOptions, ()>| {
+            let state = s.clone();
+            async move {
+                let asked = ctx.options.size.or(ctx.args.size);
+                let size = match (asked, ctx.options.width, ctx.options.height) {
+                    (Some(raw), _, _) => match crate::window::parse_size(&raw) {
+                        Some(size) => size,
+                        None => {
+                            return TypedResult::error(
+                                "usage",
+                                format!("{raw:?} is not a size; write it as 1280x720"),
+                            );
+                        }
+                    },
+                    (None, Some(width), Some(height)) => (width, height),
+                    _ => {
+                        return TypedResult::error(
+                            "usage",
+                            "a size is required, as 1280x720 or --width and --height".to_string(),
+                        );
+                    }
+                };
+                match crate::window::resize(&state, size.0, size.1) {
+                    Ok(()) => TypedResult::ok(Resized { width: size.0, height: size.1 }),
+                    Err(e) => TypedResult::error("window", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "Resize the window, for checking a layout at a phone's width without \
+         leaving the keyboard. A tiled Hyprland window is sized by the \
+         compositor and will ignore this; float it first.",
+    )
+    .done();
+
     let s = state.clone();
     let fullscreen = CommandDef::typed::<FullscreenArgs, NoOptions, (), WindowState, _, _>(
         "fullscreen",
@@ -2241,10 +3320,82 @@ fn window_group(state: Arc<AppState>) -> Cli {
         .description("The native window itself")
         .command("new", new)
         .command("fullscreen", fullscreen)
+        .command("resize", resize)
         .command("close", close)
 }
 
+#[derive(Deserialize, incurs::Args)]
+struct HookArgs {
+    /// `install`, `remove`, or `show`. Defaults to `show`.
+    action: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct Hook {
+    /// Where the hook lives, installed or not.
+    path: String,
+    /// Whether it is there now.
+    installed: bool,
+    /// What the hook runs, when it is installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runs: Option<String>,
+}
+
 fn theme_group(state: Arc<AppState>) -> Cli {
+    let hook = CommandDef::typed::<HookArgs, NoOptions, (), Hook, _, _>(
+        "hook",
+        move |ctx: TypedContext<HookArgs, NoOptions, ()>| async move {
+            let path = oma_theme::watch::hook_path();
+            let shown = path.display().to_string();
+            match ctx.args.action.as_deref().unwrap_or("show") {
+                "show" | "status" => TypedResult::ok(Hook {
+                    installed: path.exists(),
+                    runs: std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string()),
+                    path: shown,
+                }),
+                "install" | "add" => {
+                    let exe = match std::env::current_exe() {
+                        Ok(exe) => exe,
+                        Err(e) => {
+                            return TypedResult::error(
+                                "exe",
+                                format!("could not find the running binary: {e}"),
+                            );
+                        }
+                    };
+                    match oma_theme::watch::install_hook(&exe) {
+                        Ok(path) => TypedResult::ok(Hook {
+                            installed: true,
+                            runs: std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string()),
+                            path: path.display().to_string(),
+                        }),
+                        Err(e) => TypedResult::error("hook", format!("{e}")),
+                    }
+                }
+                "remove" | "uninstall" => match std::fs::remove_file(&path) {
+                    Ok(()) => TypedResult::ok(Hook { path: shown, installed: false, runs: None }),
+                    // Removing something that is not there is what was asked
+                    // for, not a failure to do it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        TypedResult::ok(Hook { path: shown, installed: false, runs: None })
+                    }
+                    Err(e) => TypedResult::error("hook", format!("could not remove {shown}: {e}")),
+                },
+                other => TypedResult::error(
+                    "usage",
+                    format!("unknown action {other:?}; use show, install or remove"),
+                ),
+            }
+        },
+    )
+    .description(
+        "Install Omarchy's theme-set hook, so a theme change reaches this \
+         browser the moment it happens. The inotify watch covers the common \
+         case on its own; the hook is the one that cannot miss.",
+    )
+    .destructive(true)
+    .done();
+
     let show_state = state.clone();
     let show = CommandDef::typed::<NoArgs, NoOptions, (), ThemeInfo, _, _>(
         "show",
@@ -2342,6 +3493,7 @@ fn theme_group(state: Arc<AppState>) -> Cli {
         .command("show", show)
         .command("reload", reload)
         .command("css", css)
+        .command("hook", hook)
 }
 
 #[derive(Deserialize, incurs::Args)]

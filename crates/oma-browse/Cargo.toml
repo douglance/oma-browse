@@ -50,7 +50,7 @@ webkit2gtk = { version = "=2.0", features = ["v2_40"] }
 # For the one call the safe crate does not generate:
 # `webkit_authentication_request_authenticate`. Pinned to the same version as
 # the wrapper above for the same reason -- two copies of these types would not
-# be the same types. See `policy::supply_credentials` for the scoped `unsafe`.
+# be the same types. See `policy::answer_challenge` for the scoped `unsafe`.
 webkit2gtk-sys = "=2.0"
 # Only for `png`: gtk pulls cairo in without it, so `ImageSurface::write_to_png`
 # is missing and a snapshot has nowhere to go. Naming it here turns the feature

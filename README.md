@@ -43,15 +43,35 @@ coding agent drives the same browser you are looking at.
   contrast against your wallpaper, or is whatever number you pin.
 - **Quick to open.** The start page is served from inside the process — no DNS, no TLS,
   no network — so a new window paints as fast as WebKit can start.
-- **Link hints.** `f` labels every link on the page and follows the one you type; `F`
-  opens it in a new tab.
+- **Link hints and vim keys.** `f` labels every link on the page and follows the one you
+  type; `F` opens it in a new tab. `j`/`k`, `d`/`u`, `gg`/`G` scroll — and stop being
+  scroll keys the moment the caret is in a text field.
+- **The console and the network, in a pipe.** `page console --follow` is `tail -f` for
+  everything a page logs; `page network --har` is the network panel without the panel.
+  Debugging stops meaning F12 and a mouse.
+- **The page as text.** `page markdown` and `page text` give you the article without the
+  navigation, the cookie banner or the script tags. `page reader` shows you the same
+  thing in the tab, in your theme.
+- **Scriptable like Playwright.** `page click`, `page fill`, `page wait` — with waiting,
+  retrying and one honest error when the element never arrives.
+- **Content blocking in C++.** WebKitGTK ships Safari's content-blocker compiler, so a
+  rule list is matched before a socket is opened. Pages get faster, not slower.
+- **Passwords without an extension.** `page fill --from rbw|op|pass` reads the login for
+  the site you are on out of the password manager you already use.
+- **Profiles.** `--profile work` is a second browser: its own config, history, cookies
+  and control socket, in the same binary.
 - **Drivable by agents.** `oma-browse skills add` teaches your coding agent the command
   vocabulary; `oma-browse mcp add` registers the browser as an MCP server.
 - **Screenshots from the engine.** WebKit paints the page into a surface itself, so
   captures work with the window on another workspace and can never catch something else
   on screen.
 - **Hands pages to the desktop.** Install the current page as an Omarchy web app with
-  its own launcher, or open a terminal with its URL on the clipboard.
+  its own launcher — one that opens *here*, chromeless, with a WM class of its own — or
+  open a terminal with its URL on the clipboard.
+- **Answers what pages ask for.** Camera, microphone, screen share, location and
+  notifications prompt in the palette and are remembered per origin. A self-signed
+  certificate gets an interstitial and `nav trust`, not a blank window; HTTP basic auth
+  gets a page and `nav login`.
 - **One dotfile.** Every setting in `~/.config/oma-browse/config.toml`, all of it
   optional.
 
@@ -146,6 +166,9 @@ Two things worth having on the system:
 | `Alt-←` / `Alt-→` / `Alt-Home` | back / forward / home |
 | `Ctrl-R`, `F5` | reload |
 | `f` / `F` | link hints: follow, or open in a new tab |
+| `j` / `k` | scroll down / up |
+| `d` / `u` | scroll half a page down / up |
+| `gg` / `G` | top / bottom |
 | `Ctrl-F`, then `Ctrl-G` / `Ctrl-Shift-G` / `F3` | find on page, next, previous |
 | **The page** | |
 | `Ctrl-+` / `Ctrl--` / `Ctrl-0` | zoom in / out / reset |
@@ -159,9 +182,13 @@ Two things worth having on the system:
 | `F11` | fullscreen |
 
 Keys are bound on the GTK window rather than injected into the page, so they work on a
-site that blocks scripts and whatever currently has focus. Link hints are the one
-exception: a bare letter has to be bound inside the page, because only the page knows
-whether you are typing into a search box.
+site that blocks scripts and whatever currently has focus. The bare letters are the
+exception — link hints and the scroll keys — because only the page knows whether you are
+typing into a search box. In a text field, `j` is a `j`.
+
+`Ctrl-D` and `Ctrl-U` are not the scroll keys here: they are already *bookmark* and
+*view source*, and they are bound on the window, so a page could not see them anyway.
+The bare `d` and `u` are Vimium's own half-page keys.
 
 `Ctrl-T` and `Ctrl-N` land on the start page with the palette already up, since a new
 tab needs a destination. Given one — `tab open <url>`, `window new <url>` — they stay
@@ -177,13 +204,14 @@ Rebind anything by chord in the config file:
 
 ## The palette
 
-`Ctrl-K` opens one list containing your open tabs and all 49 of the browser's commands,
+`Ctrl-K` opens one list containing your open tabs and all 70 of the browser's commands,
 filtered as you type. Enter on a tab switches to it. Enter on a command runs it, or opens a prompt for
 its arguments if it needs any. Typing something that is neither runs it as a URL or a
 search.
 
 Commands are grouped by what they touch: `tab`, `nav`, `page`, `find`, `history`,
-`bookmark`, `download`, `share`, `theme`, `window`, `ui`, `config`.
+`bookmark`, `download`, `share`, `permission`, `content`, `theme`, `window`, `ui`,
+`config`.
 
 <div align="center">
 <img src="assets/screenshot-palette.png" alt="The command palette, listing open tabs and commands" width="820">
@@ -241,6 +269,83 @@ curl --unix-socket "$S" --get http://x/cmd/page/eval --data-urlencode 'js=docume
 
 An HTTP or MCP request carries no working directory, so a relative `path` is refused
 there rather than resolved against the browser's own. Give an absolute one.
+
+### The dev loop
+
+The commands that exist because this is a browser for people who build the web:
+
+```sh
+oma-browse page console --follow        # tail -f for everything the page logs
+oma-browse page console --level error   # just what went wrong, once
+oma-browse page network --failed        # every request that 404'd or blew up
+oma-browse page network --har --path /tmp/run.har
+oma-browse page markdown | jq -r .content | glow   # the article, no chrome
+oma-browse page wait --selector '#app' && oma-browse page click 'button.save'
+oma-browse page fill '#search' 'query' && oma-browse page wait --text 'results'
+oma-browse nav reload --hard            # ignore the cache
+oma-browse tab open :3000               # a bare port is your dev server
+oma-browse window resize 375x812        # check a layout at a phone's width
+```
+
+`page console` catches every `console.*` call, every uncaught error and every unhandled
+rejection from the moment the tab opened — the console is patched at document start, and
+the originals still run, so the inspector shows exactly what it always showed.
+`page network` is WebKit's own view of the requests, so it includes the document, the
+stylesheets and the images, not only what `fetch` was involved in.
+
+Live reload needs no feature at all — it is one line of `watchexec`:
+
+```sh
+watchexec -e rs,html,css -- oma-browse nav reload
+```
+
+`page wait` is the one worth knowing about: with no flags it waits for the load to
+finish *and* for the requests to stop, which on a single-page application is the
+difference between "the document is ready" and "the app has actually drawn".
+
+### Passwords
+
+WebKitGTK has no extension API, so 1Password's and Bitwarden's extensions cannot run
+here. Their command-line clients can:
+
+```sh
+oma-browse page fill '#password' --from rbw
+oma-browse page fill '#email' --from rbw --field username
+oma-browse page fill '#password' --from pass --entry work/github
+```
+
+The entry is the page's host with any `www.` taken off, unless `--entry` names one.
+`rbw`, `op` and `pass` are all understood. The secret goes from the vault into one
+`page eval` and nowhere else — it is never in the answer, in a log, or on a command
+line, and nothing is remembered or offered to be saved.
+
+### Web apps
+
+`--app <url>` opens one site's window: no tab strip, no palette in your face, and a WM
+class of its own so a Hyprland rule can name it.
+
+```sh
+oma-browse --app https://app.slack.com     # class: oma-browse-app-app-slack-com
+oma-browse share webapp                    # install the current page as a launcher
+```
+
+`share webapp` writes an Omarchy launcher that opens *here*. Without it,
+`omarchy-webapp-install` writes one that runs `omarchy-launch-webapp`, whose browser
+allowlist is Chromium-family only — so "install this page as an app" from this browser
+used to install a launcher that opened Chrome.
+
+### Profiles
+
+```sh
+oma-browse --profile work https://mail.example.com
+oma-browse --profile work tab list          # talks to the work window, not the last one
+```
+
+A profile moves four things at once, and it has to be all four: the config file
+(`~/.config/oma-browse/profiles/work.toml`), the state directory, the control socket
+directory, and WebKit's own data directory — which is the one that actually holds the
+cookies. Two profiles share no logins. The default profile's paths are exactly what they
+always were, so nothing moves when you start using this.
 
 ### For coding agents
 
@@ -343,7 +448,9 @@ search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 [theme]                     # veil, recolor
 [window]                    # width, height, decorations, title
 [engine]                    # javascript, devtools, user_agent, autoplay, webrtc,
-                            # webgl, smooth_scrolling, font_size, cookies
+                            # webgl, smooth_scrolling, font_size, cookies, trust,
+                            # proxy, spellcheck, spellcheck_languages
+[content]                   # block, rules
 [control]                   # socket, remote_port
 [startup]                   # incognito, restore
 [history]                   # enabled, limit
@@ -355,7 +462,66 @@ search = "https://duckduckgo.com/?q={query}"    # {query} is url-encoded
 
 A misspelled setting or key is reported rather than ignored: the browser names the key
 and the line in the log and in `config show`, drops that one line, and starts on its
-defaults for it. `$OMA_BROWSE_CONFIG` overrides the path, for a second profile.
+defaults for it. `$OMA_BROWSE_CONFIG` overrides the path outright; `--profile <name>`
+is the supported way to keep a second one.
+
+Three `[engine]` keys are worth calling out:
+
+```toml
+[engine]
+trust = ["*.test", "localhost"]     # certificates accepted however broken
+proxy = "http://127.0.0.1:8080"     # everything through mitmproxy or Burp
+spellcheck = true                   # needs a hunspell dictionary installed
+```
+
+`trust` is the whole certificate check turned off for those names, so put nothing in it
+you did not issue the certificate for yourself. Everything else gets an interstitial
+naming the host and what was wrong with it, and `nav trust` is the way past it once.
+
+### Content blocking
+
+WebKitGTK ships the same content-blocker engine Safari uses: a JSON rule list is
+compiled once into bytecode, and after that every request is matched in C++ before a
+socket is opened. Nothing is fetched and then hidden, which is what an extension-based
+blocker does and why it costs so much.
+
+No list ships with the browser. Install one, then point at it:
+
+```sh
+curl -Lo ~/.config/oma-browse/easylist.json \
+  https://easylist-downloads.adblockplus.org/easylist_min_content_blocker.json
+```
+
+```toml
+[content]
+block = true
+rules = ["~/.config/oma-browse/easylist.json"]
+```
+
+```sh
+oma-browse content list      # what is blocking, and what could not be read
+oma-browse content reload    # after editing a list
+oma-browse content off       # stop blocking in this tab; reload to see it
+oma-browse content on
+```
+
+Paths, not URLs — fetching one would mean a TLS stack in this binary to do a job `curl`
+already does, once, before the browser starts. The first compile takes a few seconds and
+is cached in `$XDG_CACHE_HOME/oma-browse/filters`; after that it is a load. A blocked
+request never reaches `page network`, because WebKit stops it before the engine reports
+it.
+
+### Permissions
+
+Camera, microphone, screen share, location and notifications ask in the palette and are
+remembered per origin:
+
+```sh
+oma-browse permission list
+oma-browse permission allow https://meet.google.com camera microphone
+oma-browse permission deny https://example.com notifications
+oma-browse permission forget https://example.com
+```
 
 Downloads land in your XDG download directory (`~/Downloads` unless `user-dirs.dirs`
 says otherwise), named the way Chrome names them — `report.pdf`, then `report (1).pdf`.
@@ -370,6 +536,11 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
 | tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
+| `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
+| a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |
+| `spellcheck = true` underlines nothing | no dictionary installed — WebKit checks through enchant, which needs a **hunspell** language pack |
+| `window resize` changes nothing | the compositor is tiling that window; float it first (`SUPER + V` in a stock Omarchy) |
+| an incognito tab is logged out of a site the previous incognito tab was signed into | each incognito tab gets its own ephemeral WebKit context; Tauri offers no way to share one between webviews |
 
 Logs go to stderr and are filtered with `RUST_LOG`, e.g.
 `RUST_LOG=oma_browse=debug oma-browse`.

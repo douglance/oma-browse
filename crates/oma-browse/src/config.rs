@@ -121,6 +121,7 @@ pub struct Config {
     pub downloads: Downloads,
     pub screenshot: Screenshot,
     pub tabs: Tabs,
+    pub content: Content,
 
     /// Chord to command, overriding the built-in table. An empty command
     /// unbinds the chord: `"ctrl+d" = ""`.
@@ -129,6 +130,27 @@ pub struct Config {
     /// Why the file was ignored, when it was. Never read from the file itself.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+}
+
+/// Content blocking.
+///
+/// WebKitGTK ships Safari's content-blocker compiler, so this costs nothing at
+/// request time and makes pages faster rather than slower -- see
+/// [`crate::blocker`]. No list is shipped: a browser that decides for you what
+/// the web may not send you is a browser with an opinion you did not ask for,
+/// and the README names one you can install in a line.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Content {
+    /// Block, using the rule lists below. Off with no lists is the same thing
+    /// as off, so this exists to turn blocking off again without deleting the
+    /// paths you spent an afternoon collecting.
+    pub block: bool,
+    /// Rule lists, as paths to Safari-format JSON on disk. `~` is expanded.
+    ///
+    /// Paths, not URLs: fetching one would mean a TLS stack in this binary to
+    /// do a job `curl` already does, once, before the browser starts.
+    pub rules: Vec<String>,
 }
 
 /// The browser's own interface: the palette and the tab strip.
@@ -187,6 +209,10 @@ pub struct Strip {
     /// load fires a URL change, a title change and a favicon within
     /// milliseconds; this is what stops that being three redraws.
     pub debounce_ms: u64,
+    /// Draw a line along the bottom of the strip while a page is loading.
+    /// WebKit's own estimate, pushed in as it changes rather than polled, so an
+    /// idle browser runs nothing for it at all.
+    pub progress: bool,
 }
 
 /// What loaded websites get.
@@ -239,6 +265,23 @@ pub struct Engine {
     /// by default, and it should stay empty for anything you did not issue the
     /// certificate for yourself.
     pub trust: Vec<String>,
+    /// Send every request through this proxy, e.g. `http://127.0.0.1:8080`.
+    ///
+    /// Empty is the system's own setting, which is what WebKit does with no
+    /// help. The point of naming one here is mitmproxy or Burp: a browser you
+    /// can put in front of a proxy without touching the environment it was
+    /// launched from.
+    pub proxy: String,
+    /// Underline misspelt words in text boxes.
+    ///
+    /// Off, and not because WebKit is off: WebKit's default is on, and a red
+    /// squiggle under every identifier in every code review is not what a
+    /// browser for engineers should do without being asked. The palette's own
+    /// input has opted out since the day it was written.
+    pub spellcheck: bool,
+    /// Languages to spell-check against, e.g. `["en_GB"]`. Empty follows
+    /// `$LANG`, which is what WebKit does on its own.
+    pub spellcheck_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -334,6 +377,7 @@ impl Default for Config {
             downloads: Downloads::default(),
             screenshot: Screenshot::default(),
             tabs: Tabs::default(),
+            content: Content::default(),
             keys: BTreeMap::new(),
             problem: None,
         }
@@ -372,7 +416,13 @@ impl Default for Palette {
 
 impl Default for Strip {
     fn default() -> Self {
-        Self { enabled: true, height: crate::layout::STRIP_HEIGHT, title: true, debounce_ms: 80 }
+        Self {
+            enabled: true,
+            height: crate::layout::STRIP_HEIGHT,
+            title: true,
+            debounce_ms: 80,
+            progress: true,
+        }
     }
 }
 
@@ -405,6 +455,11 @@ impl Default for Engine {
             // Not a WebKit default: WebKit trusts nothing extra, and so does
             // this until someone names a host.
             trust: Vec::new(),
+            proxy: String::new(),
+            // See the field: a deliberate departure from WebKit's default, and
+            // the same call the palette's own input already makes.
+            spellcheck: false,
+            spellcheck_languages: Vec::new(),
         }
     }
 }
@@ -500,7 +555,16 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
-        config.join("oma-browse").join("config.toml")
+        // `--profile work` reads `oma-browse/profiles/work.toml`. A profile
+        // that shared the default profile's config could not have its own home
+        // page, which is half of what people name a profile for.
+        let dir = config.join("oma-browse");
+        match crate::profile::name() {
+            Some(profile) => {
+                dir.join("profiles").join(format!("{}.toml", crate::profile::sanitize(profile)))
+            }
+            None => dir.join("config.toml"),
+        }
     }
 
     /// The page to open at startup, as typed: a bare host or a search both work

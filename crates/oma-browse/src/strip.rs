@@ -58,7 +58,22 @@ async fn strip(cx: &Cx) -> Result {
     let sheet = Unescaped::new_unchecked(STRIP_CSS);
     drop(theme);
 
-    let tabs = state.tabs.read().await.list();
+    // One lock for both: the bar is part of the same snapshot as the row of
+    // favicons, and taking it twice could straddle a change and draw a bar for
+    // a tab that is no longer the active one.
+    let (tabs, progress) = {
+        let model = state.tabs.read().await;
+        (model.list(), model.active_progress())
+    };
+    // Every render ends in a call, including the one that says nothing is
+    // loading. That is what makes the reload landing at the end of a load do the
+    // right thing: the script has just restored the bar from `window.name`, and
+    // this tells it the load it belongs to is over, so it runs out and fades
+    // instead of disappearing. Appending the call rather than rendering the
+    // fraction into the markup also keeps how far ahead of WebKit to aim stated
+    // once, in one language.
+    let load_script =
+        Unescaped::new_unchecked(format!("{LOAD_JS}\n{}", crate::progress::call(progress)));
     // The active tab's title, which is the only text on the strip. Empty when
     // nothing is open, which is a state the window can be in for one frame at
     // startup and permanently after the last tab closes.
@@ -113,6 +128,19 @@ async fn strip(cx: &Cx) -> Result {
 
                     <button class="gear" id="do-settings" title="Settings">(GEAR)</button>
                 </div>
+
+                if state.config.chrome.strip.progress {
+                    // Two elements rather than one: the fill has to be scaled
+                    // and the glow at its leading edge has to be moved, and
+                    // scaling a gradient would smear it. Both are transforms,
+                    // so both ride the compositor.
+                    <div class="load">
+                        <div class="fill"></div>
+                        <div class="tip"></div>
+                    </div>
+                    <script>(load_script)</script>
+                }
+
                 topcoat::runtime::script()
             </body>
         </html>
@@ -214,6 +242,96 @@ pub fn inset_script(height: i32) -> String {
     )
 }
 
+/// The strip's half of the load bar: one function, called by
+/// [`crate::progress::paint`] once per percent of a load.
+///
+/// It sets a single custom property and toggles two classes. Everything that
+/// moves is a `transform` in the stylesheet, so a step costs a matrix on the
+/// compositor and no layout, no paint and no script beyond this.
+const LOAD_JS: &str = r#"(function () {
+  "use strict";
+  var bar = document.querySelector(".load");
+  if (!bar) return;
+  var clearing;
+
+  // How far past the truth to aim for. WebKit's estimate is dominated by the
+  // main document: a page typically reports 0.1, then 0.5 when the HTML lands,
+  // then creeps by thousandths until it is done. Drawn literally that is a bar
+  // that sits frozen at half for as long as the images take, which reads as a
+  // browser that has given up. Aiming past the last reading and taking seconds
+  // to get there means the long transition itself is the creep -- so the bar
+  // keeps moving between readings without a timer running to move it.
+  var LEAD = 0.3;
+  // Something on screen the instant a load starts, because until the first
+  // byte comes back WebKit reports nothing at all -- and that wait is the one
+  // most worth being told about.
+  var FLOOR = 0.06;
+
+  // This page is re-rendered by the browser whenever the tab model changes,
+  // which during a page load is three or four times: the URL, the title and the
+  // favicon all arrive within a second of each other. So the bar's state cannot
+  // live only in this document. The reload that lands as a load *finishes* is
+  // the one that matters -- it would take the run-out and the fade with it, and
+  // the bar would vanish at two thirds instead of arriving.
+  //
+  // `window.name` rather than `sessionStorage` because it is the one store that
+  // cannot fail: a webview on a custom scheme can be an opaque origin, where
+  // storage throws on access rather than returning null, and a load bar does not
+  // justify a feature detection wrapped in a try/catch. Nothing else uses the
+  // name -- this is the tab strip, and it has no windows to target.
+  var KEEP = "oma-load:";
+  function remember(value) {
+    window.name = value === null ? "" : KEEP + value;
+  }
+
+  if (window.name.indexOf(KEEP) === 0) {
+    // Straight into place with no transition: nothing has painted yet, so this
+    // is the bar's first frame rather than a move across the window.
+    bar.style.setProperty("--p", window.name.slice(KEEP.length));
+    bar.classList.add("on");
+  }
+
+  window.__omaLoad = function (fraction, loading) {
+    clearTimeout(clearing);
+
+    if (!loading) {
+      // Nothing to finish. A window at rest re-renders this page for its own
+      // reasons -- a theme change, a tab closing -- and running the finish
+      // animation then would flash a bar across a window that is not loading
+      // anything.
+      if (!bar.classList.contains("on")) return;
+      // A frame late, always. When this call arrives on a page that has just
+      // restored the bar above, the restore and the finish are in the same tick
+      // -- the browser would go straight from "never painted" to "finished",
+      // see no change in between, and run neither animation. Waiting for a
+      // frame gives the restored bar one paint to be at, which is what the run
+      // out and the fade are then a change *from*. In the ordinary case, where
+      // the bar has been on screen for seconds, a frame is not perceptible.
+      requestAnimationFrame(function () {
+        // Out to the end first, then fade: a bar that vanished at four fifths
+        // would read as a load that gave up rather than one that arrived.
+        bar.style.setProperty("--p", "1");
+        bar.classList.add("done");
+        clearing = setTimeout(function () {
+          bar.classList.remove("on", "done");
+          // Back to the left with the transition off -- `.load` is no longer
+          // `.on` -- so the next load grows from the edge instead of sliding
+          // back across the window first.
+          bar.style.setProperty("--p", "0");
+          remember(null);
+        }, 520);
+      });
+      return;
+    }
+
+    bar.classList.remove("done");
+    var aim = Math.max(fraction + (1 - fraction) * LEAD, FLOOR);
+    bar.style.setProperty("--p", String(aim));
+    bar.classList.add("on");
+    remember(aim);
+  };
+})();"#;
+
 const STRIP_CSS: &str = r##"
 * { box-sizing: border-box; }
 html, body {
@@ -288,6 +406,90 @@ html, body {
    that have one -- and with the mark underneath. */
 .glyph { width: 16px; height: 16px; display: block; color: var(--oma-menu-fg); }
 .glyph svg { display: block; }
+
+/* The load bar, along the strip's bottom edge -- which is also the top edge of
+   the page, since the strip floats and the inset ends exactly here.
+
+   Everything that moves is `transform`, and the two elements share one timing
+   function, so the glow stays welded to the end of the fill however jerkily
+   WebKit's estimate arrives. `--p` is the fraction, set from one place. */
+.load {
+  --p: 0;
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 2px;
+  /* The strip is one click target; a bar drawn over it must not eat any of it. */
+  pointer-events: none;
+  /* Out of the way rather than removed: `visibility` keeps the element around
+     for the fade, and both it and the animation below are gated on `.on`, so a
+     browser sitting on a loaded page has nothing running for this at all. */
+  opacity: 0; visibility: hidden;
+}
+.load.on { opacity: 1; visibility: visible; }
+/* The tail of a finished load: hold the full bar for a beat so it is seen to
+   have arrived, then fade. Visibility waits for the fade rather than
+   transitioning with it -- it is not an animatable value. */
+.load.done {
+  opacity: 0;
+  transition: opacity 240ms ease 160ms, visibility 0s linear 400ms;
+}
+
+.load .fill, .load .tip {
+  position: absolute; bottom: 0; height: 100%;
+}
+/* No transition while the bar is down: the reset back to zero happens then,
+   and it must not be seen travelling.
+
+   The duration is the creep. This curve is nearly all of the way there inside a
+   second and then crawls, so a real step from WebKit lands promptly and the
+   long tail afterwards is what keeps the bar moving while nothing is being
+   reported. One transition doing both jobs; no timer doing either. */
+.load.on .fill, .load.on .tip {
+  transition: transform 2400ms cubic-bezier(0.08, 0.82, 0.17, 1);
+}
+
+/* Full width and scaled, rather than sized: a width animation is layout on
+   every frame, and this is the same picture for none. */
+.load .fill {
+  left: 0; width: 100%;
+  transform-origin: left center;
+  transform: scaleX(var(--p));
+  background: var(--oma-accent);
+}
+
+/* The leading edge. Parked one length off the left so that translating it by
+   the fraction puts its right edge exactly where the fill ends -- `100vw` and
+   the fill's `100%` are the same span, this webview being the width of the
+   window. */
+.load .tip {
+  left: 0; width: 120px; margin-left: -120px;
+  transform: translateX(calc(var(--p) * 100vw));
+  background: linear-gradient(90deg, transparent, var(--oma-accent));
+  /* A glow rather than a blur filter: this is rasterised once into the layer
+     and then only ever moved, where a filter would be re-run every frame. */
+  box-shadow: 0 0 10px 1px var(--oma-accent);
+}
+/* WebKit's estimate can sit still for seconds on a slow connect, and the creep
+   above asymptotes. The breath is what still says "working" by then -- opacity
+   only, on a 120px sliver, which the compositor animates without waking the
+   main thread. */
+.load.on .tip { animation: oma-breathe 1.6s ease-in-out infinite; }
+@keyframes oma-breathe {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+/* After `.load.on`, and deliberately: the run out to the full width is the one
+   move that must not creep. The load is over, and the bar has a fade waiting
+   behind it. */
+.load.done .fill, .load.done .tip {
+  transition: transform 220ms cubic-bezier(0.3, 0, 0.2, 1);
+}
+
+/* Someone who has asked the system for less movement gets the bar and not the
+   breath. The bar is the information; the breath is only reassurance. */
+@media (prefers-reduced-motion: reduce) {
+  .load.on .tip { animation: none; opacity: 0.9; }
+}
 
 .title {
   min-width: 0;
