@@ -3103,12 +3103,21 @@ struct WindowNewOptions {
     // Same as the positional, for callers whose transport cannot carry slashes.
     /// A URL, a bare host, or search terms.
     url: Option<String>,
+    /// Open the window on this Hyprland workspace instead of the one you are
+    /// standing on: a number, `name:web`, `special:magic`, `+1`, `empty`.
+    /// Ignored, with a warning in the log, on anything that is not Hyprland.
+    workspace: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
 struct Spawned {
-    /// The new window's process.
-    pid: u32,
+    /// The new window's process, when we forked it ourselves. Absent when
+    /// Hyprland launched it for us, which is what `--workspace` asks for:
+    /// `hyprctl` answers `ok`, not a process id.
+    pid: Option<u32>,
+    /// The workspace it was placed on, if it was placed at all. Absent means
+    /// it opened wherever you were.
+    workspace: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3290,14 +3299,23 @@ fn window_group(state: Arc<AppState>) -> Cli {
                 // No URL means Ctrl-N, which should come up asking where to go
                 // rather than landing on the start page with nothing to do.
                 let palette = url.is_none();
-                match crate::window::spawn(state.incognito(), url, palette, false) {
-                    Ok(pid) => TypedResult::ok(Spawned { pid }),
+                let workspace = ctx.options.workspace.clone();
+                match crate::window::spawn_on(
+                    state.incognito(),
+                    url,
+                    palette,
+                    false,
+                    workspace.as_deref(),
+                ) {
+                    Ok(opened) => {
+                        TypedResult::ok(Spawned { pid: opened.pid, workspace: opened.workspace })
+                    }
                     Err(e) => TypedResult::error("spawn", format!("{e:#}")),
                 }
             }
         },
     )
-    .description("Open another browser window")
+    .description("Open another browser window, optionally on a given Hyprland workspace")
     .done();
 
     let s = state;

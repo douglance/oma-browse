@@ -587,33 +587,152 @@ pub fn parse_size(raw: &str) -> Option<(f64, f64)> {
 }
 
 pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -> Result<u32> {
-    let exe = std::env::current_exe().context("could not find the running browser binary")?;
-    let mut command = std::process::Command::new(exe);
+    Ok(spawn_on(incognito, url, palette, quiet, None)?.pid.unwrap_or_default())
+}
 
+/// What opening a window produced.
+///
+/// `pid` is absent for exactly one case: a window Hyprland launched for us, on
+/// a workspace, because `hyprctl` answers `ok` rather than a process id. Every
+/// other path knows the child it forked.
+#[derive(Debug, Default)]
+pub struct Opened {
+    pub pid: Option<u32>,
+    /// The workspace it was placed on, if it was placed at all.
+    pub workspace: Option<String>,
+}
+
+/// A workspace name Hyprland will accept and a shell will not reinterpret.
+///
+/// This reaches the browser from the CLI, the HTTP API and MCP, and it is
+/// interpolated into a Lua string that Hyprland then runs through a shell. A
+/// deny-list would be the wrong shape here, so the allow-list is the Hyprland
+/// selector grammar and nothing else: `4`, `name:web`, `special:magic`,
+/// `+1`, `-1`, `empty`.
+fn workspace_is_safe(ws: &str) -> bool {
+    !ws.is_empty()
+        && ws.len() <= 64
+        && ws.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-' | '+'))
+}
+
+/// Hyprland, or not.
+///
+/// The signature variable is set by the compositor for every client it starts,
+/// so this is asking "am I running under Hyprland" rather than "is hyprctl
+/// installed" -- which is the actual question, and is also true inside a
+/// Hyprland session that has `hyprctl` missing for some other reason.
+fn under_hyprland() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+/// One argument, safe to paste into a command line a shell will parse.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// One string, safe to paste into a Lua double-quoted literal.
+///
+/// Backslash first, or the escape would escape the backslash it just added. The
+/// two line endings are here because Lua rejects a raw newline inside a short
+/// string: without them a name containing one produces a syntax error rather
+/// than a quoted name. Nothing reaching this today can contain one --
+/// `workspace_is_safe` refuses it and a resolved URL has none -- so this is the
+/// function keeping its own promise rather than a live bug being fixed.
+fn lua_quote(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n").replace('\r', r"\r")
+}
+
+/// Open a window, optionally on a given Hyprland workspace.
+///
+/// With a workspace, Hyprland launches the binary itself with the rule already
+/// attached, so the window is on the target from its first frame. The
+/// alternative -- fork here, then ask the compositor to move the window -- races
+/// the window's own creation and shows it jumping when it loses.
+///
+/// This is the one place in the browser that knows what compositor it is on.
+/// It is confined here deliberately: everywhere else, a window is a process and
+/// nothing more (see the module docs and `crate::control`). Off Hyprland the
+/// window still opens, on whatever workspace you are standing on, and the
+/// caller is told the placement did not happen rather than being failed.
+pub fn spawn_on(
+    incognito: bool,
+    url: Option<String>,
+    palette: bool,
+    quiet: bool,
+    workspace: Option<&str>,
+) -> Result<Opened> {
+    let exe = std::env::current_exe().context("could not find the running browser binary")?;
+
+    // Built as a list rather than pushed straight onto a `Command`, because the
+    // Hyprland path below needs the same argv as a string for the compositor to
+    // run, and two builders would drift.
+    let mut args: Vec<String> = Vec::new();
     // An incognito window opens incognito windows: the alternative is a chord
     // that quietly drops you back into a session that records history.
     if incognito {
-        command.arg("--incognito");
+        args.push("--incognito".into());
     }
     // A window opened from a profile belongs to that profile. The flag is
     // stripped from argv on the way in (see `crate::profile::take_flag`), so it
     // has to be put back on the way out.
     if let Some(profile) = crate::profile::name() {
-        command.arg("--profile").arg(profile);
+        args.push("--profile".into());
+        args.push(profile.to_string());
     }
     // `--new` on both paths: this is Ctrl-N, and a new window is the whole
     // point. Without it the URL would be handed to the window we are standing
     // in (see `main::join`).
-    command.arg("--new");
+    args.push("--new".into());
     if let Some(url) = url {
-        command.arg(url);
+        args.push(url);
     }
     // Ctrl-N with nowhere to go comes up asking where; a window opened *for* an
     // agent does not, because the palette would then be sitting over every page
     // it screenshots and every element it clicks.
     if palette {
-        command.arg("--palette");
+        args.push("--palette".into());
     }
+
+    if let Some(ws) = workspace {
+        if !workspace_is_safe(ws) {
+            anyhow::bail!("{ws:?} is not a workspace name");
+        }
+        if under_hyprland() {
+            let mut line = shell_quote(&exe.to_string_lossy());
+            for arg in &args {
+                line.push(' ');
+                line.push_str(&shell_quote(arg));
+            }
+            let lua = format!(
+                "hl.dsp.exec_cmd(\"[workspace {ws} silent] {cmd}\")",
+                ws = lua_quote(ws),
+                cmd = lua_quote(&line),
+            );
+            let out = std::process::Command::new("hyprctl")
+                .arg("dispatch")
+                .arg(&lua)
+                .output()
+                .context("could not reach hyprctl to place the window")?;
+            let reply = String::from_utf8_lossy(&out.stdout);
+            // `hyprctl` exits 0 and prints the complaint, so the status is not
+            // the answer -- the body is.
+            if !out.status.success() || !reply.trim().eq_ignore_ascii_case("ok") {
+                anyhow::bail!(
+                    "hyprland refused to open the window: {}",
+                    reply.trim().lines().next().unwrap_or("no reply")
+                );
+            }
+            tracing::info!(workspace = ws, "opened another window");
+            return Ok(Opened { pid: None, workspace: Some(ws.to_string()) });
+        }
+        tracing::warn!(
+            workspace = ws,
+            "not running under Hyprland; opening on the current workspace instead"
+        );
+    }
+
+    let mut command = std::process::Command::new(exe);
+    command.args(&args);
 
     // Nothing may reach the child through our stdin either way.
     if quiet {
@@ -634,7 +753,7 @@ pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -
     });
 
     tracing::info!(pid, "opened another window");
-    Ok(pid)
+    Ok(Opened { pid: Some(pid), workspace: None })
 }
 
 /// Show or hide the palette, and hand it focus when it appears.
@@ -694,5 +813,102 @@ mod tests {
         assert_eq!(parse_size("99999x99999"), None);
         // The smallest phone anybody tests against still works.
         assert_eq!(parse_size("320x568"), Some((320.0, 568.0)));
+    }
+
+    /// The workspace name is interpolated into a Lua literal that Hyprland then
+    /// runs through a shell, and it arrives from the CLI, the HTTP API and MCP.
+    #[test]
+    fn a_workspace_name_is_a_selector_and_nothing_else() {
+        for ok in ["4", "name:web", "special:magic", "+1", "-1", "empty", "a_b-c"] {
+            assert!(workspace_is_safe(ok), "{ok:?} should be allowed");
+        }
+        for bad in [
+            "",
+            "4 evil",
+            "4\"; touch /tmp/pwned #",
+            "$(id)",
+            "`id`",
+            "a;b",
+            "a\nb",
+            "a|b",
+            "a&b",
+            "../../etc",
+        ] {
+            assert!(!workspace_is_safe(bad), "{bad:?} should be refused");
+        }
+        assert!(!workspace_is_safe(&"4".repeat(65)));
+    }
+
+    /// Both quoters, round-tripped: what a shell finally sees must be the byte
+    /// string we started with. `--profile` names flow through here too.
+    #[test]
+    fn quoting_survives_the_lua_then_shell_round_trip() {
+        // What `lua_quote` produces is what Lua hands to the shell, so undoing
+        // the Lua escaping is how we see the shell's input.
+        fn lua_unescape(s: &str) -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            }
+            out
+        }
+
+        // And undoing the single-quote wrapping is how we see the argument.
+        // Minimal POSIX word rules, which is all `shell_quote` ever emits: a
+        // quote opens or closes a literal run, and outside one a backslash
+        // escapes whatever follows it.
+        fn shell_unquote(s: &str) -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            let mut quoted = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\'' => quoted = !quoted,
+                    '\\' if !quoted => {
+                        if let Some(next) = chars.next() {
+                            out.push(next);
+                        }
+                    }
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+
+        for raw in [
+            "plain",
+            "a\"b",
+            "a'b",
+            "a\\b",
+            "https://example.com/?q=1&r=2",
+            "work profile",
+            "quote\"and'both",
+        ] {
+            let shell_ready = shell_quote(raw);
+            let lua_ready = lua_quote(&shell_ready);
+            assert_eq!(
+                shell_unquote(&lua_unescape(&lua_ready)),
+                raw,
+                "round trip lost {raw:?} (shell {shell_ready:?}, lua {lua_ready:?})"
+            );
+        }
+    }
+
+    /// Lua has no raw newline inside a short string, so neither may we emit one.
+    #[test]
+    fn lua_quoting_emits_no_raw_line_ending() {
+        let out = lua_quote("a\nb\r\nc");
+        assert!(!out.contains('\n') && !out.contains('\r'), "emitted a raw line ending: {out:?}");
+        assert_eq!(out, r"a\nb\r\nc");
     }
 }
