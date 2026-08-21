@@ -207,6 +207,9 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::blocker::install(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab blocks nothing");
             }
+            if let Err(e) = crate::tabs::watch_url(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab will not notice in-page navigation");
+            }
             // On the main thread, which is where the filter store lives, and
             // after the first webview so that anything already cached is applied
             // to it rather than only to the second tab.
@@ -348,8 +351,18 @@ pub fn instrument(
         .on_document_title_changed(move |webview, title| {
             let state = title_state.clone();
             let label = webview.label().to_string();
+            // The view's own URL, not the tab model's. The model is updated by
+            // another task (`tabs::watch_url`), and a single-page application
+            // sets its title in the same tick it changes its URL -- so reading
+            // the model here is a race, and the losing side writes the new page's
+            // title against the old page's URL. Measured on a pushState: the
+            // video's title recorded against the search URL.
+            let live = webview.url().ok().map(|u| u.to_string());
             state.runtime().spawn(async move {
-                let url = state.tabs.read().await.url_for(&label);
+                let url = match live {
+                    Some(url) => Some(url),
+                    None => state.tabs.read().await.url_for(&label),
+                };
                 state.tabs.write().await.update_title(&label, title.clone());
                 if state.keeps_history()
                     && let Some(url) = url

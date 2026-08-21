@@ -440,6 +440,9 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     if let Err(e) = crate::blocker::install(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab blocks nothing");
     }
+    if let Err(e) = watch_url(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab will not notice in-page navigation");
+    }
 
     if background {
         // Newly packed webviews are visible and expanding, which would split the
@@ -454,6 +457,76 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
         .into_iter()
         .find(|t| t.id == id)
         .ok_or_else(|| anyhow!("tab {id} vanished during creation"))
+}
+
+/// Keep the tab model in step with where the page has actually gone.
+///
+/// Tauri's `on_page_load` is a *document* event, so a single-page application
+/// that navigates with `history.pushState` is invisible to it -- and this
+/// browser then reports the wrong page from every command that asks the tab
+/// model where it is. Measured: clicking through from a search page left
+/// `tab list` showing the search URL while the page was on the video, and the
+/// *video's* title was recorded into history against the *search* URL. Not a
+/// stale field: a wrong pair, written down.
+///
+/// WebKit's `uri` property is the honest answer, because it changes for a
+/// pushState as well as for a load. It also changes several times *during* an
+/// ordinary load -- provisional, then committed, then any redirect -- which is
+/// why `on_page_load` was the natural place to record history from and why this
+/// does not take that job away from it. `is_loading()` is what tells the two
+/// apart: a pushState happens with nothing in flight.
+#[cfg(target_os = "linux")]
+pub fn watch_url<R: tauri::Runtime>(view: &Webview<R>, state: Arc<AppState>) -> Result<()> {
+    let label = view.label().to_string();
+    view.with_webview(move |platform| {
+        use webkit2gtk::WebViewExt;
+
+        platform.inner().connect_uri_notify(move |webview| {
+            let Some(uri) = webview.uri() else { return };
+            let url = uri.to_string();
+            // The browser's own pages are not somewhere the user went.
+            if url.is_empty()
+                || url == "about:blank"
+                || url.starts_with(&format!("{}://", crate::window::CHROME_SCHEME))
+            {
+                return;
+            }
+            // Mid-load the URI churns; `on_page_load` records the one that
+            // sticks. A URI that changes with nothing loading is a pushState,
+            // and it is the only kind nothing else will hear about.
+            let quiet = !webview.is_loading();
+
+            let state = state.clone();
+            let label = label.clone();
+            state.runtime().spawn(async move {
+                let moved = {
+                    let mut tabs = state.tabs.write().await;
+                    let before = tabs.url_for(&label);
+                    if before.as_deref() == Some(url.as_str()) {
+                        false
+                    } else {
+                        tabs.update_url(&label, url.clone());
+                        true
+                    }
+                };
+                if !moved {
+                    return;
+                }
+                if quiet && state.keeps_history() {
+                    let mut history = state.history.write().await;
+                    history.record(&url, crate::history::now());
+                    history.flush();
+                }
+                state.notify_tabs();
+            });
+        });
+    })
+    .context("could not reach the webview to follow its URL")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn watch_url<R: tauri::Runtime>(_view: &Webview<R>, _state: Arc<AppState>) -> Result<()> {
+    Ok(())
 }
 
 /// Make one tab visible and hide the rest.
