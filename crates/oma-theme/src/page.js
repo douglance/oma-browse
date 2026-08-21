@@ -910,6 +910,12 @@
     // reads the site's declarations again and not our own output.
     var authored = {};
     var names = [];
+    // Set when a rule's custom property is found to have been rewritten since we
+    // last read it. `siteVars` is a snapshot of *computed* values taken once and
+    // kept for good after `load`, and it outranks authored text in `varMap` --
+    // so a site that re-themes by rewriting its own variables would keep getting
+    // the colours it had before, however correctly the authored text is re-read.
+    var varsRewritten = false;
     eachStyleRule(function (rule) {
       // Which custom properties a rule declares, and their authored text, is a
       // property of the rule alone -- no `base`, no `varMap`, nothing that moves
@@ -920,23 +926,73 @@
       // declaration of every rule in the document, on top of the one that emits:
       // ~65ms per pass over youtube.com's 27,000 rules, eleven times a load, and
       // for the great majority of rules the answer is "none".
-      var mine = varCache.get(rule);
-      if (mine === undefined) {
-        mine = null;
-        for (var vi = 0; vi < rule.style.length; vi++) {
-          var name = rule.style[vi];
-          if (name.slice(0, 2) === "--" && name.indexOf("--oma-") !== 0) {
-            (mine || (mine = [])).push(name, rule.style.getPropertyValue(name).trim());
+      var seen = varCache.get(rule);
+      // A cached answer is only good while the rule still says what it said.
+      // `rule.style.setProperty` is how a site that themes by rewriting its own
+      // stylesheet works, it raises no event and `MutationObserver` cannot see
+      // it, so the only way to notice is to check. Cheaply: the declaration
+      // count catches a property appearing or going, and re-reading the handful
+      // of values actually cached catches one being changed in place. Both are
+      // a few reads against a rule, not a walk of every declaration it has.
+      if (seen !== undefined && seen.len !== rule.style.length) seen = undefined;
+      if (seen !== undefined && seen.vars) {
+        for (var vv = 0; vv < seen.vars.length; vv += 2) {
+          if (rule.style.getPropertyValue(seen.vars[vv]).trim() !== seen.vars[vv + 1]) {
+            seen = undefined;
+            varsRewritten = true;
+            break;
           }
         }
-        varCache.set(rule, mine);
       }
+      if (seen === undefined) {
+        // The same walk answers a second question worth remembering: whether
+        // this rule could ever produce an override at all. `emitRule` reads
+        // exactly four things -- any custom property, `color`, and
+        // `background-color`/`background-image` (with `background` folded in by
+        // `backgroundOf`) -- so a rule that declares none of them emits nothing
+        // whatever `base` and `varMap` say. On youtube.com that is 16,000 of
+        // 27,600 rules, and unlike the derivation cache below this answer
+        // survives a generation change, which is when every rule would
+        // otherwise be visited again.
+        var vars = null;
+        var emits = false;
+        for (var vi = 0; vi < rule.style.length; vi++) {
+          var name = rule.style[vi];
+          if (name.charCodeAt(0) === 45 && name.charCodeAt(1) === 45) {
+            if (name.indexOf("--oma-") !== 0) {
+              (vars || (vars = [])).push(name, rule.style.getPropertyValue(name).trim());
+              emits = true;
+            }
+            continue;
+          }
+          if (
+            name === "color" ||
+            name === "background" ||
+            name === "background-color" ||
+            name === "background-image"
+          ) {
+            emits = true;
+          }
+        }
+        seen = { len: rule.style.length, vars: vars, emits: emits };
+        varCache.set(rule, seen);
+      }
+      var mine = seen.vars;
       if (!mine) return;
       for (var mi = 0; mi < mine.length; mi += 2) {
         if (authored[mine[mi]] === undefined) names.push(mine[mi]);
         authored[mine[mi]] = mine[mi + 1];
       }
     });
+    if (varsRewritten) {
+      // Throw the snapshot away and take it again: the page is not the one it
+      // was measured on. This is the same reset the `!measuredFinal` branch
+      // above does while a document is still loading, for the same reason --
+      // a measurement is only good for the page it was made against.
+      measured = undefined;
+      siteVars = null;
+      pendingVarNames = null;
+    }
     if (siteVars === null && pendingVarNames === null) {
       pendingVarNames = names;
     }
@@ -953,14 +1009,29 @@
 
     var gen = generation(base, varMap, names);
     eachStyleRule(function (rule, wrap) {
+      // Settled once and for all by the scan above, and checked before the
+      // generation is: a rule that cannot emit stays skipped across the
+      // generation changes that re-derive everything else.
+      var known = varCache.get(rule);
+      if (known && !known.emits) return;
+      // The generation covers `base` and `varMap`; it says nothing about the
+      // rule's own declarations, which a site can rewrite in place. These four
+      // are the whole of what `emitRule` reads off the rule -- `backgroundOf`
+      // folds `background` into the two longhands -- so comparing them is
+      // exactly as strong as re-deriving, and four reads cheaper.
+      var st = rule.style;
+      var c = st.getPropertyValue("color");
+      var bc = st.getPropertyValue("background-color");
+      var bi = st.getPropertyValue("background-image");
+      var bs = st.getPropertyValue("background");
       var hit = ruleCache.get(rule);
-      if (hit && hit.gen === gen) {
+      if (hit && hit.gen === gen && hit.c === c && hit.bc === bc && hit.bi === bi && hit.bs === bs) {
         for (var hi = 0; hi < hit.out.length; hi++) out.push(hit.out[hi]);
         return;
       }
       var mine = [];
       emitRule(rule, wrap, base, varMap, mine);
-      ruleCache.set(rule, { gen: gen, out: mine });
+      ruleCache.set(rule, { gen: gen, out: mine, c: c, bc: bc, bi: bi, bs: bs });
       for (var mi = 0; mi < mine.length; mi++) out.push(mine[mi]);
     });
     // Unconditionally, last, so it wins on document order: the canvas belongs to
