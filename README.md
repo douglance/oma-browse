@@ -551,6 +551,7 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
 | tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
+| "log in with Google/Apple/X" does nothing | fixed — a scripted `window.open` now gets a real pop-up window with a live `opener`, which is what an OAuth provider hands the credential back through. Before, it became a detached tab and `window.open` returned null |
 | a heavy site loads or scrolls slowly | page recolouring is the dominant cost this browser adds on such a page — worth ~2.7-2.8x on load, and ~58% on every style recalculation. `theme recolor off` drops it for that window, live, or `[theme] recolor = false` for good |
 | `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
 | a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |

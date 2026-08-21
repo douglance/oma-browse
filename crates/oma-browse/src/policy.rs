@@ -72,27 +72,30 @@ pub fn install<R: tauri::Runtime>(_view: &Webview<R>, _state: Arc<AppState>) -> 
     Ok(())
 }
 
-/// `target="_blank"`, `window.open`, and a middle-click: open them as tabs.
+/// `target="_blank"`, `window.open`, and a middle-click.
 ///
-/// WebKit asks for a *widget* to put the new page in and takes `None` for an
-/// answer, which is what it was getting -- so a `_blank` link did nothing at
-/// all and `window.open` returned null. A tab is what this browser has instead
-/// of a second window, and a tab's webview cannot be conjured here anyway:
-/// `tabs::open` is async and builds it through Tauri. So the answer is still
-/// `None`, with the URL sent on to become a tab -- the same shape the link-hint
-/// sentinel already uses (see [`crate::hints::intercept`]).
+/// WebKit asks for a *widget* to put the new page in, and what it is given
+/// decides what the page gets back. Answering `None` means "no window was
+/// made", so `window.open` evaluates to `null`.
 ///
-/// The cost of answering `None` is that `window.open` keeps returning null, so
-/// a page that writes into the handle it gets back -- `w.document.write(..)`,
-/// or the `window.open('')`-then-post-a-form pattern some OAuth flows use --
-/// gets a tab that loads the URL and no handle. That is a great deal better
-/// than the nothing it does today, and the alternative is handing WebKit a
-/// widget this browser does not own.
+/// A link and a script want different things here, and the first version of
+/// this gave both of them a tab and answered `None`. That fixed `_blank` links,
+/// which had previously done nothing at all, and left every OAuth pop-up
+/// broken: "log in with Google" on x.com opened the chooser as two detached
+/// tabs, `window.open` returned null, the new page had no `opener`, and the
+/// provider had nowhere to hand the credential back to. The login could not
+/// complete and said nothing about why.
+///
+/// So the two cases are separated by [`NavigationType`]. A clicked link becomes
+/// a tab, which is what a person means by `target="_blank"`. A scripted
+/// `window.open` gets a real related view in a window of its own -- see
+/// [`popup_window`] -- because a login flow needs the two halves to be able to
+/// see each other.
 #[cfg(target_os = "linux")]
 fn popups(webview: &webkit2gtk::WebView, state: Arc<AppState>) {
-    use webkit2gtk::{URIRequestExt as _, WebViewExt as _};
+    use webkit2gtk::{NavigationType, URIRequestExt as _, WebViewExt as _};
 
-    webview.connect_create(move |_view, action| {
+    webview.connect_create(move |view, action| {
         let url = action.request().and_then(|request| request.uri()).map(|u| u.to_string());
         let Some(url) = url.filter(|u| !u.is_empty() && u != "about:blank") else {
             // `window.open('')` with nothing to load. There is no page to put
@@ -101,6 +104,24 @@ fn popups(webview: &webkit2gtk::WebView, state: Arc<AppState>) {
             tracing::debug!("a page asked for a window with no URL");
             return None;
         };
+
+        // A link and a script asking for a window want different things, and
+        // giving both of them the same thing is what broke logging in.
+        //
+        // A `target="_blank"` link wants a tab: that is what a person means by
+        // it, and a tab is what every other browser gives them.
+        //
+        // `window.open()` from script is nearly always an OAuth pop-up -- "log
+        // in with Google", "log in with X" -- and those need a *window object*
+        // back. Handing the page a tab and returning `None` here means
+        // `window.open` evaluates to `null`, the new page has no `opener`, and
+        // the provider has nowhere to hand the credential to. Measured on
+        // x.com: the Google chooser opened as two detached tabs and the login
+        // could never complete, because the two halves of the flow could not
+        // see each other.
+        if action.navigation_type() != NavigationType::LinkClicked {
+            return popup_window(view, &url);
+        }
 
         // A window the reader asked for comes to the front; one they did not
         // goes behind what they are reading.
@@ -112,7 +133,7 @@ fn popups(webview: &webkit2gtk::WebView, state: Arc<AppState>) {
         // cases that do get through, not the pop-up blocker; that is upstream
         // and it is WebKit's.
         let background = !action.is_user_gesture();
-        tracing::debug!(%url, background, "a page asked for a new window");
+        tracing::debug!(%url, background, "a page asked for a new tab");
 
         let state = state.clone();
         state.runtime().spawn(async move {
@@ -122,6 +143,62 @@ fn popups(webview: &webkit2gtk::WebView, state: Arc<AppState>) {
         });
         None
     });
+}
+
+/// A real pop-up: a second WebKit view that shares the opener's session, in a
+/// window of its own.
+///
+/// It has to be *related* to the view that asked. `webkit_web_view_new_with_related_view`
+/// is what makes the two halves of an OAuth flow the same browsing context --
+/// same session, same cookies, and a live `window.opener` for the provider to
+/// post the credential back through. A fresh view, or a tab, is a stranger to
+/// the page that opened it however identical its configuration.
+///
+/// Deliberately not one of our tabs, and deliberately without this browser's
+/// injections. A login pop-up exists for ten seconds and closes itself; giving
+/// it a tab strip entry to be cleaned up afterwards, and a theme, would be
+/// work in service of something nobody looks at. `window.close()` from the
+/// page takes the window with it, which is what the opener is polling for.
+#[cfg(target_os = "linux")]
+fn popup_window(opener: &webkit2gtk::WebView, url: &str) -> Option<gtk::Widget> {
+    use gtk::prelude::*;
+    use webkit2gtk::WebViewExt as _;
+
+    // SAFETY: `opener` is a live view on this thread, and the constructor
+    // returns a new floating reference that `from_glib_none` takes a strong one
+    // to. The safe crate binds every other `WebView` constructor and not this
+    // one, which is the only reason this is here.
+    #[allow(unsafe_code, reason = "webkit2gtk 2.0 does not bind the related-view constructor")]
+    let popup: webkit2gtk::WebView = unsafe {
+        use gtk::glib::translate::{FromGlibPtrNone as _, ToGlibPtr as _};
+        let raw = webkit2gtk_sys::webkit_web_view_new_with_related_view(opener.to_glib_none().0);
+        if raw.is_null() {
+            return None;
+        }
+        webkit2gtk::WebView::from_glib_none(raw as *mut webkit2gtk_sys::WebKitWebView)
+    };
+
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title(url);
+    // What a login pop-up is shaped like everywhere else. WebKit will resize it
+    // from the page's own window features when it has them.
+    window.set_default_size(520, 640);
+    window.add(&popup);
+
+    // `window.close()` has to actually close it: an OAuth opener sits polling
+    // `popup.closed`, and a pop-up that cannot close is a login that hangs on
+    // the last step rather than failing outright.
+    let closing = window.clone();
+    popup.connect_close(move |_| closing.close());
+
+    // Shown when WebKit says it is ready rather than immediately, so the window
+    // does not appear empty while the provider redirects.
+    let showing = window.clone();
+    popup.connect_ready_to_show(move |_| showing.show_all());
+
+    window.show_all();
+    tracing::info!(%url, "opened a pop-up window for a scripted window.open");
+    Some(popup.upcast::<gtk::Widget>())
 }
 
 #[cfg(target_os = "linux")]
