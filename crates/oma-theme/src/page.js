@@ -855,7 +855,19 @@
   // itself, which is what makes this sound rather than a guess: if the
   // signature is unchanged then every input is unchanged. `WeakMap`, so a
   // rule's entry goes when its stylesheet does.
+  //
+  // `wrap` is absent from the signature on purpose, and this is the invariant
+  // that keeps it safe to be: `walkRules` derives it purely from the rule's
+  // position in the CSSOM tree, and a `CSSStyleRule` occupies one position for
+  // its lifetime -- so it is already a function of the key. Extending
+  // `walkRules` to `@supports` or `@container` is fine while it stays that way.
+  // Folding anything that changes at runtime into `wrap` -- which breakpoint
+  // matched, a container's size -- would make cached output stale, and it would
+  // not show up as a wrong colour on any one page.
   var ruleCache = new WeakMap();
+  // The custom properties each rule declares. Keyed by rule and never
+  // invalidated: see the comment at its only use.
+  var varCache = new WeakMap();
   var genId = 0;
   var genSig = null;
 
@@ -899,12 +911,30 @@
     var authored = {};
     var names = [];
     eachStyleRule(function (rule) {
-      for (var vi = 0; vi < rule.style.length; vi++) {
-        var name = rule.style[vi];
-        if (name.slice(0, 2) === "--" && name.indexOf("--oma-") !== 0) {
-          if (authored[name] === undefined) names.push(name);
-          authored[name] = rule.style.getPropertyValue(name).trim();
+      // Which custom properties a rule declares, and their authored text, is a
+      // property of the rule alone -- no `base`, no `varMap`, nothing that moves
+      // between passes. So unlike the derivation below this needs no generation
+      // and can be remembered for good.
+      //
+      // It is worth remembering because this is a second full walk of every
+      // declaration of every rule in the document, on top of the one that emits:
+      // ~65ms per pass over youtube.com's 27,000 rules, eleven times a load, and
+      // for the great majority of rules the answer is "none".
+      var mine = varCache.get(rule);
+      if (mine === undefined) {
+        mine = null;
+        for (var vi = 0; vi < rule.style.length; vi++) {
+          var name = rule.style[vi];
+          if (name.slice(0, 2) === "--" && name.indexOf("--oma-") !== 0) {
+            (mine || (mine = [])).push(name, rule.style.getPropertyValue(name).trim());
+          }
         }
+        varCache.set(rule, mine);
+      }
+      if (!mine) return;
+      for (var mi = 0; mi < mine.length; mi += 2) {
+        if (authored[mine[mi]] === undefined) names.push(mine[mi]);
+        authored[mine[mi]] = mine[mi + 1];
       }
     });
     if (siteVars === null && pendingVarNames === null) {
