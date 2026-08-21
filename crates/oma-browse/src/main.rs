@@ -18,6 +18,7 @@ mod history;
 mod keys;
 mod layout;
 mod mcp;
+mod paths;
 mod server;
 mod session;
 mod shot;
@@ -157,8 +158,22 @@ async fn command(argv: Vec<String>) -> Result<()> {
 
     // MCP is a protocol, not a command: it gets its own path to the window
     // rather than one argv at a time.
-    if argv.iter().any(|a| a == "--mcp") && mcp::relay(&dir, target).await? {
-        return Ok(());
+    if argv.iter().any(|a| a == "--mcp") {
+        // An MCP client starts this binary and expects a server. Serving one
+        // here, against a windowless process, is what it used to do -- and every
+        // tool call then answered "the window is not up yet". Opening a browser
+        // is what the client asked for in the only way it can ask.
+        if control::socket_for(&dir, target).is_none() {
+            // `--window` names a particular browser. Starting a different one
+            // and relaying to that would answer a question nobody asked.
+            if let control::Target::Window(pid) = target {
+                anyhow::bail!("no browser window with pid {pid} is running");
+            }
+            open_a_window(&config, &dir).await?;
+        }
+        if mcp::relay(&dir, target).await? {
+            return Ok(());
+        }
     }
 
     if !control::runs_locally(&argv) {
@@ -180,13 +195,28 @@ async fn command(argv: Vec<String>) -> Result<()> {
             // opens it, the way `xdg-open` would.
             Err(control::Failure::NoWindow) if control::opens_a_window(&argv) => {
                 let url = first_value(&argv).map(|u| tabs::resolve_input(&u, &config.search));
-                let pid = window::spawn(config.startup.incognito, url, true)?;
+                // `window new` with nothing to open comes up asking where to go,
+                // the way Ctrl-N does; `tab open <url>` has somewhere to be.
+                let palette = url.is_none();
+                let pid = window::spawn(config.startup.incognito, url, palette, true)?;
                 tracing::info!(pid, "no window to talk to; opened one");
                 return Ok(());
             }
-            // Said out loud, on stderr: the answer that follows comes from a
-            // browser that is not running, and "no tabs" reads exactly like
-            // "no tabs open" if nobody mentions it.
+            // A question about tabs, pages or the chrome, with no tabs, pages
+            // or chrome to ask about. Answering it from a windowless process
+            // prints `tabs[0]:` and exits 0, which reads as "the browser has
+            // nothing open" -- a different fact, and one an agent will act on.
+            Err(control::Failure::NoWindow) if control::needs_a_window(&argv) => {
+                anyhow::bail!(
+                    "no browser window is running, so there is nothing to ask. \
+                     Start one with `oma-browse`, or open a page directly with \
+                     `oma-browse tab open <url>`, which starts one for you."
+                );
+            }
+            // Whatever is left reads files rather than a window -- history,
+            // bookmarks, downloads, the config -- and a windowless process
+            // answers those exactly as a window would. Said out loud all the
+            // same, so nobody reads the answer as coming from a browser.
             Err(control::Failure::NoWindow) => {
                 tracing::info!("no browser window is running; answering from this process");
             }
@@ -208,6 +238,37 @@ async fn command(argv: Vec<String>) -> Result<()> {
 /// The first word that is not a flag or a command name: `tab open <this>`.
 fn first_value(argv: &[String]) -> Option<String> {
     argv.iter().skip(2).find(|a| !a.starts_with('-')).cloned()
+}
+
+/// How long to wait for a window we just started to answer.
+///
+/// WebKit and GTK take a moment, and the socket is bound before `run` is called
+/// rather than after the first paint -- so this is waiting on process startup,
+/// not on a browser being ready to look at.
+const STARTUP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Start a browser and wait until it will talk to us.
+///
+/// For the callers that cannot do anything useful without one and cannot ask
+/// the user to open it: an MCP client has a pipe and a protocol, and no way to
+/// say "start your browser first".
+async fn open_a_window(config: &config::Config, dir: &std::path::Path) -> Result<u32> {
+    let pid = window::spawn(config.startup.incognito, None, false, true)?;
+    tracing::info!(pid, "no window to talk to; opened one");
+
+    // By pid rather than through `current.sock`, which some *other* window may
+    // own: the answer has to come from the one we just started.
+    let waiting_for = control::Target::Window(pid);
+    let deadline = std::time::Instant::now() + STARTUP;
+    while std::time::Instant::now() < deadline {
+        if control::socket_for(dir, waiting_for).is_some() {
+            return Ok(pid);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Deliberately not silent: the alternative is a client that hangs, or one
+    // that gets a server answering every call with "the window is not up yet".
+    anyhow::bail!("started a browser window (pid {pid}) but it did not come up within {STARTUP:?}")
 }
 
 /// Be the browser.

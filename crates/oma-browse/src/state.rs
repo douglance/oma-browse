@@ -238,7 +238,7 @@ impl AppState {
         let dir = if configured.is_empty() {
             crate::downloads::download_dir()
         } else {
-            std::path::PathBuf::from(shellexpand(configured))
+            std::path::PathBuf::from(crate::paths::shellexpand(configured))
         };
         // A download that cannot be placed is a download that is lost, so make
         // the directory rather than letting WebKit fail on it.
@@ -362,21 +362,6 @@ impl AppState {
         // No subscribers simply means no UI is up yet.
         let _ = self.events.send(event);
         true
-    }
-}
-
-/// `~` at the start of a configured path, and nothing else.
-///
-/// A config file is written by a human, and a human writes `~/Downloads`. Full
-/// shell expansion in a path a browser writes files to would be a liability
-/// rather than a feature.
-fn shellexpand(path: &str) -> String {
-    match path.strip_prefix("~/") {
-        Some(rest) => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("{home}/{rest}")
-        }
-        None => path.to_string(),
     }
 }
 

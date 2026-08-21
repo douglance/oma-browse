@@ -37,7 +37,7 @@ pub struct Shot {
 /// bottom of a long page rather than just the part that fits on screen.
 pub async fn capture(
     state: &Arc<AppState>,
-    path: Option<String>,
+    path: PathBuf,
     full: bool,
     transparent: bool,
 ) -> Result<Shot> {
@@ -51,7 +51,6 @@ pub async fn capture(
         state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
     let view = app.get_webview(&label).with_context(|| format!("no webview labelled {label}"))?;
 
-    let path = resolve_path(path, &state.config.screenshot.dir)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
@@ -145,7 +144,7 @@ fn flatten(
 /// cleaned up by the system rather than accumulating in the user's home.
 pub fn scratch_file(requested: Option<String>, prefix: &str, extension: &str) -> Result<PathBuf> {
     if let Some(p) = requested.filter(|p| !p.trim().is_empty()) {
-        return Ok(PathBuf::from(shellexpand(&p)));
+        return crate::paths::resolve(&p);
     }
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -159,14 +158,21 @@ pub fn scratch_file(requested: Option<String>, prefix: &str, extension: &str) ->
     Ok(dir.join(format!("{prefix}-{stamp}.{extension}")))
 }
 
-/// Where the PNG goes when the caller does not say.
+/// Where the PNG goes: what the caller asked for, or somewhere under
+/// `$XDG_RUNTIME_DIR` when they did not say.
 ///
-/// Under `$XDG_RUNTIME_DIR` beside the port file, so shots are per-boot,
-/// user-private, and cleaned up by the system rather than accumulating in the
-/// user's home.
+/// Resolved by the command rather than inside [`capture`] so that a path this
+/// process cannot make sense of is reported as a path problem and not as a
+/// failure of the webview.
+pub fn destination(state: &Arc<AppState>, requested: Option<String>) -> Result<PathBuf> {
+    resolve_path(requested, &state.config.screenshot.dir)
+}
+
+/// Per-boot, user-private, and cleaned up by the system rather than
+/// accumulating in the user's home.
 fn resolve_path(requested: Option<String>, configured: &str) -> Result<PathBuf> {
     if let Some(p) = requested.filter(|p| !p.trim().is_empty()) {
-        return Ok(PathBuf::from(shellexpand(&p)));
+        return crate::paths::resolve(&p);
     }
     let dir = if configured.trim().is_empty() {
         std::env::var_os("XDG_RUNTIME_DIR")
@@ -174,25 +180,13 @@ fn resolve_path(requested: Option<String>, configured: &str) -> Result<PathBuf> 
             .unwrap_or_else(std::env::temp_dir)
             .join("oma-browse")
     } else {
-        PathBuf::from(shellexpand(configured.trim()))
+        PathBuf::from(crate::paths::shellexpand(configured.trim()))
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     Ok(dir.join(format!("shot-{stamp}.png")))
-}
-
-/// `~` only. Anything more is the shell's job, and this is also called over
-/// HTTP where there is no shell to have done it.
-pub fn shellexpand(path: &str) -> String {
-    match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest).display().to_string(),
-            None => path.to_string(),
-        },
-        None => path.to_string(),
-    }
 }
 
 #[cfg(test)]

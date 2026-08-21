@@ -497,7 +497,7 @@ pub fn close(state: &Arc<AppState>) -> Result<()> {
 /// window opened by `oma-browse tab open` does not -- that command returns to a
 /// prompt, and a browser writing to the prompt it left behind is noise the user
 /// did not ask for.
-pub fn spawn(incognito: bool, url: Option<String>, quiet: bool) -> Result<u32> {
+pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -> Result<u32> {
     let exe = std::env::current_exe().context("could not find the running browser binary")?;
     let mut command = std::process::Command::new(exe);
 
@@ -510,10 +510,15 @@ pub fn spawn(incognito: bool, url: Option<String>, quiet: bool) -> Result<u32> {
     // point. Without it the URL would be handed to the window we are standing
     // in (see `main::join`).
     command.arg("--new");
-    match url {
-        Some(url) => command.arg(url),
-        None => command.arg("--palette"),
-    };
+    if let Some(url) = url {
+        command.arg(url);
+    }
+    // Ctrl-N with nowhere to go comes up asking where; a window opened *for* an
+    // agent does not, because the palette would then be sitting over every page
+    // it screenshots and every element it clicks.
+    if palette {
+        command.arg("--palette");
+    }
 
     // Nothing may reach the child through our stdin either way.
     if quiet {

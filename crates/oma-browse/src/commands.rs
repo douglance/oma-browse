@@ -1269,7 +1269,14 @@ fn page_group(state: Arc<AppState>) -> Cli {
             let state = s.clone();
             async move {
                 let opts = ctx.options;
-                match crate::shot::capture(&state, opts.path, opts.full, !opts.opaque).await {
+                // Before the webview is asked for anything: a path this process
+                // cannot place is the caller's mistake to hear about as one,
+                // rather than as a rendering failure.
+                let path = match crate::shot::destination(&state, opts.path) {
+                    Ok(path) => path,
+                    Err(e) => return TypedResult::error("path", format!("{e:#}")),
+                };
+                match crate::shot::capture(&state, path, opts.full, !opts.opaque).await {
                     Ok(shot) => TypedResult::ok(shot),
                     Err(e) => TypedResult::error("webview", format!("{e:#}")),
                 }
@@ -1394,15 +1401,12 @@ fn page_group(state: Arc<AppState>) -> Cli {
             let state = s.clone();
             async move {
                 let to = ctx.options.path.or(ctx.args.path).filter(|p| !p.is_empty());
-                let to = to.map(|p| {
-                    let expanded = match p.strip_prefix("~/") {
-                        Some(rest) => {
-                            format!("{}/{rest}", std::env::var("HOME").unwrap_or_default())
-                        }
-                        None => p,
-                    };
-                    std::path::PathBuf::from(expanded)
-                });
+                // Against the *caller's* directory, not the browser's: a PDF
+                // written somewhere the person who asked cannot name is lost.
+                let to = match to.as_deref().map(crate::paths::resolve).transpose() {
+                    Ok(to) => to,
+                    Err(e) => return TypedResult::error("path", format!("{e:#}")),
+                };
                 let dialog = ctx.options.dialog;
                 // No path and no `--dialog` writes a PDF where the user's other
                 // downloads go. Defaulting to the dialog would be the obvious
@@ -1470,7 +1474,7 @@ fn page_group(state: Arc<AppState>) -> Cli {
                 // file WebKit recognises as HTML is one it renders instead.
                 let path = match crate::shot::scratch_file(ctx.options.path, "source", "txt") {
                     Ok(path) => path,
-                    Err(e) => return TypedResult::error("io", format!("{e:#}")),
+                    Err(e) => return TypedResult::error("path", format!("{e:#}")),
                 };
                 if let Err(e) = std::fs::write(&path, &html) {
                     return TypedResult::error(
@@ -1763,7 +1767,10 @@ fn window_group(state: Arc<AppState>) -> Cli {
                     .url
                     .or(ctx.args.url)
                     .map(|input| crate::tabs::resolve_input(&input, &state.config.search));
-                match crate::window::spawn(state.incognito(), url, false) {
+                // No URL means Ctrl-N, which should come up asking where to go
+                // rather than landing on the start page with nothing to do.
+                let palette = url.is_none();
+                match crate::window::spawn(state.incognito(), url, palette, false) {
                     Ok(pid) => TypedResult::ok(Spawned { pid }),
                     Err(e) => TypedResult::error("spawn", format!("{e:#}")),
                 }

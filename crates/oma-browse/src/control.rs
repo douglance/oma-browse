@@ -43,8 +43,9 @@ pub struct Request {
     /// Whether the caller's stdout is a terminal. Sent rather than sniffed,
     /// because the browser's stdout is not the one the answer is going to.
     pub human: bool,
-    /// The caller's working directory. Carried for the day a command resolves a
-    /// relative path; nothing reads it yet.
+    /// The caller's working directory, so a relative `--path` means what the
+    /// person who typed it meant. Read by [`crate::paths::with_caller_cwd`],
+    /// which puts it in scope for the length of the command.
     pub cwd: String,
 }
 
@@ -131,7 +132,7 @@ pub fn dir_for(control: &crate::config::Control) -> PathBuf {
     } else {
         // The same `~` expansion `[screenshot] dir` gets: one answer to "what
         // does a path in the dotfile mean".
-        PathBuf::from(crate::shot::shellexpand(configured))
+        PathBuf::from(crate::paths::shellexpand(configured))
     }
 }
 
@@ -474,9 +475,7 @@ pub fn runs_locally(argv: &[String]) -> bool {
     if argv.iter().any(|a| FLAGS.contains(&a.as_str())) {
         return true;
     }
-    let words: Vec<&str> =
-        argv.iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
-    match words.as_slice() {
+    match words(argv).as_slice() {
         // incurs' own builtins: they install completions, register MCP servers
         // and write skill files, all of it beside the caller.
         ["completions", ..] | ["mcp", ..] | ["skills", ..] | ["agent", ..] => true,
@@ -490,9 +489,40 @@ pub fn runs_locally(argv: &[String]) -> bool {
 /// The commands that mean "put something on screen", and can therefore answer
 /// "no browser running" by starting one.
 pub fn opens_a_window(argv: &[String]) -> bool {
-    let words: Vec<&str> =
-        argv.iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
-    matches!(words.as_slice(), ["tab", "open", ..] | ["window", "new", ..])
+    matches!(words(argv).as_slice(), ["tab", "open", ..] | ["window", "new", ..])
+}
+
+/// Whether this command is a question about a browser that has to be running.
+///
+/// The distinction is what the answer is *made of*. `history list` and
+/// `bookmark list` read files, so a windowless process answers them as well as
+/// a window would. `tab list` reads a tab model that only exists inside a
+/// window -- and a windowless process answers it with `tabs[0]:`, which is not
+/// "there is no browser" but "the browser has no tabs". A caller acting on the
+/// second when the first is true is the bug; saying so and exiting non-zero is
+/// the fix.
+pub fn needs_a_window(argv: &[String]) -> bool {
+    matches!(
+        words(argv).as_slice(),
+        // Everything about the tabs, the pages in them, and the chrome around
+        // them: all of it lives in the window's memory and nowhere else.
+        ["tab", ..]
+            | ["nav", ..]
+            | ["page", ..]
+            | ["ui", ..]
+            | ["find", ..]
+            | ["window", ..]
+            | ["share", ..]
+            // Both of these say they changed how the browser looks, and with no
+            // browser to change they would be saying it about nothing.
+            | ["theme", "recolor", ..]
+            | ["theme", "reload", ..]
+    )
+}
+
+/// The argv with its flags taken out: the command path a match arm wants.
+fn words(argv: &[String]) -> Vec<&str> {
+    argv.iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect()
 }
 
 #[cfg(test)]
@@ -523,6 +553,44 @@ mod tests {
             let (rest, target) = take_window_flag(spelling);
             assert_eq!(rest, argv(&["tab", "list"]));
             assert_eq!(target, Target::Window(42));
+        }
+    }
+
+    #[test]
+    fn a_question_about_the_window_is_not_answered_without_one() {
+        // The bug: `tab list` with no browser printing `tabs[0]:` and exiting 0,
+        // which reads as "no tabs open" rather than "no browser".
+        for a in [
+            argv(&["tab", "list"]),
+            argv(&["tab", "close"]),
+            argv(&["nav", "back"]),
+            argv(&["page", "eval", "1+1"]),
+            argv(&["page", "screenshot", "--full"]),
+            argv(&["ui", "palette"]),
+            argv(&["find", "text", "hello"]),
+            argv(&["window", "fullscreen"]),
+            argv(&["share", "copy"]),
+            argv(&["theme", "reload"]),
+            argv(&["--json", "tab", "list"]),
+        ] {
+            assert!(needs_a_window(&a), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_question_answered_by_a_file_is_answered_anyway() {
+        // History, bookmarks, downloads and the dotfile are on disk, so a
+        // windowless process reads them exactly as a window would. Refusing
+        // these would be the same mistake in the other direction.
+        for a in [
+            argv(&["history", "list"]),
+            argv(&["bookmark", "list"]),
+            argv(&["download", "list"]),
+            argv(&["config", "show"]),
+            argv(&["theme", "show"]),
+            argv(&["theme", "css"]),
+        ] {
+            assert!(!needs_a_window(&a), "{a:?}");
         }
     }
 

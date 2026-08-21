@@ -274,9 +274,14 @@ async fn run_argv(cli: Arc<Cli>, body: &[u8]) -> axum::response::Response {
             std::collections::HashMap::new(),
             request.human,
         );
-        let code = handle
-            .block_on(cli.run_to(request.argv, &mut out, runtime))
-            .map_err(|e| e.to_string())?;
+        // The one thing that does travel: where the caller was standing, so
+        // `page screenshot --path shot.png` writes beside them rather than
+        // beside the browser. Scoped to this thread, which is exactly the
+        // thread this one command runs on -- see `crate::paths`.
+        let code = crate::paths::with_caller_cwd(&request.cwd, || {
+            handle.block_on(cli.run_to(request.argv, &mut out, runtime))
+        })
+        .map_err(|e| e.to_string())?;
         Ok::<_, String>((code, String::from_utf8_lossy(&out).into_owned()))
     })
     .await;
@@ -358,12 +363,21 @@ mod tests {
     }
 
     async fn ask(dir: &std::path::Path, argv: Vec<String>, human: bool) -> crate::control::Reply {
+        ask_from(dir, argv, human, "/").await
+    }
+
+    async fn ask_from(
+        dir: &std::path::Path,
+        argv: Vec<String>,
+        human: bool,
+        cwd: &str,
+    ) -> crate::control::Reply {
         let request = crate::control::Request {
             v: crate::control::PROTOCOL,
             argv,
             display_name: "oma-browse".to_string(),
             human,
-            cwd: "/".to_string(),
+            cwd: cwd.to_string(),
         };
         crate::control::forward(dir, crate::control::Target::Current, &request).await.unwrap()
     }
@@ -397,6 +411,43 @@ mod tests {
         // that would leave the CLI with nothing to print.
         let closed = ask(&dir, argv(&["tab", "close", "4242"]), false).await;
         assert!(!closed.stdout.is_empty(), "a failure must explain itself");
+
+        crate::control::unlink_in(&dir, pid);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relative path means the directory the *caller* was standing in, and
+    /// the only place that can be known is the request.
+    ///
+    /// End-to-end rather than a unit test of `paths::resolve`, because the part
+    /// that can quietly stop working is the scope: the command runs inside a
+    /// `spawn_blocking` thread that `run_argv` sets up, and a task-local or a
+    /// misplaced guard would leave the path resolving against the browser's own
+    /// directory again -- silently, and with a success message.
+    #[tokio::test]
+    async fn a_relative_path_is_the_callers_and_not_the_browsers() {
+        let (dir, pid) = window("cwd").await;
+
+        // No window behind this state, so `page print` cannot get as far as
+        // printing -- but it resolves the path first, and *which* error comes
+        // back says whether the caller's directory was in scope.
+        // An empty `cwd` is a caller that sent none -- a raw HTTP or MCP
+        // request, where there is no directory to resolve against.
+        let nowhere =
+            ask_from(&dir, argv(&["page", "print", "--path", "out.pdf"]), false, "").await;
+        assert!(nowhere.stdout.contains("relative path"), "{}", nowhere.stdout);
+
+        let somewhere =
+            ask_from(&dir, argv(&["page", "print", "--path", "out.pdf"]), false, "/tmp").await;
+        assert!(
+            !somewhere.stdout.contains("relative path"),
+            "a caller's directory must resolve it: {}",
+            somewhere.stdout
+        );
+
+        // And the scope does not leak into the next command on that thread.
+        let after = ask_from(&dir, argv(&["page", "print", "--path", "out.pdf"]), false, "").await;
+        assert!(after.stdout.contains("relative path"), "{}", after.stdout);
 
         crate::control::unlink_in(&dir, pid);
         std::fs::remove_dir_all(&dir).ok();
