@@ -32,7 +32,9 @@ optdepends=(
   'ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes'
 )
 
-provides=('oma-browse')
+# Versioned, so `pacman -S something-that-needs-oma-browse>=0.1` resolves to
+# this rather than being told nothing provides it.
+provides=("oma-browse=$pkgver")
 conflicts=('oma-browse' 'oma-browse-git')
 options=('!strip')  # already stripped by the release build
 

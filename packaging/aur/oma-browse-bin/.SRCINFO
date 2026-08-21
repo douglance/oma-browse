@@ -14,7 +14,7 @@ pkgbase = oma-browse-bin
 	optdepends = ghostty: `share terminal`, which opens a terminal with the URL ready to pipe
 	optdepends = omarchy: desktop notifications, and the theme this browser dresses itself in
 	optdepends = ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes
-	provides = oma-browse
+	provides = oma-browse=0.1.0
 	conflicts = oma-browse
 	conflicts = oma-browse-git
 	options = !strip

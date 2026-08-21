@@ -16,7 +16,7 @@ url="https://github.com/douglance/oma-browse"
 license=('MIT')
 
 depends=('gtk3' 'webkit2gtk-4.1' 'hicolor-icon-theme')
-makedepends=('git' 'rust' 'cargo' 'pkgconf')
+makedepends=('git' 'cargo' 'pkgconf')
 
 optdepends=(
   'gst-plugins-good: audio and video. Without a GStreamer audio sink WebKit renders media-heavy sites blank, not merely silent'
@@ -27,7 +27,7 @@ optdepends=(
   'ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes'
 )
 
-provides=('oma-browse')
+provides=("oma-browse=$pkgver")
 conflicts=('oma-browse' 'oma-browse-bin')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')

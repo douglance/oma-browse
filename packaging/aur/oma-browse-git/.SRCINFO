@@ -6,7 +6,6 @@ pkgbase = oma-browse-git
 	arch = x86_64
 	license = MIT
 	makedepends = git
-	makedepends = rust
 	makedepends = cargo
 	makedepends = pkgconf
 	depends = gtk3
@@ -18,7 +17,7 @@ pkgbase = oma-browse-git
 	optdepends = ghostty: `share terminal`, which opens a terminal with the URL ready to pipe
 	optdepends = omarchy: desktop notifications, and the theme this browser dresses itself in
 	optdepends = ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes
-	provides = oma-browse
+	provides = oma-browse=r1.0000000
 	conflicts = oma-browse
 	conflicts = oma-browse-bin
 	source = oma-browse-git::git+https://github.com/douglance/oma-browse.git
