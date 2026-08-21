@@ -864,6 +864,13 @@
   // Folding anything that changes at runtime into `wrap` -- which breakpoint
   // matched, a container's size -- would make cached output stale, and it would
   // not show up as a wrong colour on any one page.
+  // Set once a document has been found to be over the cap. Sticky, because a
+  // capped pass has no inputs: it emits one constant rule whatever the page
+  // does next, so re-running it can only produce the answer it already gave.
+  // A page's stylesheets only accumulate, so this cannot go stale in the
+  // direction that would matter.
+  var capped = false;
+
   var ruleCache = new WeakMap();
   // The custom properties each rule declares. Keyed by rule and never
   // invalidated: see the comment at its only use.
@@ -915,7 +922,8 @@
     //
     // Not a silent giveaway: `[theme] recolor_max_rules = 0` turns the limit
     // off, and the cap is high enough that an ordinary site never reaches it.
-    if (CFG.maxRules > 0 && documentRuleCount() > CFG.maxRules) {
+    if (capped || (CFG.maxRules > 0 && documentRuleCount() > CFG.maxRules)) {
+      capped = true;
       return {
         css: ":root:root:root,:root:root:root body{background-color:transparent !important;}",
         base: pageBase(),
@@ -1399,6 +1407,10 @@
             var tag = n.tagName;
             if (tag === "STYLE" || (tag === "LINK" && n.rel === "stylesheet")) {
               if (n.id === STYLE_ID || n.id === OVERRIDE_ID) continue;
+              // A capped document's overrides do not depend on its stylesheets,
+              // so another one arriving changes nothing to recompute. The veil's
+              // floats are refreshed on the slow tick below either way.
+              if (capped) return;
               if (sheetPending) return;
               sheetPending = true;
               requestAnimationFrame(function () {
