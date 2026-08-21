@@ -1,0 +1,62 @@
+# Maintainer: Doug Lance <doug.lance@gmail.com>
+#
+# The package to point people at. Building oma-browse from source compiles the
+# WebKitGTK bindings, which is ten minutes and a toolchain most people do not
+# want to install to try a browser; this unpacks a release tarball instead.
+#
+# Bumping it: edit pkgver, then `updpkgsums` (pacman-contrib) to refresh the
+# checksum from the new tarball, then `makepkg --printsrcinfo > .SRCINFO`.
+
+pkgname=oma-browse-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="An Omarchy-themed, agent-drivable browser: no toolbar, one command palette, every command scriptable"
+arch=('x86_64')
+url="https://github.com/douglance/oma-browse"
+license=('MIT')
+
+# webkit2gtk-4.1 specifically, not 4.0: that is the pkg-config name the binary
+# was linked against, and the two are parallel-installable, so naming the wrong
+# one produces a package that installs and will not start.
+depends=('gtk3' 'webkit2gtk-4.1' 'hicolor-icon-theme')
+
+# Everything the browser shells out to. None of it is needed to browse, and each
+# one is a single feature that reports its own absence rather than failing
+# silently -- so they are optional, and the reason is spelled out per entry.
+optdepends=(
+  'gst-plugins-good: audio and video. Without a GStreamer audio sink WebKit renders media-heavy sites blank, not merely silent'
+  'wl-clipboard: `share copy`, which puts the current URL on the Wayland clipboard'
+  'xdg-utils: `download open`, which hands a saved file to the desktop handler'
+  'ghostty: `share terminal`, which opens a terminal with the URL ready to pipe'
+  'omarchy: desktop notifications, and the theme this browser dresses itself in'
+  'ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes'
+)
+
+provides=('oma-browse')
+conflicts=('oma-browse' 'oma-browse-git')
+options=('!strip')  # already stripped by the release build
+
+source=("oma-browse-$pkgver.tar.gz::$url/releases/download/v$pkgver/oma-browse-$pkgver-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/oma-browse-$pkgver-x86_64-linux"
+
+  install -Dm755 oma-browse "$pkgdir/usr/bin/oma-browse"
+
+  # The client runtime, and the whole reason this package cannot be a lone
+  # binary. `AssetBundle` looks beside the executable and then in
+  # `$prefix/share/oma-browse/assets` -- this is the second one. Drop it and the
+  # command palette renders blank with no error a user can act on.
+  install -dm755 "$pkgdir/usr/share/oma-browse/assets"
+  install -Dm644 assets/* -t "$pkgdir/usr/share/oma-browse/assets"
+
+  # Being the default browser is a .desktop file: xdg-open, link handlers and
+  # every launcher resolve one. The MIME types in it are what make
+  # `xdg-settings set default-web-browser oma-browse.desktop` work.
+  install -Dm644 oma-browse.desktop "$pkgdir/usr/share/applications/oma-browse.desktop"
+  install -Dm644 oma-browse.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/oma-browse.png"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

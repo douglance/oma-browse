@@ -106,16 +106,56 @@ pub fn router(state: Arc<AppState>, catalog: ToolCatalog) -> Router {
     // compiled binary (`topcoat asset bundle`). A missing bundle does not fail
     // loudly — it panics the render worker and returns an empty reply — so say
     // something useful here instead.
-    match AssetBundle::load() {
-        Ok(bundle) => builder = builder.assets(bundle),
-        Err(e) => tracing::error!(
-            error = %e,
-            "no asset bundle next to the binary; run `topcoat asset bundle -p oma-browse`. \
-             The palette will not render until you do."
+    match load_assets() {
+        Some(bundle) => builder = builder.assets(bundle),
+        None => tracing::error!(
+            looked_in = ?bundle_dirs(std::env::current_exe().ok().as_deref()),
+            "no asset bundle; run `topcoat asset bundle -p oma-browse` for a local build, \
+             or install one to $prefix/share/oma-browse/assets. The palette will not \
+             render until you do."
         ),
     }
 
     builder.build()
+}
+
+/// The first bundle that is actually on disk.
+fn load_assets() -> Option<AssetBundle> {
+    let exe = std::env::current_exe().ok();
+    bundle_dirs(exe.as_deref())
+        .into_iter()
+        .find(|dir| dir.join("manifest.toml").is_file())
+        .and_then(|dir| AssetBundle::load_dir(dir).ok())
+}
+
+/// Where the client runtime might be, in the order to believe it.
+///
+/// `AssetBundle::load()` only ever looks next to the running binary, which is
+/// right for `cargo run` and impossible for a package: `/usr/bin/oma-browse`
+/// would need `/usr/bin/assets`, which is both wrong and a collision with every
+/// other Topcoat application on the machine. So the search is ours.
+///
+/// The third entry is the one that makes packaging work, and it is relative to
+/// the binary rather than hardcoded to `/usr`: `/usr/bin/oma-browse` finds
+/// `/usr/share/oma-browse/assets`, and `~/.local/bin/oma-browse` finds
+/// `~/.local/share/oma-browse/assets`, with no build-time prefix to bake in.
+fn bundle_dirs(exe: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    // An explicit answer wins, for packagers and for testing an install layout
+    // without installing it.
+    if let Some(dir) = std::env::var_os("OMA_BROWSE_ASSETS") {
+        dirs.push(std::path::PathBuf::from(dir));
+    }
+
+    if let Some(bin) = exe.and_then(std::path::Path::parent) {
+        dirs.push(bin.join("assets"));
+        if let Some(prefix) = bin.parent() {
+            dirs.push(prefix.join("share").join("oma-browse").join("assets"));
+        }
+    }
+
+    dirs
 }
 
 pub(crate) fn state(cx: &Cx) -> &Arc<AppState> {
@@ -931,6 +971,32 @@ kbd {
 
 #[cfg(test)]
 mod tests {
+    /// The search order is the whole of packaging: a distro installs the binary
+    /// to `$prefix/bin` and its data to `$prefix/share`, and nothing may need a
+    /// prefix baked in at build time to find it again.
+    #[test]
+    fn the_bundle_is_looked_for_where_installs_actually_put_it() {
+        use std::path::{Path, PathBuf};
+
+        let system = super::bundle_dirs(Some(Path::new("/usr/bin/oma-browse")));
+        assert_eq!(
+            system,
+            vec![PathBuf::from("/usr/bin/assets"), PathBuf::from("/usr/share/oma-browse/assets"),],
+            "a packaged binary must find /usr/share, and still find a bundle beside it"
+        );
+
+        // The same rule, no special case: a user install resolves under ~/.local.
+        let user = super::bundle_dirs(Some(Path::new("/home/x/.local/bin/oma-browse")));
+        assert_eq!(user[1], PathBuf::from("/home/x/.local/share/oma-browse/assets"));
+
+        // `cargo run` puts the bundle beside the binary, which stays first.
+        let dev = super::bundle_dirs(Some(Path::new("/src/target/debug/oma-browse")));
+        assert_eq!(dev[0], PathBuf::from("/src/target/debug/assets"));
+
+        // Nowhere to look is empty rather than a guess at the filesystem root.
+        assert!(super::bundle_dirs(None).is_empty());
+    }
+
     /// The palette, the CLI and MCP must all see the same commands.
     ///
     /// This is the test that makes the registry worth having: add a command to

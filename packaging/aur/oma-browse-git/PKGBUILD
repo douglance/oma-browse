@@ -1,0 +1,78 @@
+# Maintainer: Doug Lance <doug.lance@gmail.com>
+#
+# Builds the tip of master. For the ten-minute WebKitGTK compile you get
+# whatever landed today; most people want oma-browse-bin instead.
+#
+# Note for anyone building in a network-isolated chroot: `build()` fetches
+# crates and installs topcoat-cli, so it needs network the way most unvendored
+# Rust packages do. `makepkg` allows it; `makechrootpkg` may not.
+
+pkgname=oma-browse-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="An Omarchy-themed, agent-drivable browser: no toolbar, one command palette, every command scriptable (git)"
+arch=('x86_64')
+url="https://github.com/douglance/oma-browse"
+license=('MIT')
+
+depends=('gtk3' 'webkit2gtk-4.1' 'hicolor-icon-theme')
+makedepends=('git' 'rust' 'cargo' 'pkgconf')
+
+optdepends=(
+  'gst-plugins-good: audio and video. Without a GStreamer audio sink WebKit renders media-heavy sites blank, not merely silent'
+  'wl-clipboard: `share copy`, which puts the current URL on the Wayland clipboard'
+  'xdg-utils: `download open`, which hands a saved file to the desktop handler'
+  'ghostty: `share terminal`, which opens a terminal with the URL ready to pipe'
+  'omarchy: desktop notifications, and the theme this browser dresses itself in'
+  'ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes'
+)
+
+provides=('oma-browse')
+conflicts=('oma-browse' 'oma-browse-bin')
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+
+  cargo build --release --locked
+
+  # The client runtime is *extracted from the compiled binary*, so this runs
+  # after the build and cannot be folded into it. Its output is
+  # `target/release/assets`, and without it the palette renders blank -- which
+  # is a runtime symptom with no build-time signal, so it is checked here.
+  cargo install topcoat-cli --locked --root "$srcdir/tools"
+  PATH="$srcdir/tools/bin:$PATH" topcoat asset bundle -p oma-browse
+  [ -f target/release/assets/manifest.toml ] || {
+    echo "topcoat produced no manifest -- the palette would ship blank"; return 1; }
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --workspace --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+
+  install -Dm755 target/release/oma-browse "$pkgdir/usr/bin/oma-browse"
+
+  # See oma-browse-bin: `$prefix/share/oma-browse/assets` is the second place
+  # `AssetBundle` looks, and the only one a packaged binary can use.
+  install -dm755 "$pkgdir/usr/share/oma-browse/assets"
+  install -Dm644 target/release/assets/* -t "$pkgdir/usr/share/oma-browse/assets"
+
+  install -Dm644 assets/oma-browse.desktop "$pkgdir/usr/share/applications/oma-browse.desktop"
+  install -Dm644 assets/icon.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/oma-browse.png"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

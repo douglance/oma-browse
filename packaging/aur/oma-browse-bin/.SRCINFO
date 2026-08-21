@@ -1,0 +1,24 @@
+pkgbase = oma-browse-bin
+	pkgdesc = An Omarchy-themed, agent-drivable browser: no toolbar, one command palette, every command scriptable
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/douglance/oma-browse
+	arch = x86_64
+	license = MIT
+	depends = gtk3
+	depends = webkit2gtk-4.1
+	depends = hicolor-icon-theme
+	optdepends = gst-plugins-good: audio and video. Without a GStreamer audio sink WebKit renders media-heavy sites blank, not merely silent
+	optdepends = wl-clipboard: `share copy`, which puts the current URL on the Wayland clipboard
+	optdepends = xdg-utils: `download open`, which hands a saved file to the desktop handler
+	optdepends = ghostty: `share terminal`, which opens a terminal with the URL ready to pipe
+	optdepends = omarchy: desktop notifications, and the theme this browser dresses itself in
+	optdepends = ttf-jetbrains-mono-nerd: the tab strip glyphs. Without a patched font they are tofu boxes
+	provides = oma-browse
+	conflicts = oma-browse
+	conflicts = oma-browse-git
+	options = !strip
+	source = oma-browse-0.1.0.tar.gz::https://github.com/douglance/oma-browse/releases/download/v0.1.0/oma-browse-0.1.0-x86_64-linux.tar.gz
+	sha256sums = SKIP
+
+pkgname = oma-browse-bin

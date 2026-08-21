@@ -7,8 +7,6 @@
 **An Omarchy-themed, agent-drivable browser for Linux.**<br>
 Rust · Tauri · WebKitGTK
 
-<img src="assets/screenshot-start.png" alt="The start page, wearing the current Omarchy theme" width="820">
-
 </div>
 
 Two ideas, and everything else follows from them:
@@ -20,9 +18,10 @@ chrome is a 26px strip of favicons at the top, and it floats — the page scroll
 underneath it.
 
 **Every capability is one command, reachable four ways.** The palette, the
-keyboard, a loopback HTTP control plane and MCP all dispatch through the same
-command graph. Nothing the UI can do is unavailable to a script or an agent, and
-nothing has to be implemented twice to keep it that way.
+keyboard, the CLI and MCP all dispatch through the same command graph — the last
+two over a Unix socket the window opens for itself, so there is no port to pin
+and nothing on the network. Nothing the UI can do is unavailable to a script or
+an agent, and nothing has to be implemented twice to keep it that way.
 
 <div align="center">
 <img src="assets/screenshot-palette.png" alt="The command palette, listing open tabs and commands" width="820">
@@ -55,6 +54,19 @@ nothing has to be implemented twice to keep it that way.
 
 ## Install
 
+On Omarchy, or any Arch:
+
+```sh
+yay -S oma-browse-bin      # the release binary — seconds
+yay -S oma-browse-git      # or build the tip yourself
+```
+
+`-bin` is the one to want: building from source compiles the WebKitGTK bindings,
+which is ten minutes and a Rust toolchain you may not have wanted.
+
+<details>
+<summary>From source</summary>
+
 Needs GTK 3, WebKitGTK 4.1 and a Rust toolchain (see `rust-toolchain.toml`).
 
 ```sh
@@ -64,6 +76,12 @@ cargo build --release
 cargo install topcoat-cli               # once
 topcoat asset bundle -p oma-browse      # not optional — see below
 ```
+
+The bundle is looked for beside the binary first and in
+`$prefix/share/oma-browse/assets` second, so a build tree and an installed
+package both work with no prefix compiled in.
+
+</details>
 
 > [!IMPORTANT]
 > The chrome is [Topcoat](https://crates.io/crates/topcoat), whose client
@@ -134,9 +152,16 @@ Each window listens on its own Unix socket in `$XDG_RUNTIME_DIR/oma-browse`, and
 `current.sock` follows whichever window has focus — so a bare command means "this
 one", and `--window <pid>` means a particular one. Nothing to discover, no port
 to pin: the CLI hands the window its argv, the window runs it, and you get the
-output and the exit code back. With no browser running, `tab open` and
-`window new` start one, and every command that needs no window (`--help`,
-`theme show`, `config init`) answers on the spot.
+output and the exit code back. Relative paths are yours, not the browser's:
+`page screenshot --path shot.png` writes beside you, because the CLI sends your
+working directory along with the argv.
+
+With no browser running, `tab open` and `window new` start one, and every
+command answered by a file rather than a window (`--help`, `history list`,
+`bookmark list`, `config show`) answers on the spot. A question that only a
+window can answer — anything under `tab`, `nav`, `page`, `ui`, `find`, `window`
+or `share` — says so and exits non-zero, rather than answering `tabs[0]:` and
+letting you read it as "no tabs open".
 
 The same commands are an HTTP API on that socket — the OpenAPI document and an
 MCP endpoint included — which is what a script or an agent should talk to:
@@ -145,13 +170,18 @@ MCP endpoint included — which is what a script or an agent should talk to:
 S="$XDG_RUNTIME_DIR/oma-browse/current.sock"
 curl --unix-socket "$S" http://x/cmd/tab/open/example.com
 curl --unix-socket "$S" http://x/cmd/tab/list
-curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png
+curl --unix-socket "$S" http://x/cmd/page/screenshot?path=/tmp/shot.png  # absolute
 curl --unix-socket "$S" --get http://x/cmd/page/eval --data-urlencode 'js=document.title'
 ```
 
+An HTTP or MCP request carries no working directory, so a relative `path` there
+is refused rather than resolved against the browser's own — give an absolute one.
+
 For an agent, the same graph is an MCP server. `oma-browse --mcp` speaks MCP on
 stdin and stdout the way an MCP client expects, and relays it to the window you
-were last looking at, so a tool call opens a tab in the browser you can see:
+were last looking at, so a tool call opens a tab in the browser you can see. An
+MCP client has no way to say "start your browser first", so with none running it
+starts one and relays to that:
 
 ```sh
 oma-browse mcp add         # register it with an MCP client

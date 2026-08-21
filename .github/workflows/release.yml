@@ -1,0 +1,113 @@
+name: Release
+
+# Tags only. A release is a deliberate act, and the tag is the record of it --
+# `v0.1.0` here builds and publishes what `v0.1.0` points at, and nothing else
+# can trigger a publish by accident.
+on:
+  push:
+    tags: ["v*"]
+  # So a failed publish can be retried against an existing tag without moving it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to build and publish
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tarball:
+    name: build and publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The bundler is a separate binary, and it is the reason a release cannot
+      # be `cargo build` alone: the client runtime is extracted from the
+      # compiled binary afterwards. Cached with the rest of cargo's bin dir.
+      - name: Install topcoat-cli
+        run: cargo install topcoat-cli --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Writes `target/release/assets/`: manifest.toml plus the hashed runtime.
+      # Without it the palette renders blank, so it is checked, not assumed.
+      - name: Bundle the client runtime
+        run: |
+          topcoat asset bundle -p oma-browse
+          test -f target/release/assets/manifest.toml || {
+            echo "topcoat produced no manifest -- the palette would ship blank"; exit 1; }
+
+      # The tag is the version people install; Cargo.toml is the version the
+      # binary reports. A release where they disagree is a support question
+      # nobody can answer, so they have to match.
+      - name: The tag and Cargo.toml agree
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          crate="v$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="oma-browse"))')"
+          [ "$tag" = "$crate" ] || { echo "tag $tag but Cargo.toml says $crate"; exit 1; }
+
+      # A layout a PKGBUILD can install from without knowing anything about
+      # cargo: the binary, the runtime bundle, the desktop entry and the icon.
+      - name: Stage the tarball
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          dir="oma-browse-${tag#v}-x86_64-linux"
+          mkdir -p "$dir/assets"
+          cp target/release/oma-browse "$dir/"
+          cp -r target/release/assets/. "$dir/assets/"
+          cp assets/oma-browse.desktop "$dir/"
+          cp assets/icon.png "$dir/oma-browse.png"
+          cp README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          echo "TARBALL=$dir.tar.gz" >> "$GITHUB_ENV"
+
+      # Proves the tarball unpacks into the layout a PKGBUILD installs, and
+      # that the bundle lands where the binary will look for it.
+      #
+      # A filesystem assertion rather than running the thing: the asset lookup
+      # only happens when the *window* starts, and a runner has no display, so
+      # `oma-browse config show` would exit clean whether the bundle were there
+      # or not. The search order itself is unit-tested --
+      # `ui::tests::the_bundle_is_looked_for_where_installs_actually_put_it`.
+      - name: The tarball carries an installable layout
+        run: |
+          tar xzf "$TARBALL" -C /tmp
+          dir="/tmp/$(basename "$TARBALL" .tar.gz)"
+          prefix=/tmp/prefix
+          install -Dm755 "$dir/oma-browse" "$prefix/bin/oma-browse"
+          install -Dm644 "$dir"/assets/* -t "$prefix/share/oma-browse/assets"
+          install -Dm644 "$dir/oma-browse.desktop" "$prefix/share/applications/oma-browse.desktop"
+          for f in bin/oma-browse \
+                   share/oma-browse/assets/manifest.toml \
+                   share/applications/oma-browse.desktop; do
+            test -e "$prefix/$f" || { echo "missing from the install: $f"; exit 1; }
+          done
+          # The runtime is a hashed filename, so match the shape, not a name.
+          ls "$prefix"/share/oma-browse/assets/topcoat-*.js >/dev/null || {
+            echo "no client runtime in the bundle -- the palette would ship blank"; exit 1; }
+          # Not on the runner image by default, and a malformed entry is a
+          # browser that never appears in a launcher -- worth the ten seconds.
+          sudo apt-get install --no-install-recommends -y desktop-file-utils
+          desktop-file-validate "$prefix/share/applications/oma-browse.desktop"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          generate_release_notes: true
