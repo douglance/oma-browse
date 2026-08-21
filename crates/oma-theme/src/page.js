@@ -724,6 +724,153 @@
     return "auto";
   }
 
+  // One rule's worth of overrides, appended to `out`.
+  //
+  // Lifted out of `buildOverrides` so a single rule can be derived on its own,
+  // which is what makes the cache below possible. Pure in everything that
+  // matters: the output is a function of the rule, the page's measured `base`
+  // and the resolved `varMap`, and nothing else.
+  function emitRule(rule, wrap, base, varMap, out) {
+    var decls = "";
+    // Set when the background below turns out to be the site's own brand
+    // colour, which we leave alone; the foreground pass then leaves its
+    // partner alone too.
+    var brandBg = null;
+    // That partner is emitted separately, because it is the one declaration
+    // here that has to outrank `a:any-link`. See the push below.
+    var pairDecl = "";
+
+    // Custom properties first. Retinting the variable retints every rule that
+    // reads it, which on a site like Wikipedia is nearly all of them -- its
+    // surfaces come almost entirely through `--background-color-*` tokens, so
+    // rewriting concrete declarations alone leaves the page untouched.
+    for (var ci = 0; ci < rule.style.length; ci++) {
+      var prop = rule.style[ci];
+      if (prop.slice(0, 2) !== "--") continue;
+      if (prop.indexOf("--oma-") === 0) continue;
+      var raw = resolveVars(rule.style.getPropertyValue(prop).trim(), varMap);
+      var dir = varDirection(prop);
+      if (!dir) continue;
+      var mapped;
+      if (isNeutral(raw)) {
+        mapped =
+          dir === "bg" ? mapBackground(raw, base)
+          : dir === "fg" ? mapForeground(raw, base)
+          : mapUnknown(raw, base);
+      } else {
+        // A coloured token still has to come down out of the light band, or a
+        // pastel declared once as a variable reappears as a bright stripe
+        // everywhere the site reads it.
+        mapped = dir === "fg" ? null : mapTintedBackground(raw, base);
+      }
+      if (!mapped) continue;
+      // `transparent` is the point, not a failure: a surface sitting at the
+      // page's own base lightness is the page canvas, and letting the veil
+      // through it is the whole design. Wikipedia paints its entire content
+      // column from `--background-color-base`, so refusing to clear that one
+      // variable leaves the site opaque white over the veil.
+      decls += prop + ":" + mapped + " !important;";
+    }
+
+    var bg = backgroundOf(rule, varMap, "background-color");
+    if (bg && isNeutral(bg)) {
+      // The page canvas is the veil's job, always. Whatever neutral a site
+      // paints on `html`/`body` is by definition its base, and letting it
+      // stand -- even remapped to a dark theme grey -- puts an opaque sheet
+      // between the wallpaper and the window. Sites that state the canvas
+      // through a `var()` chain we could not follow land here too, which is
+      // why this is a selector test rather than a lightness one.
+      var isRoot = /(^|,)\s*(html|body|:root)\s*($|,)/i.test(rule.selectorText);
+      var mb = isRoot ? "transparent" : mapBackground(bg, base);
+      if (mb) decls += "background-color:" + mb + " !important;";
+    } else if (bg) {
+      var mt = mapTintedBackground(bg, base);
+      if (mt) decls += "background-color:" + mt + " !important;";
+      // Nothing mapped means we are keeping the site's own fill: brand colour,
+      // by the rule `isNeutral` states. That decision reaches past the
+      // background -- see `brandBg` below.
+      else if (lightness(bg) !== null) brandBg = bg;
+    }
+    var img = backgroundOf(rule, varMap, "background-image");
+    var mg = mapGradient(img, base);
+    if (mg) decls += "background-image:" + mg + " !important;";
+    var fg = resolveVars(rule.style.getPropertyValue("color"), varMap);
+    // A foreground declared alongside a background we are keeping is half of a
+    // pair, not an independent colour. The site picked those two to read
+    // against each other, and mapping one end of a pair onto the theme ramp
+    // while the other end keeps its brand value is what turns a legible button
+    // into two colours of the same weight -- omarchy.org's own call-to-action
+    // buttons came back accent-on-brand-blue, at about 1.1:1.
+    //
+    // So: keep the pair. The literal is emitted rather than the `var()` the
+    // site wrote, because the custom-property pass above has already retinted
+    // that variable for its use as a background elsewhere.
+    if (brandBg) {
+      var pair = fg || readableOn(brandBg);
+      // A translucent fill is mostly the page underneath it, so the site's
+      // pairing was never against this colour alone and `readableOn` would be
+      // answering the wrong question. Only a declared colour is trustworthy
+      // there; with none, fall through and leave the cascade alone.
+      var solid = (channels(brandBg) || [0, 0, 0, 1])[3] >= 0.9;
+      if (pair && (fg || solid)) pairDecl = "color:" + pair + " !important;";
+    } else if (fg && isNeutral(fg)) {
+      var mf = mapForeground(fg, base);
+      if (mf) decls += "color:" + mf + " !important;";
+    }
+    if (decls) {
+      var text = rule.selectorText + "{" + decls + "}";
+      out.push(wrap ? wrap + "{" + text + "}" : text);
+    }
+    // The brand pair, raised above `css.rs`'s `a:any-link { !important }`.
+    //
+    // That rule is (0,1,1) and has to stay there, or a site's neutral-grey
+    // links stop reading as links. But a link styled as a button is exactly
+    // the case where it is wrong, and the site's own selector is usually
+    // below it -- `.button` is (0,1,0). Two `:root`s buy (0,2,0) and `:is()`
+    // carries the original selector at its own weight without needing the
+    // selector list split, so `.button` lands at (0,3,0) and wins. The same
+    // device, for the same reason, as the canvas rule at the end of this
+    // function.
+    if (pairDecl) {
+      var lifted = ":root:root :is(" + rule.selectorText + "){" + pairDecl + "}";
+      out.push(wrap ? wrap + "{" + lifted + "}" : lifted);
+    }
+  }
+
+  // Per-rule derivation, remembered until its inputs change.
+  //
+  // `emitRule` is a pure function of the rule, the page's measured `base` and
+  // the resolved `varMap`. A page load runs it over every rule in the document
+  // eleven times -- 27,000 rules, ~270ms a pass, ~3.0s of a 4.4s load on
+  // youtube.com -- and those passes cannot be skipped, because each one
+  // genuinely sees stylesheets the last did not.
+  //
+  // What they mostly do not see is *new inputs*. Measured across those eleven
+  // passes: `base` takes three distinct values and the `varMap` signature five.
+  // So a rule derived under the same generation would compute the same answer
+  // again, and a pass only has to derive rules that are new or whose inputs
+  // moved.
+  //
+  // The generation is the whole of what `emitRule` reads besides the rule
+  // itself, which is what makes this sound rather than a guess: if the
+  // signature is unchanged then every input is unchanged. `WeakMap`, so a
+  // rule's entry goes when its stylesheet does.
+  var ruleCache = new WeakMap();
+  var genId = 0;
+  var genSig = null;
+
+  function generation(base, varMap, names) {
+    var sig = JSON.stringify(base);
+    for (var i = 0; i < names.length; i++) {
+      sig += names[i] + "\u0001" + varMap[names[i]] + "\u0002";
+    }
+    if (sig !== genSig) {
+      genSig = sig;
+      genId++;
+    }
+    return genId;
+  }
+
   function buildOverrides() {
     var out = [];
 
@@ -774,111 +921,17 @@
       varMap[key] = (siteVars && siteVars[key]) || authored[key];
     }
 
+    var gen = generation(base, varMap, names);
     eachStyleRule(function (rule, wrap) {
-      var decls = "";
-      // Set when the background below turns out to be the site's own brand
-      // colour, which we leave alone; the foreground pass then leaves its
-      // partner alone too.
-      var brandBg = null;
-      // That partner is emitted separately, because it is the one declaration
-      // here that has to outrank `a:any-link`. See the push below.
-      var pairDecl = "";
-
-      // Custom properties first. Retinting the variable retints every rule that
-      // reads it, which on a site like Wikipedia is nearly all of them -- its
-      // surfaces come almost entirely through `--background-color-*` tokens, so
-      // rewriting concrete declarations alone leaves the page untouched.
-      for (var ci = 0; ci < rule.style.length; ci++) {
-        var prop = rule.style[ci];
-        if (prop.slice(0, 2) !== "--") continue;
-        if (prop.indexOf("--oma-") === 0) continue;
-        var raw = resolveVars(rule.style.getPropertyValue(prop).trim(), varMap);
-        var dir = varDirection(prop);
-        if (!dir) continue;
-        var mapped;
-        if (isNeutral(raw)) {
-          mapped =
-            dir === "bg" ? mapBackground(raw, base)
-            : dir === "fg" ? mapForeground(raw, base)
-            : mapUnknown(raw, base);
-        } else {
-          // A coloured token still has to come down out of the light band, or a
-          // pastel declared once as a variable reappears as a bright stripe
-          // everywhere the site reads it.
-          mapped = dir === "fg" ? null : mapTintedBackground(raw, base);
-        }
-        if (!mapped) continue;
-        // `transparent` is the point, not a failure: a surface sitting at the
-        // page's own base lightness is the page canvas, and letting the veil
-        // through it is the whole design. Wikipedia paints its entire content
-        // column from `--background-color-base`, so refusing to clear that one
-        // variable leaves the site opaque white over the veil.
-        decls += prop + ":" + mapped + " !important;";
+      var hit = ruleCache.get(rule);
+      if (hit && hit.gen === gen) {
+        for (var hi = 0; hi < hit.out.length; hi++) out.push(hit.out[hi]);
+        return;
       }
-
-      var bg = backgroundOf(rule, varMap, "background-color");
-      if (bg && isNeutral(bg)) {
-        // The page canvas is the veil's job, always. Whatever neutral a site
-        // paints on `html`/`body` is by definition its base, and letting it
-        // stand -- even remapped to a dark theme grey -- puts an opaque sheet
-        // between the wallpaper and the window. Sites that state the canvas
-        // through a `var()` chain we could not follow land here too, which is
-        // why this is a selector test rather than a lightness one.
-        var isRoot = /(^|,)\s*(html|body|:root)\s*($|,)/i.test(rule.selectorText);
-        var mb = isRoot ? "transparent" : mapBackground(bg, base);
-        if (mb) decls += "background-color:" + mb + " !important;";
-      } else if (bg) {
-        var mt = mapTintedBackground(bg, base);
-        if (mt) decls += "background-color:" + mt + " !important;";
-        // Nothing mapped means we are keeping the site's own fill: brand colour,
-        // by the rule `isNeutral` states. That decision reaches past the
-        // background -- see `brandBg` below.
-        else if (lightness(bg) !== null) brandBg = bg;
-      }
-      var img = backgroundOf(rule, varMap, "background-image");
-      var mg = mapGradient(img, base);
-      if (mg) decls += "background-image:" + mg + " !important;";
-      var fg = resolveVars(rule.style.getPropertyValue("color"), varMap);
-      // A foreground declared alongside a background we are keeping is half of a
-      // pair, not an independent colour. The site picked those two to read
-      // against each other, and mapping one end of a pair onto the theme ramp
-      // while the other end keeps its brand value is what turns a legible button
-      // into two colours of the same weight -- omarchy.org's own call-to-action
-      // buttons came back accent-on-brand-blue, at about 1.1:1.
-      //
-      // So: keep the pair. The literal is emitted rather than the `var()` the
-      // site wrote, because the custom-property pass above has already retinted
-      // that variable for its use as a background elsewhere.
-      if (brandBg) {
-        var pair = fg || readableOn(brandBg);
-        // A translucent fill is mostly the page underneath it, so the site's
-        // pairing was never against this colour alone and `readableOn` would be
-        // answering the wrong question. Only a declared colour is trustworthy
-        // there; with none, fall through and leave the cascade alone.
-        var solid = (channels(brandBg) || [0, 0, 0, 1])[3] >= 0.9;
-        if (pair && (fg || solid)) pairDecl = "color:" + pair + " !important;";
-      } else if (fg && isNeutral(fg)) {
-        var mf = mapForeground(fg, base);
-        if (mf) decls += "color:" + mf + " !important;";
-      }
-      if (decls) {
-        var text = rule.selectorText + "{" + decls + "}";
-        out.push(wrap ? wrap + "{" + text + "}" : text);
-      }
-      // The brand pair, raised above `css.rs`'s `a:any-link { !important }`.
-      //
-      // That rule is (0,1,1) and has to stay there, or a site's neutral-grey
-      // links stop reading as links. But a link styled as a button is exactly
-      // the case where it is wrong, and the site's own selector is usually
-      // below it -- `.button` is (0,1,0). Two `:root`s buy (0,2,0) and `:is()`
-      // carries the original selector at its own weight without needing the
-      // selector list split, so `.button` lands at (0,3,0) and wins. The same
-      // device, for the same reason, as the canvas rule at the end of this
-      // function.
-      if (pairDecl) {
-        var lifted = ":root:root :is(" + rule.selectorText + "){" + pairDecl + "}";
-        out.push(wrap ? wrap + "{" + lifted + "}" : lifted);
-      }
+      var mine = [];
+      emitRule(rule, wrap, base, varMap, mine);
+      ruleCache.set(rule, { gen: gen, out: mine });
+      for (var mi = 0; mi < mine.length; mi++) out.push(mine[mi]);
     });
     // Unconditionally, last, so it wins on document order: the canvas belongs to
     // the veil. The per-rule pass above only fires on a neutral literal, and a
