@@ -76,12 +76,94 @@ fn publish(state: &Arc<AppState>, label: &str, loading: bool, fraction: f64) {
     let state = state.clone();
     let label = label.to_string();
     state.runtime().spawn(async move {
+        // A load that has *ended* is not the same as a page that has something
+        // to show, and on a heavy site the two are seconds apart. Measured on
+        // youtube.com from a cold cache: WebKit's load event at 7.9s, first
+        // contentful paint at 8.6s. Finishing on the load event ran the bar out
+        // to full and faded it while the window was still empty, which is the
+        // bar saying "arrived" about a blank page.
+        if !loading {
+            await_paint(&state, &label).await;
+        }
         if !state.tabs.write().await.set_progress(&label, loading.then_some(fraction)) {
             return;
         }
         paint(&state).await;
     });
 }
+
+/// How long the bar will wait for a first paint after the load itself is over.
+///
+/// Generous, because the whole point is the case where a page takes seconds to
+/// put anything on screen -- but bounded, because a document that paints nothing
+/// at all (a download, a bare `204`) must not leave the bar up forever.
+#[cfg(target_os = "linux")]
+const PAINT_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How often to ask. Twenty or so questions across the grace period, each one a
+/// single expression against a page that has just stopped loading.
+#[cfg(target_os = "linux")]
+const PAINT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Hold until the page has painted, or until [`PAINT_GRACE`] runs out.
+///
+/// Polled rather than pushed, which is the opposite of how the rest of this
+/// module works, and deliberately: the alternative is a page-to-browser channel,
+/// and wry connects `script-message-received` with no name filter, so anything a
+/// page posts reaches Tauri's IPC parser, fails to parse, and is reported with
+/// `console.error` -- which the console capture then records, and posts again.
+/// A bounded poll that only runs in the tail of a load is the cheaper mistake:
+/// nothing at all while a page is loading, nothing at all once it has painted,
+/// and at most a couple of dozen one-line evaluations in between.
+#[cfg(target_os = "linux")]
+async fn await_paint(state: &Arc<AppState>, label: &str) {
+    use tauri::Manager;
+
+    let deadline = tokio::time::Instant::now() + PAINT_GRACE;
+    loop {
+        let Some(app) = state.app_handle() else { return };
+        // The tab can be closed while its last load is being waited on.
+        let Some(view) = app.get_webview(label) else { return };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let asked = view.eval_with_callback(PAINTED, move |value| {
+            if let Ok(mut slot) = tx.lock()
+                && let Some(tx) = slot.take()
+            {
+                let _ = tx.send(value);
+            }
+        });
+        if asked.is_err() {
+            return;
+        }
+
+        // `true` is the only answer that means painted. Anything else -- a page
+        // that refused the evaluation, a timeout, a document with no
+        // `performance` -- falls through to the deadline rather than holding the
+        // bar up on a technicality.
+        if let Ok(Ok(answer)) = tokio::time::timeout(PAINT_EVERY, rx).await
+            && answer.trim_matches('"') == "true"
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(PAINT_EVERY).await;
+    }
+}
+
+/// Has this document put anything on screen yet?
+///
+/// `first-contentful-paint` rather than `first-paint`: the latter fires for the
+/// background alone, which is exactly the blank window the bar must not claim to
+/// have finished. A document that never reports either -- an image, a plugin
+/// document -- answers `false` and is caught by the grace period instead.
+#[cfg(target_os = "linux")]
+const PAINTED: &str = "(function(){try{\
+return performance.getEntriesByName('first-contentful-paint').length>0;\
+}catch(e){return false}})()";
 
 /// Push the active tab's progress into the strip.
 ///
