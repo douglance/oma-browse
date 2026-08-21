@@ -811,7 +811,21 @@ pub fn spawn_on(
             anyhow::bail!("{ws:?} is not a workspace name");
         }
         if under_hyprland() {
-            let mut line = shell_quote(&exe.to_string_lossy());
+            // Hyprland runs this in the *compositor's* environment, not this
+            // process's -- `exec_cmd` is the compositor forking, so nothing
+            // exported here reaches the child. `--profile` survives because it
+            // is an argument, but `$OMA_BROWSE_CONFIG` is not, and without this
+            // a `--workspace` window quietly joins a different control plane
+            // from the browser that opened it. Measured: the window turned up
+            // in the default socket directory while its parent was pointed at
+            // another one, so nothing could address it.
+            let mut line = String::new();
+            if let Some(config) = std::env::var_os("OMA_BROWSE_CONFIG") {
+                line.push_str("env OMA_BROWSE_CONFIG=");
+                line.push_str(&shell_quote(&config.to_string_lossy()));
+                line.push(' ');
+            }
+            line.push_str(&shell_quote(&exe.to_string_lossy()));
             for arg in &args {
                 line.push(' ');
                 line.push_str(&shell_quote(arg));
@@ -867,6 +881,67 @@ pub fn spawn_on(
 
     tracing::info!(pid, "opened another window");
     Ok(Opened { pid: Some(pid), workspace: None })
+}
+
+/// How long to wait for a window that has just been started to answer.
+///
+/// Generous, because this is a debug build's cold start on a laptop as much as
+/// a release binary's: measured at around seven seconds unoptimised. A caller
+/// that waits four seconds too long has lost four seconds; a caller that gives
+/// up too early hands an agent a pid that does not work yet, which is the bug
+/// this exists to fix.
+pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until a newly started window will actually answer commands.
+///
+/// A socket accepting connections is *not* the signal. The control plane binds
+/// before Tauri takes the main thread -- it has to, or the first command would
+/// find nothing listening -- so there is a window of a second or more where a
+/// command connects, reaches the graph, and is told "the window is not up yet".
+/// Measured: `window new` returned a pid, and three out of three immediate
+/// `tab list` calls against that pid failed with "no browser window is running".
+///
+/// So the probe is a real command. `tab list` is the cheapest question that only
+/// a live window can answer, and its succeeding is the definition of ready.
+///
+/// `expect` is the pid to wait for when the caller forked the child itself.
+/// Under Hyprland the compositor forks it and answers `ok`, so there is no pid
+/// to expect -- `before` is then the set of windows that already existed, and
+/// the new one is whichever pid is not in it.
+pub async fn wait_until_ready(
+    dir: &std::path::Path,
+    expect: Option<u32>,
+    before: &[u32],
+    timeout: std::time::Duration,
+) -> Option<u32> {
+    let began = std::time::Instant::now();
+    loop {
+        let candidate = match expect {
+            Some(pid) => Some(pid),
+            None => crate::control::live_in(dir).into_iter().find(|p| !before.contains(p)),
+        };
+        if let Some(pid) = candidate {
+            let probe = crate::control::Request {
+                v: crate::control::PROTOCOL,
+                argv: vec!["tab".to_string(), "list".to_string()],
+                display_name: "oma-browse".to_string(),
+                human: false,
+                cwd: String::new(),
+            };
+            if let Ok(reply) =
+                crate::control::forward(dir, crate::control::Target::Window(pid), &probe).await
+                && reply.exit_code.unwrap_or(0) == 0
+            {
+                tracing::debug!(pid, waited_ms = began.elapsed().as_millis(), "window is ready");
+                return Some(pid);
+            }
+        }
+        if began.elapsed() >= timeout {
+            tracing::warn!(?expect, "a window was started but did not answer in time");
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Show or hide the palette, and hand it focus when it appears.

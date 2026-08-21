@@ -2227,24 +2227,63 @@ fn js_string(value: &str) -> String {
 /// never goes idle by this definition, which is why the timeout is not optional.
 async fn idle(state: &Arc<AppState>, budget: std::time::Duration) -> Result<(), String> {
     const QUIET_MS: u64 = 500;
+    // A request still pending after this long is not the page loading. It is a
+    // beacon, a long-poll, an event stream, or a request the last navigation
+    // walked away from -- and none of those ever finish, so counting them means
+    // never returning.
+    //
+    // Both halves of that were real. `network_of` is the tab's whole history,
+    // not the current document's, so a YouTube embed's telemetry POST from a
+    // page we navigated away from 47 seconds ago was still "in flight" and
+    // still blocking: bare `page wait` could not succeed on any tab that had
+    // ever left a page with a request outstanding, which is nearly all of them.
+    // The live half is the same story on one page -- analytics beacons do not
+    // complete on purpose, which is why Playwright deprecated `networkidle`.
+    //
+    // The cost of the threshold is a genuinely slow asset: a response taking
+    // longer than this stops counting as loading, and `page wait` may return
+    // while it is still coming. That is the right way round -- a caller who
+    // needs that asset should wait for what it produces, with `--selector` or
+    // `--text`, which is exact where this is a heuristic.
+    const STALL_MS: u64 = 2_000;
+
     let label = active_label(state).await.ok_or("there is no active tab")?;
     let began = std::time::Instant::now();
     loop {
-        let (in_flight, newest) = {
+        let now = crate::inspect::now_ms();
+        let (loading, last, stalled) = {
             let Ok(inspector) = state.inspector.lock() else {
                 return Err("the network log is wedged".to_string());
             };
             let requests = inspector.network_of(&label);
-            let in_flight = requests.iter().filter(|e| e.status == 0 && e.failed.is_none()).count();
-            let newest = requests.iter().map(|e| e.at).max().unwrap_or(0);
-            (in_flight, newest)
+            let mut loading = 0usize;
+            let mut stalled = 0usize;
+            let mut last = 0u64;
+            for e in &requests {
+                let done = e.status != 0 || e.failed.is_some();
+                // Finished requests count their end, so a burst that lands
+                // quickly is quiet from the moment the last one lands rather
+                // than from the moment the last one started.
+                last = last.max(if done { e.at.saturating_add(e.ms) } else { e.at });
+                if !done {
+                    if now.saturating_sub(e.at) < STALL_MS {
+                        loading += 1;
+                    } else {
+                        stalled += 1;
+                    }
+                }
+            }
+            (loading, last, stalled)
         };
-        if in_flight == 0 && crate::inspect::now_ms().saturating_sub(newest) >= QUIET_MS {
+        if loading == 0 && now.saturating_sub(last) >= QUIET_MS {
             return Ok(());
         }
         if began.elapsed() >= budget {
+            // Says which kind, because the two want different answers: still
+            // loading means raise `--timeout`, all stalled means the page has
+            // something open that will never close and `--selector` is the tool.
             return Err(format!(
-                "{in_flight} request(s) still in flight after {}ms",
+                "{loading} request(s) still loading after {}ms ({stalled} stalled and ignored)",
                 budget.as_millis()
             ));
         }
@@ -3111,9 +3150,14 @@ struct WindowNewOptions {
 
 #[derive(JsonSchema, Serialize)]
 struct Spawned {
-    /// The new window's process, when we forked it ourselves. Absent when
-    /// Hyprland launched it for us, which is what `--workspace` asks for:
-    /// `hyprctl` answers `ok`, not a process id.
+    /// The new window's process. Always present when this command succeeded:
+    /// pass it straight to `--window`.
+    ///
+    /// `Option` because `hyprctl` answers `ok` rather than a process id, so on
+    /// the `--workspace` path there is no pid to report at the moment the
+    /// compositor forks the child. It is filled in by waiting for the window to
+    /// answer and seeing which one is new -- so an agent gets a usable pid on
+    /// both paths and never has to handle a null here.
     pid: Option<u32>,
     /// The workspace it was placed on, if it was placed at all. Absent means
     /// it opened wherever you were.
@@ -3315,22 +3359,53 @@ fn window_group(state: Arc<AppState>) -> Cli {
                 // rather than landing on the start page with nothing to do.
                 let palette = url.is_none();
                 let workspace = ctx.options.workspace.clone();
-                match crate::window::spawn_on(
+                // Taken before the window is started, so that the Hyprland path
+                // -- where the compositor forks the child and there is no pid to
+                // report -- can still work out which window is the new one.
+                let dir = crate::control::dir_for(&state.config.control);
+                let before = crate::control::live_in(&dir);
+
+                let opened = match crate::window::spawn_on(
                     state.incognito(),
                     url,
                     palette,
                     false,
                     workspace.as_deref(),
                 ) {
-                    Ok(opened) => {
-                        TypedResult::ok(Spawned { pid: opened.pid, workspace: opened.workspace })
-                    }
-                    Err(e) => TypedResult::error("spawn", format!("{e:#}")),
-                }
+                    Ok(opened) => opened,
+                    Err(e) => return TypedResult::error("spawn", format!("{e:#}")),
+                };
+
+                // Do not answer until the window will actually take a command.
+                // Returning the moment the child is forked is what made this
+                // unusable from a script: the pid was real and every command
+                // sent to it for the next few seconds was told there was no
+                // browser running. See `window::wait_until_ready`.
+                let ready = crate::window::wait_until_ready(
+                    &dir,
+                    opened.pid,
+                    &before,
+                    crate::window::READY_TIMEOUT,
+                )
+                .await;
+                let Some(pid) = ready else {
+                    return TypedResult::error(
+                        "slow_start",
+                        format!(
+                            "the window was started but did not answer within {}s",
+                            crate::window::READY_TIMEOUT.as_secs()
+                        ),
+                    );
+                };
+                TypedResult::ok(Spawned { pid: Some(pid), workspace: opened.workspace })
             }
         },
     )
-    .description("Open another browser window, optionally on a given Hyprland workspace")
+    .description(
+        "Open another browser window, optionally on a given Hyprland workspace. \
+         Answers only once the window will take a command, so the pid it returns \
+         is usable immediately -- which is what makes `window new` scriptable.",
+    )
     .done();
 
     let s = state;

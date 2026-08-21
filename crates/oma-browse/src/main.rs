@@ -136,6 +136,87 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Ask a freshly opened window the question that was asked of this process.
+///
+/// The window has already done the opening -- it was launched with the URL, so
+/// `tab open` would make a *second* tab and `window new` a second window. What
+/// is wanted is the answer, not the action, so the two commands are re-phrased
+/// as the question that describes what already happened.
+async fn answer_from(dir: &std::path::Path, pid: u32, argv: &[String]) -> Result<()> {
+    use std::io::Write as _;
+
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let wants_json = argv.iter().any(|a| a == "--json");
+    let mut ask: Vec<String> = match words.as_slice() {
+        // The window opened the URL as its first tab, so "which tab is active"
+        // is the same answer `tab open` would have given.
+        ["tab", "open", ..] => vec!["tab".into(), "list".into()],
+        // Nothing to ask: the answer is the pid, and this process has it. Said
+        // in whichever shape the caller asked for -- a script that passed
+        // `--json` and got `pid: 1234` back is a script that breaks here, which
+        // is the whole class of bug this branch exists to fix.
+        _ => {
+            if wants_json {
+                println!("{}", serde_json::json!({ "pid": pid, "workspace": null }));
+            } else {
+                println!("pid: {pid}");
+            }
+            return Ok(());
+        }
+    };
+    // Always JSON on the wire, whatever the caller wanted: this answer is
+    // reshaped below before it is printed, and reshaping a table is harder than
+    // reshaping an object.
+    ask.push("--json".into());
+
+    let request = control::Request::from_process(ask);
+    let reply = match control::forward(dir, control::Target::Window(pid), &request).await {
+        Ok(reply) => reply,
+        // The window answered a moment ago -- `wait_until_ready` proved it --
+        // so this is a window that died between then and now.
+        Err(e) => return Err(anyhow::anyhow!("{e}")),
+    };
+
+    // `tab list` answers with a list, and `tab open` answers with one tab. A
+    // caller who asked for the second and got the first has to branch on which
+    // command started the browser, which is exactly the sort of thing that makes
+    // a CLI unscriptable. Narrow it back down.
+    let Some(tab) = active_tab(&reply.stdout) else {
+        print!("{}", reply.stdout);
+        let _ = std::io::stdout().flush();
+        return Ok(());
+    };
+    if wants_json {
+        println!("{tab}");
+    } else {
+        print!("{}", flat(&tab));
+    }
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// The active tab out of a `tab list --json` answer.
+fn active_tab(stdout: &str) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let tabs = parsed.get("tabs")?.as_array()?;
+    tabs.iter()
+        .find(|t| t.get("active").and_then(serde_json::Value::as_bool) == Some(true))
+        .or_else(|| tabs.first())
+        .cloned()
+}
+
+/// A flat JSON object as the `key: value` lines a terminal gets.
+fn flat(value: &serde_json::Value) -> String {
+    let Some(object) = value.as_object() else { return format!("{value}\n") };
+    object
+        .iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::String(s) => format!("{key}: {s}\n"),
+            other => format!("{key}: {other}\n"),
+        })
+        .collect()
+}
+
 /// Hand a URL to the window that is already open. `false` if there is none.
 async fn join(url: &str) -> bool {
     let config = config::Config::load();
@@ -230,9 +311,24 @@ async fn command(argv: Vec<String>) -> Result<()> {
                 // `window new` with nothing to open comes up asking where to go,
                 // the way Ctrl-N does; `tab open <url>` has somewhere to be.
                 let palette = url.is_none();
+                let before = control::live_in(&dir);
                 let pid = window::spawn(config.startup.incognito, url, palette, true)?;
                 tracing::info!(pid, "no window to talk to; opened one");
-                return Ok(());
+
+                // Wait for it, then ask it the question that was asked here.
+                // Without this the command printed nothing at all and exited 0:
+                // a script that ran `oma-browse tab open <url> --json` as its
+                // first command got no JSON, no tab id, and no way to tell
+                // whether anything had happened. See `window::wait_until_ready`.
+                let ready =
+                    window::wait_until_ready(&dir, Some(pid), &before, window::READY_TIMEOUT).await;
+                let Some(pid) = ready else {
+                    anyhow::bail!(
+                        "a window was started but did not answer within {}s",
+                        window::READY_TIMEOUT.as_secs()
+                    );
+                };
+                return answer_from(&dir, pid, &argv).await;
             }
             // A question about tabs, pages or the chrome, with no tabs, pages
             // or chrome to ask about. Answering it from a windowless process
