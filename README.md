@@ -240,8 +240,15 @@ That is why very large documents opt themselves out. `[theme] recolor_max_rules`
 (15,000 by default) is the ceiling: above it a page keeps its own colours entirely and
 gets only the one rule the veil needs, on the grounds that a site with that much CSS is
 a web application with a considered theme of its own rather than a document that wants
-repainting. x.com and youtube.com are above the line; github.com, which is light-themed
-and gains the most from being repainted, is comfortably below it.
+repainting. youtube.com declares 22,214 rules and is above the line; github.com, which
+is light-themed and gains the most from being repainted, is comfortably below it at
+around 10,500.
+
+The ceiling is not what makes a heavy page survivable, though, and it is worth not
+confusing the two. x.com declares about 1,960 rules, sits well under the cap, and is
+recoloured in full — it became usable because deriving a rule's colours is now
+remembered rather than recomputed on each of the eleven passes a page load triggers,
+not because the browser stopped trying.
 
 **`theme recolor off` is still the lever for a page under the cap that feels slow**, and
 it works on the page you are already looking at rather than only on the next load.
