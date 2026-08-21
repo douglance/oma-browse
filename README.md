@@ -228,19 +228,23 @@ in it is left alone. `theme recolor off` turns the repainting off for a site tha
 not survive it — and it takes effect on the page you are already looking at, per window,
 rather than only on the next load.
 
-**It is also the first thing to try on a site that loads slowly**, because on a heavy page
-the repaint is the dominant cost this browser adds. Measured two ways, independently:
-`recolor = false` takes `loadEventEnd` from a median of 1402ms to 503ms on a synthetic
-page of 4,000 descendant-selector rules — **2.8x** — and another measurement on
-youtube.com put it at 2.7x. Transparency, by contrast, costs almost nothing, and the
-tiling layout costs nothing at all.
+The repaint derives an override for every neutral colour the document declares, so the
+sheet it adds mirrors the page's own selectors and inherits their matching cost. Shape
+matters far more than volume: 3,001 override rules with flat selectors add nothing
+measurable, while 4,001 with descendant selectors add **58% to a full style
+recalculation**. A single-page application recalculates style constantly, so that is a
+tax on every interaction and not only on load. Transparency, by contrast, costs almost
+nothing, and the tiling layout costs nothing at all.
 
-The mechanism is that the repaint derives an override for every neutral colour the
-document declares, so the sheet it adds mirrors the page's own selectors and inherits
-their matching cost. Shape matters far more than volume: 3,001 override rules with flat
-selectors add nothing measurable, while 4,001 with descendant selectors add **58% to a
-full style recalculation**. A single-page application recalculates style constantly, so
-that is a tax on every interaction and not only on load.
+That is why very large documents opt themselves out. `[theme] recolor_max_rules`
+(15,000 by default) is the ceiling: above it a page keeps its own colours entirely and
+gets only the one rule the veil needs, on the grounds that a site with that much CSS is
+a web application with a considered theme of its own rather than a document that wants
+repainting. x.com and youtube.com are above the line; github.com, which is light-themed
+and gains the most from being repainted, is comfortably below it.
+
+**`theme recolor off` is still the lever for a page under the cap that feels slow**, and
+it works on the page you are already looking at rather than only on the next load.
 
 Page transparency and palette transparency are set separately. `[theme] veil` controls
 how see-through a *page* is: `"auto"` solves for contrast against your wallpaper and
@@ -552,7 +556,7 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
 | tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
 | "log in with Google/Apple/X" does nothing | fixed — a scripted `window.open` now gets a real pop-up window with a live `opener`, which is what an OAuth provider hands the credential back through. Before, it became a detached tab and `window.open` returned null |
-| a heavy site loads or scrolls slowly | page recolouring is the dominant cost this browser adds on such a page — worth ~2.7-2.8x on load, and ~58% on every style recalculation. `theme recolor off` drops it for that window, live, or `[theme] recolor = false` for good |
+| a heavy site loads or scrolls slowly | page recolouring is the largest cost this browser adds on such a page — ~58% on every style recalculation. Documents over `[theme] recolor_max_rules` (15,000) opt out on their own; below that, `theme recolor off` drops it for that window, live, or `[theme] recolor = false` for good |
 | `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
 | a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |
 | `spellcheck = true` underlines nothing | no dictionary installed — WebKit checks through enchant, which needs a **hunspell** language pack |
