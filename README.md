@@ -228,14 +228,19 @@ in it is left alone. `theme recolor off` turns the repainting off for a site tha
 not survive it — and it takes effect on the page you are already looking at, per window,
 rather than only on the next load.
 
-It is also the lever to reach for on a site that feels sluggish. The repaint works by
-deriving an override for every neutral colour the document declares, which means the
-sheet it adds mirrors the page's own selectors. On a page with flat selectors that costs
-nothing measurable; on a component framework with deep descendant selectors it inherits
-their matching cost and roughly doubles it — measured at **58% added to a full style
-recalculation** on a page of 4,000 such rules, and 40–55% on youtube.com. A single-page
-application recalculates style constantly, so that is a tax on every interaction, not
-just on load. Turning it off for that one site removes the sheet outright.
+**It is also the first thing to try on a site that loads slowly**, because on a heavy page
+the repaint is the dominant cost this browser adds. Measured two ways, independently:
+`recolor = false` takes `loadEventEnd` from a median of 1402ms to 503ms on a synthetic
+page of 4,000 descendant-selector rules — **2.8x** — and another measurement on
+youtube.com put it at 2.7x. Transparency, by contrast, costs almost nothing, and the
+tiling layout costs nothing at all.
+
+The mechanism is that the repaint derives an override for every neutral colour the
+document declares, so the sheet it adds mirrors the page's own selectors and inherits
+their matching cost. Shape matters far more than volume: 3,001 override rules with flat
+selectors add nothing measurable, while 4,001 with descendant selectors add **58% to a
+full style recalculation**. A single-page application recalculates style constantly, so
+that is a tax on every interaction and not only on load.
 
 Page transparency and palette transparency are set separately. `[theme] veil` controls
 how see-through a *page* is: `"auto"` solves for contrast against your wallpaper and
@@ -546,7 +551,7 @@ says otherwise), named the way Chrome names them — `report.pdf`, then `report 
 | the strip's gear is a tofu box | no Nerd Font installed |
 | a command answers *the window is not up yet* | you ran it in a second process; talk to the running browser over HTTP |
 | tabs tile instead of stacking | `OMA_LAYOUT=plain` is set — the escape hatch for bisecting render problems |
-| a site feels sluggish, especially a single-page app | page recolouring adds an override rule per neutral colour the page declares, and on deep selectors that is ~40–58% on every style recalculation — `theme recolor off` drops it for that window, live |
+| a heavy site loads or scrolls slowly | page recolouring is the dominant cost this browser adds on such a page — worth ~2.7-2.8x on load, and ~58% on every style recalculation. `theme recolor off` drops it for that window, live, or `[theme] recolor = false` for good |
 | `content list` is empty just after launch | a first compile takes a few seconds and runs in the background; ask again |
 | a blocklist blocks nothing | `content list` names any rule file it could not read; the file must be Safari content-blocker JSON, not an EasyList `.txt` |
 | `spellcheck = true` underlines nothing | no dictionary installed — WebKit checks through enchant, which needs a **hunspell** language pack |
