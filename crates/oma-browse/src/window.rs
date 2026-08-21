@@ -717,12 +717,22 @@ pub fn spawn(incognito: bool, url: Option<String>, palette: bool, quiet: bool) -
 }
 
 /// What opening a window produced.
-///
-/// `pid` is absent for exactly one case: a window Hyprland launched for us, on
-/// a workspace, because `hyprctl` answers `ok` rather than a process id. Every
-/// other path knows the child it forked.
 #[derive(Debug, Default)]
 pub struct Opened {
+    /// The child's process id, when this function forked it.
+    ///
+    /// `None` on the Hyprland path, where the compositor forks the window and
+    /// `hyprctl` answers `ok` rather than a process id. That is a statement
+    /// about what *this function* can know, not about what a caller ends up
+    /// with: `window new` recovers the pid a layer up by diffing the window set
+    /// around the call, and does return one.
+    ///
+    /// Which is the whole reason the `Option` stays. The tempting argument for
+    /// it -- that `None` is honest about our ignorance -- stopped being true
+    /// the moment that diff existed, because the pid is recoverable after all.
+    /// The argument that survives is narrower: the ignorance is real *here*,
+    /// and collapsing the type would push a value this function cannot obtain
+    /// down into it.
     pub pid: Option<u32>,
     /// The workspace it was placed on, if it was placed at all.
     pub workspace: Option<String>,
