@@ -191,6 +191,12 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::progress::watch(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab loads without a progress bar");
             }
+            if let Err(e) = crate::crash::watch(&content, state.clone()) {
+                tracing::warn!(error = %e, "the first tab will die silently if its process does");
+            }
+            if let Err(e) = crate::crash::watch_chrome(&palette, "palette") {
+                tracing::warn!(error = %e, "the palette will not come back if its process dies");
+            }
             // `[engine]`, which is per webview like the two above -- and this is
             // the one webview `tabs::open` never sees.
             if let Err(e) = crate::engine::configure(&content, state.clone()) {
@@ -240,6 +246,9 @@ pub fn run(launch: Launch) -> Result<()> {
                     )
                     .context("could not create the tab strip webview")?;
                 crate::layout::adopt_strip(&strip, height)?;
+                if let Err(e) = crate::crash::watch_chrome(&strip, "strip") {
+                    tracing::warn!(error = %e, "the strip will not come back if its process dies");
+                }
                 spawn_strip_refresh(state.clone());
             }
 
@@ -378,6 +387,15 @@ pub fn instrument(
             let state = load_state.clone();
             let label = webview.label().to_string();
             let url = payload.url().to_string();
+
+            // Synchronously, on the way past: a tab that is loading again has a
+            // web process again. The first load after a crash is the crash page
+            // this browser put there, which only disarms the guard; see
+            // `crate::crash`.
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                state.note_load(&label);
+            }
+
             state.runtime().spawn(async move {
                 state.tabs.write().await.update_url(&label, url.clone());
                 if state.keeps_history() {

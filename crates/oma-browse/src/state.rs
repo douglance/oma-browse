@@ -99,6 +99,18 @@ pub struct AppState {
     pub tls: std::sync::Mutex<Option<crate::policy::Refused>>,
     /// The site currently asking for a username and a password.
     pub login: std::sync::Mutex<Option<crate::policy::Challenge>>,
+    /// Tabs whose web process has died, by webview label.
+    ///
+    /// A `std::sync::Mutex` for the same reason as the three above, and for one
+    /// more: the crash and the guard against the crash page clearing it have to
+    /// be recorded in the same breath, before the load they are guarding
+    /// against can be asked for. Handing that to the runtime would put a task
+    /// boundary in the middle of it. See [`crate::crash`].
+    ///
+    /// A map rather than a single slot, unlike `tls`: one web process backs
+    /// several tabs, so one death is several crashes at once, and a slot would
+    /// leave all but the last of them looking healthy.
+    crashed: std::sync::Mutex<std::collections::HashMap<String, crate::crash::Crash>>,
     /// Logins given this session, by host and port. Memory only -- see
     /// [`crate::policy::remember_login`].
     pub logins: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
@@ -156,6 +168,7 @@ impl AppState {
             tls: std::sync::Mutex::new(None),
             login: std::sync::Mutex::new(None),
             logins: std::sync::Mutex::new(std::collections::HashMap::new()),
+            crashed: std::sync::Mutex::new(std::collections::HashMap::new()),
             incognito: std::sync::atomic::AtomicBool::new(false),
             app_mode: std::sync::atomic::AtomicBool::new(false),
             download_hook: std::sync::atomic::AtomicBool::new(false),
@@ -343,6 +356,52 @@ impl AppState {
             crate::strip::inset_script(self.config.chrome.strip.height)
         } else {
             String::new()
+        }
+    }
+
+    /// Record that a tab's web process has died, and arm the guard that keeps
+    /// the crash page from clearing the crash it is reporting.
+    ///
+    /// Called on the GTK main thread, from the signal, before the crash page is
+    /// asked for; see [`crate::crash::Crash::reporting`].
+    pub fn note_crash(&self, label: &str, reason: &'static str, uri: &str) {
+        if let Ok(mut crashed) = self.crashed.lock() {
+            crashed.insert(
+                label.to_string(),
+                crate::crash::Crash { reason, uri: uri.to_string(), reporting: true },
+            );
+        }
+    }
+
+    /// A tab has started loading something. The first one after a crash is the
+    /// crash page itself and only disarms the guard; the next one is a real page
+    /// and means the tab is alive again.
+    pub fn note_load(&self, label: &str) {
+        let Ok(mut crashed) = self.crashed.lock() else { return };
+        match crashed.get_mut(label) {
+            Some(crash) if crash.reporting => crash.reporting = false,
+            Some(_) => {
+                crashed.remove(label);
+            }
+            None => {}
+        }
+    }
+
+    /// Why this tab is dead, if it is.
+    ///
+    /// Read before anything is evaluated in a tab: a dead webview answers an
+    /// `eval` with an empty string rather than failing, so without this every
+    /// command that asks a page a question gets a plausible wrong answer.
+    pub fn crash_of(&self, label: &str) -> Option<crate::crash::Crash> {
+        self.crashed.lock().ok()?.get(label).cloned()
+    }
+
+    /// Forget a tab's crash, because the tab is gone. Labels are not reused, so
+    /// this is housekeeping rather than correctness -- but a browser left open
+    /// for a week should not accumulate a row per tab it has ever lost.
+    pub fn forget_crash(&self, label: &str) {
+        if let Ok(mut crashed) = self.crashed.lock() {
+            crashed.remove(label);
         }
     }
 

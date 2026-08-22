@@ -9,6 +9,7 @@ mod bookmarks;
 mod commands;
 mod config;
 mod control;
+mod crash;
 mod dispatch;
 mod downloads;
 mod engine;

@@ -428,6 +428,9 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     if let Err(e) = crate::progress::watch(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab loads without a progress bar");
     }
+    if let Err(e) = crate::crash::watch(&view, state.clone()) {
+        tracing::warn!(error = %e, tab = %label, "this tab will die silently if its process does");
+    }
     if let Err(e) = crate::engine::configure(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab kept WebKit's own settings");
     }
@@ -565,6 +568,8 @@ pub async fn close(state: &Arc<AppState>, id: Option<u32>) -> Result<Option<u32>
     if let Ok(mut inspector) = state.inspector.lock() {
         inspector.clear(Some(&label));
     }
+    // Likewise anything recorded about its web process dying.
+    state.forget_crash(&label);
     if let Some(next) = next {
         select(state, next).await?;
     }
@@ -1083,6 +1088,21 @@ pub async fn eval(state: &Arc<AppState>, js: &str) -> Result<String> {
     let app = state.app_handle().context("the window is not up yet")?;
     let label =
         state.tabs.read().await.active_label().ok_or_else(|| anyhow!("there is no active tab"))?;
+
+    // A webview whose web process has died still accepts an evaluation and
+    // still calls back -- with an empty string, immediately, for any script at
+    // all. That is indistinguishable from a page that genuinely answered with
+    // nothing, so every command built on this one would report a confident
+    // wrong answer. Refuse instead, and say what to do about it.
+    if let Some(crash) = state.crash_of(&label) {
+        return Err(anyhow!(
+            "this tab's web process died -- {} -- so there is no page to ask. `nav reload` \
+             brings {} back",
+            crash.reason,
+            if crash.uri.is_empty() { "it" } else { crash.uri.as_str() }
+        ));
+    }
+
     let view = webview(&app, &label)?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
