@@ -98,7 +98,7 @@ impl Browser {
         let config = root.join("config.toml");
         write_config(&config, &web, &sockets, &downloads, &screenshots);
 
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_oma-browse"));
+        let binary = pin_binary();
         let profile = format!("e2e-{}", std::process::id());
 
         let log = std::fs::File::create(root.join("browser.log")).expect("could not make a log");
@@ -116,7 +116,7 @@ impl Browser {
         // aborts, a `kill -9`, a cancelled `cargo test` -- the browser would
         // otherwise sit on the desktop for ever. This waits for us to go and
         // then tidies up, and costs one sleeping shell.
-        reap_on_exit(child.id(), &root);
+        reap_on_exit(child.id(), &root, &binary);
 
         let browser = Browser {
             binary,
@@ -141,13 +141,18 @@ impl Browser {
         let deadline = Instant::now() + READY;
         let mut last = String::new();
         while Instant::now() < deadline {
-            // `tab list` is the cheapest question that only a window can answer,
-            // so an answer to it *is* readiness. Polling the socket file would
-            // prove the inode exists, which it does before anyone is listening.
+            // A parsed answer to `tab list` is not readiness, which is what the
+            // first version of this assumed and what CI caught: the control
+            // server starts answering before the window exists, so `tab list`
+            // comes back as an empty list while the very next command is told
+            // "the window is not up yet". Readiness is a *tab*, because a tab
+            // only exists once there is a webview to hold it.
             let output = self.try_run(&["tab", "list", "--json"]);
             if let Some(output) = output
                 && output.status.success()
-                && serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout)).is_ok()
+                && let Ok(value) =
+                    serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout))
+                && value.get("tabs").and_then(Value::as_array).is_some_and(|t| !t.is_empty())
             {
                 return;
             }
@@ -276,6 +281,7 @@ impl Browser {
     pub fn stop(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.binary);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -391,17 +397,49 @@ fn set_executable(path: &Path) {
     std::fs::set_permissions(path, permissions).expect("could not chmod a shim");
 }
 
+/// Copy the binary under test and run the copy.
+///
+/// `cargo` rewrites `target/debug/oma-browse` in place, so a build started
+/// while this suite is running -- another session on the same checkout, a
+/// second `cargo test`, CI doing both jobs at once -- replaces the file the
+/// window was started from underneath it. What that produces is not a clean
+/// failure: `window new` reports "No such file or directory", `nav go` reports
+/// "no webview labelled tab-0", and `nav login` simply times out. Three cases
+/// fail and every one of them reads like a real bug in the browser.
+///
+/// The copy is made *beside* the original rather than inside the test's own
+/// directory, and that placement is load-bearing: the binary finds its client
+/// runtime by its own path, so a copy in `/tmp` would come up with no palette
+/// at all. `target/debug/oma-browse-e2e-<pid>` keeps `../assets` where the
+/// binary expects to find it.
+fn pin_binary() -> PathBuf {
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_oma-browse"));
+    let pinned = built.with_file_name(format!("oma-browse-e2e-{}", std::process::id()));
+    // A failed copy is not fatal: running the original is what this suite did
+    // before, and it is better than refusing to run at all.
+    if std::fs::copy(&built, &pinned).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&pinned, std::fs::Permissions::from_mode(0o755));
+        }
+        return pinned;
+    }
+    built
+}
+
 /// Kill the browser and delete the tree once this test process has gone.
 ///
 /// A sleeping `sh` rather than anything cleverer: the suite has no `unsafe` to
 /// spend on `prctl`, and a `Drop` impl does not run when the process aborts.
-fn reap_on_exit(browser: u32, root: &Path) {
+fn reap_on_exit(browser: u32, root: &Path, binary_path: &Path) {
     let me = std::process::id();
     let script = format!(
         "while kill -0 {me} 2>/dev/null; do sleep 1; done; \
          kill {browser} 2>/dev/null; sleep 1; kill -9 {browser} 2>/dev/null; \
-         rm -rf '{root}'",
-        root = root.display()
+         rm -rf '{root}' '{binary}'",
+        root = root.display(),
+        binary = binary_path.display()
     );
     let _ = Command::new("sh")
         .arg("-c")
