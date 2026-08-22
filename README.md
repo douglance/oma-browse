@@ -108,7 +108,7 @@ desktop entry, and the binary finds the runtime by its own path — so it works 
 `/usr/local` or from `~/.local` with nothing compiled in.
 
 ```sh
-v=0.1.1
+v=0.1.2
 curl -LO https://github.com/douglance/oma-browse/releases/download/v$v/oma-browse-$v-x86_64-linux.tar.gz
 curl -LO https://github.com/douglance/oma-browse/releases/download/v$v/oma-browse-$v-x86_64-linux.tar.gz.sha256
 sha256sum -c oma-browse-$v-x86_64-linux.tar.gz.sha256

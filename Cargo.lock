@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "oma-browse"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -3229,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "oma-theme"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
  "notify",
