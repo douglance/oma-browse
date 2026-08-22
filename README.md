@@ -213,7 +213,7 @@ Rebind anything by chord in the config file:
 
 ## The palette
 
-`Ctrl-K` opens one list containing your open tabs and all 72 of the browser's commands,
+`Ctrl-K` opens one list containing your open tabs and all 73 of the browser's commands,
 filtered as you type. Enter on a tab switches to it. Enter on a command runs it, or opens a prompt for
 its arguments if it needs any. Typing something that is neither runs it as a URL or a
 search.
@@ -545,6 +545,40 @@ already does, once, before the browser starts. The first compile takes a few sec
 is cached in `$XDG_CACHE_HOME/oma-browse/filters`; after that it is a load. A blocked
 request never reaches `page network`, because WebKit stops it before the engine reports
 it.
+
+### Userscripts
+
+The other half of what an extension was for. Drop a `.js` or `.css` file in
+`~/.config/oma-browse/scripts/` with a header saying where it applies:
+
+```js
+// ==UserScript==
+// @name     Wider articles
+// @match    https://example.com/*
+// @exclude  https://example.com/admin/*
+// @run-at   document-end
+// ==/UserScript==
+
+document.querySelector('article').style.maxWidth = '80ch'
+```
+
+CSS takes the same header in a block comment. `WebKitUserContentManager` applies both
+itself — the engine matches the patterns and injects at the time it is told, rather than
+a script of ours watching for navigations and racing them.
+
+```sh
+oma-browse script list      # every file, where it runs, and why one is not running
+```
+
+A file with no `@match` is injected nowhere and says so in `script list`, rather than
+being guessed at: a userscript that silently does nothing is a much better accident than
+one that silently runs on your bank. Scripts are per profile, and a new tab picks up an
+edited file.
+
+**A `@match` cannot name a port.** WebKit matches on scheme, host and path and has
+nowhere to put one, so `http://localhost:3000/*` matches nothing at all — write
+`http://localhost/*`, which applies to every port on that host. `script list` says so
+rather than leaving you to work out why nothing happens on your dev server.
 
 ### Permissions
 

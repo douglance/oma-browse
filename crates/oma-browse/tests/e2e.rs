@@ -31,6 +31,7 @@
 mod harness;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -191,6 +192,7 @@ const CASES: &[Case] = &[
     ("permission: a page asks, decide answers, and list remembers", permission_round_trip),
     ("permission: allow, deny and forget decide without being asked", permission_written_by_hand),
     ("content: list, off, on and reload report what is blocking", content_commands),
+    ("script: a userscript is listed, injected, and kept off @exclude", script_list_and_injection),
     ("theme: css, show and reload describe the theme being worn", theme_describes_itself),
     ("theme: recolor turns page repainting off and on", theme_recolor),
     ("theme: hook installs Omarchy's theme-set hook and removes it", theme_hook),
@@ -1071,6 +1073,155 @@ fn content_commands(browser: &Browser) {
 // ---------------------------------------------------------------------------
 // userscripts
 // ---------------------------------------------------------------------------
+
+/// Write four files into the scripts directory and prove what each one does: a
+/// JS one that runs, a CSS one that overrules the page, one with no `@match`,
+/// and one whose `@match` names a port.
+///
+/// The directory comes from `script list` rather than being rebuilt here from
+/// `XDG_CONFIG_HOME` and the profile name. That is the contract the command
+/// advertises -- an empty list says where to put a file -- so a test that
+/// derived the path itself could pass while the answer it prints sends you
+/// somewhere else.
+///
+/// The patterns have no port in them, and one of the four deliberately does.
+/// WebKit matches on scheme, host and path and has nowhere to put a port, so
+/// `http://127.0.0.1:8080/*` matches nothing at all -- which is why the fixture
+/// is addressed as `http://127.0.0.1/*` here even though it is served on a port
+/// picked at random, and why the fourth file exists.
+///
+/// Injection is asserted in a *new* tab, because that is when scripts are read:
+/// the tab already open was started before these files existed.
+fn script_list_and_injection(browser: &Browser) {
+    reset(browser);
+
+    let before = browser.json(&["script", "list"]);
+    let dir = PathBuf::from(string(&before, "directory"));
+    assert!(dir.is_absolute(), "the scripts directory is not a usable path: {before}");
+    assert!(
+        dir.starts_with(browser.config_path().parent().expect("the config file has a directory")),
+        "the suite's scripts would be written outside the test's own config: {}",
+        dir.display()
+    );
+    assert!(
+        field(&before, "scripts").as_array().is_some_and(Vec::is_empty),
+        "a fresh profile has no scripts: {before}"
+    );
+
+    std::fs::create_dir_all(&dir).expect("could not make the scripts directory");
+    std::fs::write(
+        dir.join("renamer.js"),
+        "// ==UserScript==\n\
+         // @name     Renamer\n\
+         // @match    http://127.0.0.1/*\n\
+         // @exclude  http://127.0.0.1/form.html\n\
+         // @run-at   document-end\n\
+         // ==/UserScript==\n\
+         document.title = 'userscript ran'\n",
+    )
+    .expect("could not write the script");
+    std::fs::write(
+        dir.join("outline.css"),
+        "/* ==UserScript==\n\
+         // @name  Outline\n\
+         // @match http://127.0.0.1/*\n\
+         ==/UserScript== */\n\
+         body { outline: 3px solid rgb(1, 2, 3) }\n",
+    )
+    .expect("could not write the stylesheet");
+    // A header, a name, and nothing saying where it applies.
+    std::fs::write(
+        dir.join("nowhere.js"),
+        "// ==UserScript==\n// @name  Nowhere\n// ==/UserScript==\nwindow.__nowhere = true\n",
+    )
+    .expect("could not write the headerless script");
+    // The pattern anybody would write for a dev server, and the one WebKit
+    // cannot honour.
+    std::fs::write(
+        dir.join("ported.js"),
+        "// ==UserScript==\n\
+         // @name  Ported\n\
+         // @match http://127.0.0.1:3000/*\n\
+         // ==/UserScript==\n\
+         window.__ported = true\n",
+    )
+    .expect("could not write the ported script");
+
+    let listed = browser.json(&["script", "list"]);
+    let scripts = field(&listed, "scripts").as_array().expect("scripts is a list").clone();
+    assert_eq!(scripts.len(), 4, "not every file was listed: {listed}");
+    // Sorted by path, so the order a page gets them in is stable between runs.
+    let names: Vec<String> = scripts.iter().map(|s| string(s, "name")).collect();
+    assert_eq!(
+        names,
+        ["Nowhere", "Outline", "Ported", "Renamer"],
+        "listed out of order: {names:?}"
+    );
+
+    let renamer = &scripts[3];
+    assert_eq!(string(renamer, "kind"), "js");
+    assert_eq!(string(renamer, "run_at"), "document-end");
+    assert_eq!(field(renamer, "matches").as_array().map(Vec::len), Some(1));
+    assert_eq!(field(renamer, "excludes").as_array().map(Vec::len), Some(1));
+    assert_eq!(string(renamer, "problem"), "", "a complete script reported a problem: {renamer}");
+
+    let outline = &scripts[1];
+    assert_eq!(string(outline, "kind"), "css");
+    assert_eq!(
+        string(outline, "run_at"),
+        "document-start",
+        "a stylesheet is not injected at a time"
+    );
+    assert_eq!(string(outline, "problem"), "", "the stylesheet reported a problem: {outline}");
+
+    // The two that matter: listed, findable, and honestly described as inert.
+    let nowhere = &scripts[0];
+    assert!(
+        !string(nowhere, "problem").is_empty(),
+        "a script with no @match was reported as running: {nowhere}"
+    );
+    let ported = &scripts[2];
+    assert!(
+        string(ported, "problem").contains("port"),
+        "a @match with a port was not reported as the reason it does nothing: {ported}"
+    );
+
+    // A new tab reads the directory, so this one has the scripts and the tab
+    // opened before them does not.
+    let id = integer(&browser.json(&["tab", "open", &browser.web.url("/index.html")]), "id");
+    browser.json(&["page", "wait"]);
+    until("the userscript to rename the page", Duration::from_secs(10), || {
+        string(&browser.json(&["page", "eval", "document.title"]), "result") == "\"userscript ran\""
+    });
+    let outlined = browser.json(&["page", "eval", "getComputedStyle(document.body).outlineColor"]);
+    assert_eq!(
+        string(&outlined, "result"),
+        "\"rgb(1, 2, 3)\"",
+        "the user stylesheet did not overrule the page"
+    );
+    for (flag, why) in [
+        ("__nowhere", "the script with no @match ran anyway"),
+        ("__ported", "the script whose @match names a port ran anyway"),
+    ] {
+        let seen = browser.json(&["page", "eval", &format!("String(window.{flag})")]);
+        assert_eq!(string(&seen, "result"), "\"undefined\"", "{why}");
+    }
+
+    // `@exclude` wins over `@match` on the page both name.
+    browser.json(&["nav", "go", &browser.web.url("/form.html")]);
+    browser.json(&["page", "wait"]);
+    assert_ne!(
+        string(&browser.json(&["page", "eval", "document.title"]), "result"),
+        "\"userscript ran\"",
+        "the script ran on the page it was excluded from"
+    );
+
+    browser.json(&["tab", "close", &id.to_string()]);
+    for file in ["renamer.js", "outline.css", "nowhere.js", "ported.js"] {
+        let _ = std::fs::remove_file(dir.join(file));
+    }
+    reset(browser);
+}
 
 // ---------------------------------------------------------------------------
 // theme

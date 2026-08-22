@@ -63,6 +63,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("ui", "Interface"),
     ("history", "History"),
     ("data", "Site data"),
+    ("script", "Userscripts"),
     ("bookmark", "Bookmarks"),
     ("find", "Find"),
     ("share", "Share"),
@@ -84,6 +85,7 @@ pub fn command_graph(state: Arc<AppState>) -> Cli {
         .group(theme_group(state.clone()))
         .group(history_group(state.clone()))
         .group(data_group(state.clone()))
+        .group(script_group(state.clone()))
         .group(bookmark_group(state.clone()))
         .group(find_group(state.clone()))
         .group(download_group(state.clone()))
@@ -1245,6 +1247,39 @@ fn data_group(state: Arc<AppState>) -> Cli {
         .description("What sites have stored here")
         .command("list", list)
         .command("clear", clear)
+}
+
+// ---------------------------------------------------------------------------
+// script
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct ScriptList {
+    /// Where the files are read from, so an empty list says where to put one.
+    directory: String,
+    scripts: Vec<crate::scripts::Script>,
+}
+
+fn script_group(_state: Arc<AppState>) -> Cli {
+    let list = CommandDef::typed::<NoArgs, NoOptions, (), ScriptList, _, _>(
+        "list",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| async move {
+            TypedResult::ok(ScriptList {
+                directory: crate::scripts::dir().display().to_string(),
+                scripts: crate::scripts::load(),
+            })
+        },
+    )
+    .description(
+        "The JavaScript and CSS you have put in the scripts directory, and where each one \
+         runs. A file with a `problem` is not being injected -- the commonest reason being \
+         no `@match` line, which is refused rather than guessed at. Edit a file and open a \
+         new tab to pick it up.",
+    )
+    .mcp(read_only())
+    .done();
+
+    Cli::create("script").description("Your own JavaScript and CSS").command("list", list)
 }
 
 // ---------------------------------------------------------------------------
@@ -3866,6 +3901,7 @@ mod tests {
             "download_list",
             "history_list",
             "permission_list",
+            "script_list",
             "tab_list",
             "theme_css",
             "theme_show",

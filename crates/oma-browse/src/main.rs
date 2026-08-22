@@ -29,6 +29,7 @@ mod permissions;
 mod policy;
 mod profile;
 mod progress;
+mod scripts;
 mod server;
 mod session;
 mod shot;

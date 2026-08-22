@@ -443,6 +443,9 @@ pub async fn open(state: &Arc<AppState>, input: &str, background: bool) -> Resul
     if let Err(e) = crate::blocker::install(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab blocks nothing");
     }
+    if let Err(e) = crate::scripts::install(&view, crate::scripts::loaded()) {
+        tracing::warn!(error = %e, tab = %label, "this tab runs none of your scripts");
+    }
     if let Err(e) = watch_url(&view, state.clone()) {
         tracing::warn!(error = %e, tab = %label, "this tab will not notice in-page navigation");
     }

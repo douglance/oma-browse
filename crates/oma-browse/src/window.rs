@@ -213,6 +213,9 @@ pub fn run(launch: Launch) -> Result<()> {
             if let Err(e) = crate::blocker::install(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab blocks nothing");
             }
+            if let Err(e) = crate::scripts::install(&content, crate::scripts::loaded()) {
+                tracing::warn!(error = %e, "the first tab runs none of your scripts");
+            }
             if let Err(e) = crate::tabs::watch_url(&content, state.clone()) {
                 tracing::warn!(error = %e, "the first tab will not notice in-page navigation");
             }
