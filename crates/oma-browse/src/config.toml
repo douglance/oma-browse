@@ -177,7 +177,10 @@ transparent = false
 [tabs]
 # How many closed tabs Ctrl-Shift-T can walk back through.
 reopen_depth = 32
-# What a new tab starts at, and the ladder Ctrl-+ and Ctrl-- step along.
+# What a page starts at when its site has no level of its own, and the ladder
+# Ctrl-+ and Ctrl-- step along. A level you set is remembered against the site
+# -- scheme, host and port -- and reapplied in every tab and after a restart,
+# the way every other browser does it; Ctrl-0 sets it back and forgets it.
 zoom = 1.0
 zoom_steps = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 # The size favicons are stored at. Sites do ship 512px icons, and one of those

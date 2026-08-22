@@ -70,6 +70,9 @@ pub struct AppState {
     /// window -- see [`AppState::set_incognito`].
     pub history: RwLock<crate::history::History>,
     pub bookmarks: RwLock<crate::bookmarks::Bookmarks>,
+    /// How big each site should be, remembered across tabs and restarts.
+    /// See [`crate::zoom`].
+    pub zooms: RwLock<crate::zoom::Zooms>,
     /// What has been saved to disk.
     ///
     /// A `std::sync::Mutex`, not tokio's, and deliberately: WebKit's download
@@ -159,6 +162,7 @@ impl AppState {
         Self {
             theme: RwLock::new(ThemeState::load(&config)),
             tabs: RwLock::new(Tabs::with_reopen_depth(config.tabs.reopen_depth)),
+            zooms: RwLock::new(crate::zoom::Zooms::load()),
             history: RwLock::new(crate::history::History::load_with(config.history.limit)),
             bookmarks: RwLock::new(crate::bookmarks::Bookmarks::load()),
             downloads: std::sync::Mutex::new(crate::downloads::Downloads::load()),

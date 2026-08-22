@@ -38,6 +38,7 @@ mod tabs;
 mod ui;
 mod vault;
 mod window;
+mod zoom;
 
 use std::sync::Arc;
 

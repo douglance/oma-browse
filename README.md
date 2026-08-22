@@ -180,7 +180,7 @@ Two things worth having on the system:
 | `gg` / `G` | top / bottom |
 | `Ctrl-F`, then `Ctrl-G` / `Ctrl-Shift-G` / `F3` | find on page, next, previous |
 | **The page** | |
-| `Ctrl-+` / `Ctrl--` / `Ctrl-0` | zoom in / out / reset |
+| `Ctrl-+` / `Ctrl--` / `Ctrl-0` | zoom in / out / reset — remembered per site |
 | `Ctrl-D` | bookmark this page |
 | `Ctrl-U` | view source |
 | `Ctrl-Shift-P` | print to PDF |

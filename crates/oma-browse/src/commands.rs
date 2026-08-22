@@ -2495,7 +2495,9 @@ fn page_group(state: Arc<AppState>) -> Cli {
     )
     .description(
         "Zoom the active tab. Steps along Chrome's zoom ladder; also bound to \
-         Ctrl+= / Ctrl+- / Ctrl+0 on the window. Zoom is per tab, not per site.",
+         Ctrl+= / Ctrl+- / Ctrl+0 on the window. The level is remembered against the \
+         site and reapplied on every later visit, in any tab; Ctrl+0 sets it back \
+         to normal and forgets it.",
     )
     .done();
 

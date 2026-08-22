@@ -645,9 +645,10 @@ fn stepped(steps: &[f64], current: f64, up: bool) -> f64 {
 
 /// Zoom the active tab, returning the level it settled on.
 ///
-/// Per tab, because that is where WebKit keeps it. Chrome remembers zoom per
-/// origin and reapplies it on the next visit; that needs somewhere to persist a
-/// map, and is a separate thing from the keys doing what the keys should do.
+/// WebKit keeps zoom on the webview, so the level itself is per tab -- but the
+/// level is then remembered against the site, the way Chrome, Firefox and
+/// Safari all do it, and reapplied to every page of that site in every tab from
+/// then on. See [`crate::zoom`].
 /// What to do with the find controller.
 #[derive(Clone, Debug)]
 pub enum FindAction {
@@ -1009,6 +1010,42 @@ impl Toggle {
     }
 }
 
+/// Put a tab at the level its site should be shown at.
+///
+/// Called on every page load rather than only when the site changes: a load is
+/// also the moment a *new* tab first has a URL, and a tab opened onto a site you
+/// have resized should already be that size rather than resize itself once the
+/// page is up. Setting the level WebKit is already at is a no-op, so the common
+/// case costs one main-thread hop and nothing else.
+#[cfg(target_os = "linux")]
+pub async fn apply_zoom(state: &Arc<AppState>, label: &str, url: &str) -> Result<()> {
+    let app = state.app_handle().context("the window is not up yet")?;
+    let view = webview(&app, label)?;
+    // The site's level if it has one, else whatever `[tabs] zoom` says a page
+    // starts at -- which is the level `engine::configure` gave the webview when
+    // it was built, so this agrees with a tab that has never navigated.
+    let level = state
+        .zooms
+        .read()
+        .await
+        .level_for(url)
+        .unwrap_or_else(|| state.config.tabs.zoom.clamp(0.1, 10.0));
+
+    view.with_webview(move |platform| {
+        use webkit2gtk::WebViewExt;
+        let w = platform.inner();
+        if (w.zoom_level() - level).abs() > 1e-6 {
+            w.set_zoom_level(level);
+        }
+    })
+    .context("could not reach the webview to set its zoom")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn apply_zoom(_state: &Arc<AppState>, _label: &str, _url: &str) -> Result<()> {
+    Ok(())
+}
+
 pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
     let app = state.app_handle().context("the window is not up yet")?;
     let label =
@@ -1042,7 +1079,16 @@ pub async fn zoom(state: &Arc<AppState>, change: ZoomChange) -> Result<f64> {
             let _ = tx.send(next);
         })
         .context("could not reach the webview")?;
-        rx.await.context("the webview did not report a zoom level")
+        let settled = rx.await.context("the webview did not report a zoom level")?;
+
+        // Against the site, not the tab. `url_for` rather than the webview's own
+        // URI because we are off the GTK thread here, and the model is what the
+        // rest of the browser agrees the tab is showing.
+        let url = state.tabs.read().await.url_for(&label).unwrap_or_default();
+        if state.zooms.write().await.remember(&url, settled) {
+            tracing::debug!(%url, level = settled, "remembered a zoom level");
+        }
+        Ok(settled)
     }
     #[cfg(not(target_os = "linux"))]
     {

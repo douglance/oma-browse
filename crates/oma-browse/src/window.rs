@@ -398,6 +398,12 @@ pub fn instrument(
 
             state.runtime().spawn(async move {
                 state.tabs.write().await.update_url(&label, url.clone());
+                // Before history and before the strip: this is what decides how
+                // big the page is, and it should be settled by the time anybody
+                // looks at it. See `crate::zoom`.
+                if let Err(e) = crate::tabs::apply_zoom(&state, &label, &url).await {
+                    tracing::warn!(error = %e, %url, "could not set this site's zoom");
+                }
                 if state.keeps_history() {
                     let mut history = state.history.write().await;
                     history.record(&url, crate::history::now());
