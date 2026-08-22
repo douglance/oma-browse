@@ -10,6 +10,7 @@ mod commands;
 mod config;
 mod control;
 mod crash;
+mod data;
 mod dispatch;
 mod downloads;
 mod engine;

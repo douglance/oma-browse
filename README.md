@@ -58,6 +58,10 @@ coding agent drives the same browser you are looking at.
   rule list is matched before a socket is opened. Pages get faster, not slower.
 - **Passwords without an extension.** `page fill --from rbw|op|pass` reads the login for
   the site you are on out of the password manager you already use.
+- **Cookies and site data, per site.** `data list` says what every site is keeping here
+  and how much of it; `data clear cookies --host example.com` unsticks one login without
+  signing you out of everywhere else. A bare `data clear` is the cache only, and the HSTS
+  cache is never cleared.
 - **Profiles.** `--profile work` is a second browser: its own config, history, cookies
   and control socket, in the same binary.
 - **Drivable by agents.** `oma-browse skills add` teaches your coding agent the command
@@ -72,6 +76,11 @@ coding agent drives the same browser you are looking at.
   notifications prompt in the palette and are remembered per origin. A self-signed
   certificate gets an interstitial and `nav trust`, not a blank window; HTTP basic auth
   gets a page and `nav login`.
+- **Says so when something breaks.** A host that does not resolve gets a themed page with
+  the reason on it, not a line of unstyled text in the corner. A tab whose web process
+  dies says so and comes back with Ctrl-R, rather than sitting there showing the last
+  frame it painted — and every command that asks a dead page a question fails instead of
+  answering with nothing.
 - **One dotfile.** Every setting in `~/.config/oma-browse/config.toml`, all of it
   optional.
 
@@ -204,7 +213,7 @@ Rebind anything by chord in the config file:
 
 ## The palette
 
-`Ctrl-K` opens one list containing your open tabs and all 70 of the browser's commands,
+`Ctrl-K` opens one list containing your open tabs and all 72 of the browser's commands,
 filtered as you type. Enter on a tab switches to it. Enter on a command runs it, or opens a prompt for
 its arguments if it needs any. Typing something that is neither runs it as a URL or a
 search.
@@ -582,6 +591,36 @@ Logs go to stderr and are filtered with `RUST_LOG`, e.g.
 
 ## Development
 
+### Tests
+
+`cargo test --workspace` runs two kinds of test.
+
+The unit tests live beside the code they check and need nothing. `tests/e2e.rs` is the
+other kind: it starts a **real browser window**, serves it pages from a loopback web
+server, and types every command the binary advertises at it the way a person or an agent
+would — then asserts on what came back, on the files that were written, and on what the
+page did. It needs a display, so headless it wants a virtual one:
+
+```sh
+cargo test --test e2e -- --nocapture                     # from a desktop session
+xvfb-run -a dbus-run-session -- cargo test --test e2e    # headless, as CI runs it
+```
+
+It is safe to run on a machine you are using. The window it opens is a profile of its
+own, with its own config file, state directory, cookie jar and control socket, so it
+cannot see or disturb the browser you already have open; it never reaches the network;
+and `wl-copy`, `ghostty`, `xdg-open` and `omarchy` are shadowed on `PATH` by stubs that
+record what they were asked to do, so the commands that hand a page to the desktop are
+exercised without a terminal opening in your face.
+
+The last thing it does is compare what it ran against `oma-browse --llms` — the command
+list the binary prints about itself — and fail if the two disagree. A command added to
+`commands.rs` therefore fails the suite until there is a case for it. That is what makes
+"every command is covered end to end" a fact about this build rather than a claim about
+an older one.
+
+### Hooks
+
 Hooks live in `.githooks/` and are opt-in per clone. One line, once:
 
 ```sh
@@ -597,7 +636,8 @@ Around 0.2s.
 warnings`, the test suite, and `node --check` on the two JavaScript runtimes the binary
 injects. Those are `include_str!` strings to Rust, so a syntax error in one compiles,
 ships and silently never runs; the only symptom is a page that stays unthemed, or `f`
-that stops drawing link hints. Around 17s warm.
+that stops drawing link hints. Around two and a half minutes warm, nearly all of it the
+end-to-end suite below.
 
 Both hooks honour `--no-verify`, and `OMA_SKIP_HOOKS=1` does the same for a script that
 cannot pass the flag.

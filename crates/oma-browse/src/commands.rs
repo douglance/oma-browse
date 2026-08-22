@@ -62,6 +62,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("theme", "Theme"),
     ("ui", "Interface"),
     ("history", "History"),
+    ("data", "Site data"),
     ("bookmark", "Bookmarks"),
     ("find", "Find"),
     ("share", "Share"),
@@ -82,6 +83,7 @@ pub fn command_graph(state: Arc<AppState>) -> Cli {
         .group(ui_group(state.clone()))
         .group(theme_group(state.clone()))
         .group(history_group(state.clone()))
+        .group(data_group(state.clone()))
         .group(bookmark_group(state.clone()))
         .group(find_group(state.clone()))
         .group(download_group(state.clone()))
@@ -1157,6 +1159,95 @@ fn history_group(state: Arc<AppState>) -> Cli {
 }
 
 // ---------------------------------------------------------------------------
+// data
+// ---------------------------------------------------------------------------
+
+#[derive(JsonSchema, Serialize)]
+struct StoredList {
+    sites: Vec<crate::data::Site>,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct DataClearArgs {
+    /// What to throw away: `cache`, `cookies`, `storage`, or `all`.
+    /// Defaults to `cache`, which is the one that cannot log you out.
+    what: Option<String>,
+}
+
+#[derive(Default, Deserialize, incurs::Options)]
+#[serde(default)]
+struct DataClearOptions {
+    /// Only this site. A registrable domain, so `youtube.com` also covers
+    /// `www.youtube.com`.
+    host: Option<String>,
+    /// Only data touched this recently: `1h`, `7d`, `30m`. Defaults to
+    /// everything ever stored.
+    since: Option<String>,
+}
+
+fn data_group(state: Arc<AppState>) -> Cli {
+    let s = state.clone();
+    let list = CommandDef::typed::<NoArgs, NoOptions, (), StoredList, _, _>(
+        "list",
+        move |_ctx: TypedContext<NoArgs, NoOptions, ()>| {
+            let state = s.clone();
+            async move {
+                match crate::data::list(&state).await {
+                    Ok(sites) => TypedResult::ok(StoredList { sites }),
+                    Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                }
+            }
+        },
+    )
+    .description(
+        "What each site has stored here -- cookies, caches and databases -- biggest first. \
+         This is the list `data clear --host` acts on.",
+    )
+    .mcp(read_only())
+    .done();
+
+    let s = state;
+    let clear =
+        CommandDef::typed::<DataClearArgs, DataClearOptions, (), crate::data::Cleared, _, _>(
+            "clear",
+            move |ctx: TypedContext<DataClearArgs, DataClearOptions, ()>| {
+                let state = s.clone();
+                async move {
+                    let what = ctx.args.what.as_deref().unwrap_or("cache");
+                    let types = match crate::data::kinds_of(what) {
+                        Ok(types) => types,
+                        Err(e) => return TypedResult::error("bad_kind", format!("{e:#}")),
+                    };
+                    let since =
+                        match crate::data::since_of(ctx.options.since.as_deref().unwrap_or("")) {
+                            Ok(since) => since,
+                            Err(e) => return TypedResult::error("bad_since", format!("{e:#}")),
+                        };
+                    let hosts = ctx.options.host.iter().cloned().collect();
+                    match crate::data::clear(&state, types, hosts, since).await {
+                        Ok(cleared) => TypedResult::ok(cleared),
+                        Err(e) => TypedResult::error("webview", format!("{e:#}")),
+                    }
+                }
+            },
+        )
+        .description(
+            "Throw away what sites have stored. `cache` is the default and is only housekeeping; \
+         `cookies` signs you out of everywhere and has to be asked for by name, and `all` is \
+         both plus local storage. `--host` narrows it to one site, `--since 1h` to what is \
+         recent. The HSTS cache is never cleared -- forgetting that a site insisted on HTTPS \
+         is not something anybody means by \"clear my data\".",
+        )
+        .destructive(true)
+        .done();
+
+    Cli::create("data")
+        .description("What sites have stored here")
+        .command("list", list)
+        .command("clear", clear)
+}
+
+// ---------------------------------------------------------------------------
 // tab
 // ---------------------------------------------------------------------------
 
@@ -1882,6 +1973,10 @@ struct Printed {
 /// The downloads directory under the page's own title, because a PDF of a page
 /// is a file the user went looking for, and `$XDG_RUNTIME_DIR` -- where the
 /// screenshots go -- is wiped at reboot.
+///
+/// Through `download_path` rather than `downloads::download_dir` directly, so
+/// that "the downloads directory" means the same thing here as it does for a
+/// download: this used to go to `~/Downloads` whatever `[downloads] dir` said.
 async fn default_pdf(state: &std::sync::Arc<crate::state::AppState>) -> std::path::PathBuf {
     let title = {
         let tabs = state.tabs.read().await;
@@ -1889,8 +1984,7 @@ async fn default_pdf(state: &std::sync::Arc<crate::state::AppState>) -> std::pat
     };
     let title = title.trim();
     let stem = if title.is_empty() { "page" } else { title };
-    let dir = crate::downloads::download_dir();
-    crate::downloads::unique(&dir, &format!("{stem}.pdf"))
+    state.download_path(&format!("{stem}.pdf"))
 }
 
 #[derive(Deserialize, incurs::Args)]
@@ -3766,6 +3860,7 @@ mod tests {
             "bookmark_list",
             "config_show",
             "content_list",
+            "data_list",
             "download_list",
             "history_list",
             "permission_list",
