@@ -58,7 +58,12 @@ jobs:
       - uses: ./.github/actions/linux-deps
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked
+      # Under a virtual display and a session bus, because `tests/e2e.rs` starts
+      # a real browser window and drives it. Without either, WebKitGTK has
+      # nothing to draw on and every case in that suite fails for a reason that
+      # has nothing to do with the change being tested. `-a` picks a free
+      # display number rather than assuming `:99` is going spare.
+      - run: xvfb-run -a dbus-run-session -- cargo test --workspace --locked
       # Both injected runtimes are `include_str!` strings as far as Rust is
       # concerned, so a syntax error in either one compiles, ships, and silently
       # never runs. The only symptom is a page that stays unthemed, or `f` that
