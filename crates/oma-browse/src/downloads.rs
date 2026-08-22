@@ -310,14 +310,7 @@ pub fn watch<R: tauri::Runtime>(
         context.connect_download_started(move |_context, download| {
             let state = state.clone();
 
-            // Choose the destination *here*, not in `decide-destination`.
-            //
-            // That signal is the documented hook and it does not fire on
-            // WebKitGTK 2.52 -- proven by probe: `download-started` arrives with
-            // the request in hand, `destination` and `response` both null, and
-            // `decide-destination` never follows. wry's own download support is
-            // built on it, which is why Tauri's `on_download` reports only the
-            // completion and never the request.
+            // Record the transfer here, where the request is in hand.
             //
             // At this moment only the URL is known, so the name comes from its
             // last path segment. `Content-Disposition` arrives with the
@@ -338,15 +331,20 @@ pub fn watch<R: tauri::Runtime>(
             if state.config.downloads.notify {
                 crate::dispatch::toast(&format!("Downloading {}", path_name(&path)));
             }
-            download.set_destination(&path.to_string_lossy());
+            download.set_destination(&destination_uri(&path));
+
+            // Where the file is meant to end up, shared with the hooks below.
+            // It moves once, when the server turns out to have a better name
+            // for it than the URL did.
+            let wanted = std::rc::Rc::new(std::cell::RefCell::new(path.clone()));
 
             // A server that names the file explicitly knows better than its own
             // URL does: `/download?id=7` is not a filename. The response is the
-            // first moment that name exists, and WebKit accepts a destination
-            // right up until the first byte is written.
+            // first moment that name exists.
             let renamed = std::rc::Rc::new(std::cell::Cell::new(false));
             let rename_state = state.clone();
             let chosen = path.clone();
+            let renaming = wanted.clone();
             download.connect_response_notify(move |download| {
                 use webkit2gtk::URIResponseExt;
                 if renamed.replace(true) {
@@ -361,37 +359,71 @@ pub fn watch<R: tauri::Runtime>(
                 }
                 let better = rename_state.download_path(suggested.as_str());
                 tracing::info!(path = %better.display(), "the server named the file");
-                download.set_destination(&better.to_string_lossy());
+                download.set_destination(&destination_uri(&better));
+                *renaming.borrow_mut() = better.clone();
                 if let Ok(mut list) = rename_state.downloads.lock() {
                     list.rename(&chosen, &better);
                 }
             });
 
+            // Where WebKit *actually* put the bytes.
+            //
+            // On WebKitGTK 2.52 the destination is decided in the network
+            // process before the download is announced here at all: neither
+            // `decide-destination` nor the `destination` property reaches that
+            // decision, so `set_destination` above takes the value, reads it
+            // back unchanged, and the file still lands in WebKit's own download
+            // directory. `created-destination` is the one hook that says where
+            // that was, and the file is put where it was asked to go once the
+            // bytes stop arriving -- see `place`.
+            let landed = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let landing = landed.clone();
+            download.connect_created_destination(move |_download, where_| {
+                *landing.borrow_mut() = Some(path_from_destination(where_));
+            });
+
             // Progress, on every chunk. Cheap by construction: nothing is
             // written to disk (see `Downloads::progress`) and the destination is
-            // read from the download rather than captured, so a rename part-way
-            // through -- which is exactly what the response hook above does --
-            // does not leave this updating an entry that no longer exists.
+            // read from the shared cell rather than captured, so a rename
+            // part-way through -- which is exactly what the response hook above
+            // does -- does not leave this updating an entry that no longer
+            // exists.
             let moving = state.clone();
             let received = std::rc::Rc::new(std::cell::Cell::new(0u64));
             let counted = received.clone();
+            let progressing = wanted.clone();
             download.connect_received_data(move |_download, chunk| {
                 counted.set(counted.get().saturating_add(chunk));
             });
             download.connect_estimated_progress_notify(move |download| {
-                let Some(destination) = download.destination() else { return };
-                let path = PathBuf::from(destination.as_str());
+                let path = progressing.borrow().clone();
                 if let Ok(mut list) = moving.downloads.lock() {
                     list.progress(&path, download.estimated_progress(), received.get());
                 }
             });
 
             let done = state.clone();
-            download.connect_finished(move |download| settle(&done, download, true));
+            let finishing = wanted.clone();
+            let finished_at = landed.clone();
+            download.connect_finished(move |download| {
+                let target = finishing.borrow().clone();
+                let actual = place(finished_at.borrow().as_deref(), &target);
+                // A move that could not happen leaves the file where WebKit put
+                // it, and the list has to say so: a `download open` on a path
+                // with no file is worse than an unexpected path.
+                if actual != target
+                    && let Ok(mut list) = done.downloads.lock()
+                {
+                    list.rename(&target, &actual);
+                }
+                settle(&done, download, &actual, true);
+            });
             let failed = state.clone();
+            let failing = wanted.clone();
             download.connect_failed(move |download, error| {
                 tracing::warn!(%error, "download failed");
-                settle(&failed, download, false);
+                let target = failing.borrow().clone();
+                settle(&failed, download, &target, false);
             });
         });
     })
@@ -416,15 +448,14 @@ pub fn watch<R: tauri::Runtime>(
 fn settle(
     state: &std::sync::Arc<crate::state::AppState>,
     download: &webkit2gtk::Download,
+    path: &Path,
     ok: bool,
 ) {
     use webkit2gtk::{DownloadExt, URIRequestExt};
 
-    let Some(destination) = download.destination() else { return };
-    let path = PathBuf::from(destination.as_str());
     let url = download.request().and_then(|r| r.uri()).map(|u| u.to_string());
     let closed =
-        state.downloads.lock().ok().and_then(|mut list| list.finish(&path, url.as_deref(), ok));
+        state.downloads.lock().ok().and_then(|mut list| list.finish(path, url.as_deref(), ok));
     let Some(entry) = closed else { return };
 
     tracing::info!(path = %path.display(), ok, "download settled");
@@ -435,6 +466,83 @@ fn settle(
             format!("Download failed: {}", entry.name())
         });
     }
+}
+
+/// A destination in the form WebKit's `destination` property actually wants.
+///
+/// It is a URI, not a path. A plain path set into it is not refused -- reading
+/// the property straight back hands you the same string -- it is simply ignored
+/// when the time comes to open the file, and WebKit falls back to its own
+/// choice: `~/Downloads`, under the name the server suggested. The symptoms were
+/// a browser that ignored `[downloads] dir` entirely and a `download list` whose
+/// entries never left "running", because nothing afterwards matched the path
+/// that had been recorded.
+///
+/// Through glib rather than `format!("file://{path}")` because a filename can
+/// contain a space, a `#` or a `%`, and every one of those means something else
+/// in a URI.
+#[cfg(target_os = "linux")]
+fn destination_uri(path: &Path) -> String {
+    gtk::glib::filename_to_uri(path, None)
+        .map(|uri| uri.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
+/// Put a finished download where it was asked to go, and say where that was.
+///
+/// WebKit decides the destination before this process is told the download
+/// exists, so `[downloads] dir` cannot be honoured while the bytes are still
+/// arriving -- only afterwards. A file that already landed in the right place is
+/// not touched, which is what happens on any WebKit that does obey
+/// `set_destination`, so this costs nothing where it is not needed.
+///
+/// `rename` first because a move within one filesystem is free. The copy is for
+/// a downloads directory on another mount, which is ordinary enough -- a
+/// `~/Downloads` on a second disk, a temporary directory on tmpfs -- to be worth
+/// handling rather than failing on.
+#[cfg(target_os = "linux")]
+fn place(landed: Option<&Path>, wanted: &Path) -> PathBuf {
+    let Some(landed) = landed else {
+        // Nothing said where the bytes went, so there is nothing to move and no
+        // reason to doubt the transfer.
+        return wanted.to_path_buf();
+    };
+    if landed == wanted {
+        return wanted.to_path_buf();
+    }
+    if let Some(parent) = wanted.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::rename(landed, wanted).is_ok() {
+        tracing::info!(from = %landed.display(), to = %wanted.display(), "put the download away");
+        return wanted.to_path_buf();
+    }
+    match std::fs::copy(landed, wanted) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(landed);
+            tracing::info!(from = %landed.display(), to = %wanted.display(), "copied the download");
+            wanted.to_path_buf()
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                at = %landed.display(),
+                wanted = %wanted.display(),
+                "could not move the download; leaving it where WebKit put it"
+            );
+            landed.to_path_buf()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn path_from_destination(raw: &str) -> PathBuf {
+    if raw.starts_with("file://")
+        && let Ok((path, _)) = gtk::glib::filename_from_uri(raw)
+    {
+        return path;
+    }
+    PathBuf::from(raw)
 }
 
 fn path_name(path: &Path) -> String {
@@ -529,5 +637,59 @@ mod tests {
         assert_eq!(name_from_url(&named), "report.pdf");
         let bare: url::Url = "https://a.example/".parse().unwrap();
         assert_eq!(name_from_url(&bare), "a.example");
+    }
+    // The three below are the WebKit-facing half, and are the reason a download
+    // used to land in `~/Downloads` however the config was written.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_destination_survives_the_trip_through_a_uri() {
+        // A space and a `#` are both ordinary in a filename and both mean
+        // something else in a URI, which is why this does not build the string
+        // by hand.
+        let path = PathBuf::from("/tmp/oma download #2.bin");
+        let uri = destination_uri(&path);
+        assert!(uri.starts_with("file:///"), "not a file URI: {uri}");
+        assert!(!uri.contains(' '), "a raw space in a URI: {uri}");
+        assert_eq!(path_from_destination(&uri), path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_destination_that_is_already_a_path_is_left_alone() {
+        // Kept working on purpose: a WebKit that hands back a path rather than
+        // a URI must not have it read as a relative filename.
+        assert_eq!(path_from_destination("/tmp/plain.bin"), PathBuf::from("/tmp/plain.bin"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_download_is_moved_to_where_it_was_asked_to_go() {
+        let dir = std::env::temp_dir().join(format!("oma-place-{}", std::process::id()));
+        let webkits = dir.join("webkit");
+        let ours = dir.join("ours");
+        std::fs::create_dir_all(&webkits).unwrap();
+        let landed = webkits.join("file.bin");
+        std::fs::write(&landed, b"payload").unwrap();
+
+        let wanted = ours.join("file.bin");
+        assert_eq!(place(Some(&landed), &wanted), wanted);
+        assert_eq!(std::fs::read(&wanted).unwrap(), b"payload");
+        assert!(!landed.exists(), "the file was copied rather than moved");
+
+        // Already in the right place: nothing happens, and nothing is lost.
+        assert_eq!(place(Some(&wanted), &wanted), wanted);
+        assert_eq!(std::fs::read(&wanted).unwrap(), b"payload");
+
+        // Nowhere to move it from is not a failure; the transfer still happened.
+        assert_eq!(place(None, &wanted), wanted);
+
+        // And a move that cannot happen answers with where the file really is,
+        // because a list entry pointing at nothing is worse than a surprising
+        // path.
+        let missing = webkits.join("never-existed.bin");
+        assert_eq!(place(Some(&missing), &ours.join("elsewhere.bin")), missing);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
