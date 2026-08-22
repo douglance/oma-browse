@@ -141,20 +141,31 @@ impl Browser {
         let deadline = Instant::now() + READY;
         let mut last = String::new();
         while Instant::now() < deadline {
-            // A parsed answer to `tab list` is not readiness, which is what the
-            // first version of this assumed and what CI caught: the control
-            // server starts answering before the window exists, so `tab list`
-            // comes back as an empty list while the very next command is told
-            // "the window is not up yet". Readiness is a *tab*, because a tab
-            // only exists once there is a webview to hold it.
-            let output = self.try_run(&["tab", "list", "--json"]);
-            if let Some(output) = output
-                && output.status.success()
-                && let Ok(value) =
-                    serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout))
-                && value.get("tabs").and_then(Value::as_array).is_some_and(|t| !t.is_empty())
-            {
-                return;
+            // Readiness is the browser saying so, not a command coming back.
+            //
+            // Two weaker gates were tried and both let the suite start early,
+            // failing the first case with "the window is not up yet" on CI and
+            // never here -- a runner is slow enough to open the gap and this
+            // desktop is not. An answer to `tab list` proves only that the
+            // control server is listening, which it is well before the window
+            // exists; a *tab* in that answer proves only that a tab has been
+            // registered, which also happens before the handle the other
+            // commands need is set.
+            //
+            // `window up` is logged as the last act of building the window,
+            // after both webviews exist, so it is the one signal that cannot be
+            // true early. `tab list` is still asked afterwards, because the
+            // suite's first act is to talk to the socket and the log says
+            // nothing about that.
+            if self.log_contains("window up") {
+                let output = self.try_run(&["tab", "list", "--json"]);
+                if let Some(output) = output
+                    && output.status.success()
+                    && serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout))
+                        .is_ok()
+                {
+                    return;
+                }
             }
             last = self.log_tail();
             std::thread::sleep(Duration::from_millis(250));
@@ -271,6 +282,14 @@ impl Browser {
     }
 
     /// The browser's own log, for a failure message worth reading.
+    /// Whether the browser has written a line by now. The whole log, not the
+    /// tail: startup is where this is asked, and a slow start is exactly when
+    /// the interesting line is not in the last thirty.
+    fn log_contains(&self, needle: &str) -> bool {
+        std::fs::read_to_string(self.root.join("browser.log"))
+            .is_ok_and(|text| text.contains(needle))
+    }
+
     pub fn log_tail(&self) -> String {
         let text = std::fs::read_to_string(self.root.join("browser.log")).unwrap_or_default();
         let lines: Vec<&str> = text.lines().collect();
