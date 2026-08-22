@@ -133,142 +133,22 @@ fn describe(reason: webkit2gtk::WebProcessTerminationReason) -> &'static str {
 /// The page a crashed tab shows.
 ///
 /// Built here rather than served from the chrome scheme like the certificate
-/// and login interstitials, for two reasons. It has to carry the URL it is
-/// standing in for, and a query string on a page a content webview can navigate
-/// to is a query string a page could forge -- the same objection [`crate::ui`]
-/// records against putting the refused host in one. And it has to arrive
+/// and login interstitials, and for a reason worth keeping: it has to arrive
 /// through `load_alternate_html`, which takes markup rather than a URL, because
-/// that is what keeps the tab's own address intact.
+/// that is what keeps the tab's own address intact. Putting the address in a
+/// query string instead would put it somewhere a page could forge -- the same
+/// objection [`crate::ui`] records against doing that with a refused host.
+#[cfg(target_os = "linux")]
 fn page(state: &Arc<AppState>, uri: &str, reason: &'static str) -> String {
-    // `try_read`, not `read`: this runs on the GTK main thread inside a signal,
-    // where there is no runtime to await on. The lock is only ever taken to
-    // swap themes, so failing here means the theme is changing in this exact
-    // millisecond; the page then renders on the fallback below, which is
-    // readable in any theme rather than pretty in one.
-    let (vars, mine) = match state.theme.try_read() {
-        Ok(theme) => {
-            (theme.css.chrome.clone(), crate::strip::chrome_vars(&state.config, theme.css.opacity))
-        }
-        Err(_) => (FALLBACK_VARS.to_string(), String::new()),
-    };
-
-    format!(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>This page stopped responding</title>\
-         <style>{vars}</style><style>{mine}</style><style>{CRASH_CSS}</style>\
-         </head><body><main>\
-         <p class=\"tag\">crashed</p>\
-         <h1>{host}</h1>\
-         <p class=\"sub\">stopped responding, because {reason}.</p>\
-         <p class=\"hint\">Nothing of the page is left to show. \
-         <code>nav reload</code> asks for it again &mdash; or press \
-         <kbd>Ctrl</kbd>+<kbd>R</kbd>, which is the same thing. \
-         Anything you had typed into it is gone.</p>\
-         <p class=\"uri\">{shown}</p>\
-         </main></body></html>",
-        host = escape(&host_of(uri)),
-        shown = escape(uri),
-    )
-}
-
-/// The host, for the heading -- a whole URL in 2rem type wraps to three lines
-/// and says nothing the line underneath does not.
-fn host_of(uri: &str) -> String {
-    match url::Url::parse(uri) {
-        Ok(parsed) => parsed.host_str().unwrap_or_default().to_string(),
-        // A tab that crashed before it had a URL at all, or on something that is
-        // not one. "This page" is wrong-sounding but true, and better than an
-        // empty heading.
-        Err(_) => "This page".to_string(),
+    crate::interstitial::Interstitial {
+        tag: "crashed",
+        title: "This page stopped responding",
+        sub: &format!("stopped responding, because {reason}."),
+        detail: None,
+        hint: "Nothing of the page is left to show. <code>nav reload</code> asks for it \
+               again &mdash; or press <kbd>Ctrl</kbd>+<kbd>R</kbd>, which is the same \
+               thing. Anything you had typed into it is gone.",
+        uri,
     }
-}
-
-/// Text into markup.
-///
-/// The URL here came off the page that just died and is echoed into a document,
-/// so it is escaped like anything else that is not ours. Quotes included: this
-/// is written into a format string by hand rather than by a template engine,
-/// and the whole point of doing that carefully is not to have to reason about
-/// which contexts the value can reach.
-fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Enough of the theme to read the page by, for the moment the theme is being
-/// swapped underneath us. Omarchy's own defaults, so it is not jarring even
-/// when it is wrong.
-const FALLBACK_VARS: &str = ":root { --oma-veil: #1a1b26; --oma-fg: #c0caf5; \
-     --oma-muted: #565f89; --oma-accent: #7aa2f7; --oma-color-red: #f7768e; \
-     --oma-space: 8px; --oma-space-2: 16px; --oma-font-small: 0.85rem; \
-     --oma-font-mono: monospace; --oma-control-normal-border: #414868; }";
-
-/// Deliberately the same shape as the certificate page's stylesheet: a crash and
-/// a refused certificate are the same kind of event to whoever is looking at
-/// them, and they should not look like two different browsers.
-const CRASH_CSS: &str = r#"
-* { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--oma-veil); color: var(--oma-fg);
-  font-family: system-ui, sans-serif; }
-main { height: 100%; display: flex; flex-direction: column; align-items: center;
-  justify-content: center; gap: var(--oma-space); padding: var(--oma-space-2);
-  max-width: 46rem; margin: 0 auto; text-align: center; }
-.tag { margin: 0; text-transform: uppercase; letter-spacing: 0.16em;
-  font-size: var(--oma-font-small); color: var(--oma-color-red); }
-h1 { margin: 0; font-size: 2rem; font-weight: 600; color: var(--oma-fg);
-  font-family: var(--oma-font-mono); word-break: break-all; }
-.sub { margin: 0; color: var(--oma-fg); }
-.hint { margin: var(--oma-space) 0 0; color: var(--oma-fg); line-height: 1.6; }
-code, kbd { font-family: var(--oma-font-mono); color: var(--oma-accent);
-  border: 1px solid var(--oma-control-normal-border); padding: 0 6px; }
-.uri { margin: var(--oma-space-2) 0 0; color: var(--oma-muted);
-  font-family: var(--oma-font-mono); font-size: var(--oma-font-small);
-  word-break: break-all; opacity: 0.7; }
-"#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_url_becomes_a_host() {
-        assert_eq!(host_of("https://youtube.com/watch?v=1"), "youtube.com");
-        assert_eq!(host_of("http://127.0.0.1:8731/index.html"), "127.0.0.1");
-    }
-
-    #[test]
-    fn something_that_is_not_a_url_still_gets_a_heading() {
-        assert_eq!(host_of(""), "This page");
-        assert_eq!(host_of("not a url"), "This page");
-    }
-
-    /// The URL on this page came off a page that just died, and it is written
-    /// into markup by hand.
-    #[test]
-    fn the_url_cannot_carry_markup_onto_the_page() {
-        let nasty = "https://x.test/?q=<script>alert('x')</script>&a=\"b\"";
-        let escaped = escape(nasty);
-        assert!(!escaped.contains('<'), "{escaped}");
-        assert!(!escaped.contains('>'), "{escaped}");
-        assert!(!escaped.contains('"'), "{escaped}");
-        assert!(escaped.contains("&lt;script&gt;"), "{escaped}");
-        // And the ampersand that was already there is not left half-escaped.
-        assert!(escaped.contains("&amp;a="), "{escaped}");
-    }
-
-    #[test]
-    fn escaping_leaves_an_ordinary_url_alone() {
-        let plain = "https://omarchy.org/docs/getting-started";
-        assert_eq!(escape(plain), plain);
-    }
+    .render(state)
 }

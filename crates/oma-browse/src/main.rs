@@ -19,6 +19,7 @@ mod fuzzy;
 mod hints;
 mod history;
 mod inspect;
+mod interstitial;
 mod keys;
 mod layout;
 mod mcp;

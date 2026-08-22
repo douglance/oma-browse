@@ -41,6 +41,112 @@ impl Challenge {
     }
 }
 
+/// A page that never arrived: a host that does not resolve, a connection
+/// refused, a protocol the browser does not speak.
+///
+/// WebKit does answer this one -- it is the only failure that does not leave a
+/// blank window -- but what it answers with is a single line of unstyled text in
+/// the top-left corner of the viewport. No heading, nothing to do about it, and
+/// nothing of the theme: in a browser whose whole argument is that everything is
+/// themed, it reads as the browser having given up. Measured against a host that
+/// does not exist: one line, "Error resolving ...: Name or service not known",
+/// and no way forward but the palette.
+///
+/// So it gets the same page the crash does, for the same reason and by the same
+/// route -- `load_alternate_html`, so the address stays the address that failed
+/// and `nav reload` retries the site rather than the error.
+#[cfg(target_os = "linux")]
+fn failures(webview: &webkit2gtk::WebView, state: Arc<AppState>) {
+    use webkit2gtk::WebViewExt as _;
+
+    webview.connect_load_failed(move |view, _event, uri, error| {
+        let Some(sub) = worth_a_page(error) else {
+            // Not a failure anybody needs a page about; see `worth_a_page`.
+            // `false` leaves WebKit to do whatever it would have done, which for
+            // these is nothing.
+            tracing::debug!(%uri, error = %error, "a load ended without arriving");
+            return false;
+        };
+        tracing::warn!(%uri, error = %error, "a page could not be reached");
+
+        let page = crate::interstitial::Interstitial {
+            tag: "not reached",
+            title: "This site could not be reached",
+            sub,
+            // WebKit's own sentence. It names the actual failure -- which of
+            // resolving, connecting or speaking the protocol went wrong -- and
+            // nothing else on the page does.
+            detail: Some(error.message()),
+            hint: "Check the address, and whether you are online. \
+                   <code>nav reload</code> tries again &mdash; or press \
+                   <kbd>Ctrl</kbd>+<kbd>R</kbd>, which is the same thing.",
+            uri,
+        }
+        .render(&state);
+
+        view.load_alternate_html(&page, uri, None);
+        true
+    });
+}
+
+/// Whether a failed load is worth putting a page in front of, and what to say.
+///
+/// The answer defaults to *yes*, and that direction was measured rather than
+/// chosen. The first version of this recognised WebKit's own error domains and
+/// ignored everything else, which sounded careful and meant the commonest
+/// failure of all showed nothing: a host that does not resolve arrives as
+/// `g-resolver-error-quark`, not as a `WebKitNetworkError`, and a connection
+/// refused comes up from GIO the same way. Recognising failures one domain at a
+/// time is a list that is always missing the one in front of you.
+///
+/// So this names only what must *not* get a page. Two of these are not failures
+/// at all, and either one wrongly turned into a page would be worse than the
+/// bare line this replaces:
+///
+/// * **Cancelled** is what every superseded load reports. Clicking a second link
+///   before the first arrives cancels the first, and so does `nav stop`. A page
+///   here would replace the page you asked for with an error about the page you
+///   changed your mind about.
+/// * **Interrupted by a policy change**, and its other half **cannot show this
+///   MIME type**, are what a *download* reports. WebKit decides it cannot
+///   display a response, hands it to the download machinery, and tells the view
+///   its load failed. Every download would otherwise end with the tab claiming
+///   the site could not be reached.
+#[cfg(target_os = "linux")]
+fn worth_a_page(error: &gtk::glib::Error) -> Option<&'static str> {
+    use webkit2gtk::{NetworkError, PolicyError};
+
+    if let Some(policy) = error.kind::<PolicyError>() {
+        return match policy {
+            PolicyError::FrameLoadInterruptedByPolicyChange => None,
+            PolicyError::CannotShowMimeType => None,
+            PolicyError::CannotUseRestrictedPort => {
+                Some("is on a port a browser is not allowed to use.")
+            }
+            _ => Some("could not be opened."),
+        };
+    }
+
+    if let Some(network) = error.kind::<NetworkError>() {
+        return match network {
+            NetworkError::Cancelled => None,
+            NetworkError::UnknownProtocol => Some("is not an address this browser can open."),
+            NetworkError::FileDoesNotExist => Some("is not there."),
+            _ => Some("could not be reached."),
+        };
+    }
+
+    // A load abandoned on the way out -- the tab was closed, or the browser is
+    // shutting down. Nobody is left to read a page about it.
+    if error.kind::<gtk::gio::IOErrorEnum>() == Some(gtk::gio::IOErrorEnum::Cancelled) {
+        return None;
+    }
+
+    // Everything else, which in practice is where the real failures live: GIO
+    // and the resolver. The engine's own message is what says which.
+    Some("could not be reached.")
+}
+
 /// A page that would not load because its certificate did not check out.
 ///
 /// Kept so the interstitial can say which host and what was wrong with it, and
@@ -62,6 +168,7 @@ pub fn install<R: tauri::Runtime>(view: &Webview<R>, state: Arc<AppState>) -> Re
         popups(&webview, state.clone());
         permissions(&webview, state.clone());
         certificates(&webview, state.clone());
+        failures(&webview, state.clone());
         logins(&webview, state.clone());
     })
     .context("could not reach the webview to set its policy")
